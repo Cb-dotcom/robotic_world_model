@@ -1,3 +1,5 @@
+from configs import BaseConfig, AnymalDFlatConfig, Go2FlatConfig
+from envs import BaseEnv, AnymalDFlatEnv, Go2FlatEnv
 from configs import BaseConfig, AnymalDFlatConfig
 from envs import BaseEnv, AnymalDFlatEnv
 from policy_training import PolicyTraining
@@ -26,6 +28,8 @@ class ModelBasedExperiment:
     def resolve_environment_cls(self, environment):
         if environment == "anymal_d_flat":
             return AnymalDFlatEnv
+        elif environment == "go2_flat":
+            return Go2FlatEnv
         else:
             raise ValueError(f"Unknown environment: {environment}")
 
