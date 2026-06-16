@@ -79,12 +79,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     ckpt = torch.load(resume_path, map_location=device)
     state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-    ac = getattr(getattr(runner, "alg", runner), "actor_critic", None) or getattr(runner, "actor_critic", None)
-    if ac is None:
-        raise RuntimeError("could not locate actor_critic on runner")
-    missing, unexpected = ac.load_state_dict(state, strict=False)
-    print(f"[eval] loaded actor-critic (missing={list(missing)}, unexpected={list(unexpected)})")
-    ac.eval()
+    # policy net lives at runner.alg.policy (confirmed via get_inference_policy).
+    # Load ONLY it -- runner.load() would also expect system_dynamics_state_dict, absent here.
+    runner.alg.policy.load_state_dict(state)
+    runner.alg.policy.eval()
+    print("[eval] loaded policy weights into runner.alg.policy")
     policy = runner.get_inference_policy(device=device)
 
     # --- obs-layout trap check: print the real policy group's term order ---
