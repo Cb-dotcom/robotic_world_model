@@ -305,6 +305,9 @@ def resolve_task_config(task: str):
     if task == "anymal_d_flat":
         config = AnymalDFlatConfig()
         return config
+    elif task == "go2_flat":
+        config = Go2FlatConfig()
+        return config
     else:
         raise ValueError(f"Unknown task: {task}")
 
