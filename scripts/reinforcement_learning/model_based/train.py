@@ -315,6 +315,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Online learning training.")
     parser.add_argument("--task", type=str, default="anymal_d_flat", help="Task to use for the experiment.")
     parser.add_argument("--run_num", type=int, default=None, help="Run number for the experiment on the cluster.")
+    parser.add_argument("--penalty", type=float, default=None, help="Override uncertainty_penalty_weight (MOPO penalty).")
     args_cli = parser.parse_args()
     config = resolve_task_config(args_cli.task)
+    if args_cli.penalty is not None:
+        config.environment_config.uncertainty_penalty_weight = args_cli.penalty
     run(config)
