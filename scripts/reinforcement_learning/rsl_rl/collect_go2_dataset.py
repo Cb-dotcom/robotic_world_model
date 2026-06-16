@@ -42,7 +42,7 @@ import os
 import torch
 import pandas as pd
 
-from rsl_rl.runners import OnPolicyRunner
+import rsl_rl.runners as rsl_runners
 
 from isaaclab.envs import DirectRLEnvCfg, DirectMARLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.utils.assets import retrieve_file_path
@@ -77,7 +77,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    runner_cls = getattr(rsl_runners, agent_cfg.class_name)  # MBPOOnPolicyRunner for the pretrain agent
+    runner = runner_cls(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(resume_path)
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
