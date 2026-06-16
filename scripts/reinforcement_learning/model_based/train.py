@@ -316,7 +316,6 @@ if __name__ == "__main__":
     parser.add_argument("--task", type=str, default="anymal_d_flat", help="Task to use for the experiment.")
     parser.add_argument("--run_num", type=int, default=None, help="Run number for the experiment on the cluster.")
     parser.add_argument("--penalty", type=float, default=None, help="Override uncertainty_penalty_weight (MOPO penalty).")
-    parser.add_argument("--penalty", type=float, default=None, help="Override uncertainty_penalty_weight (MOPO penalty).")
     parser.add_argument("--wm-checkpoint", type=str, default=None, help="Path to a checkpoint with system_dynamics_state_dict to load as the world model.")
     args_cli = parser.parse_args()
     config = resolve_task_config(args_cli.task)
