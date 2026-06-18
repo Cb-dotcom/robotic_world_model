@@ -89,10 +89,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     obs = env.get_observations()
     rows = []
+    done_count = 0
     for t in range(args_cli.num_steps):
         with torch.inference_mode():
             actions = policy(obs)
-            obs, _, _, _ = env.step(actions)
+            if args_cli.action_noise > 0.0:
+                actions = actions + args_cli.action_noise * torch.randn_like(actions)
+            obs, _, dones, _ = env.step(actions)
+        done_count += int(dones.sum().item())
         full = env.unwrapped.obs_buf  # dict of all groups, post-step
         row = torch.cat(
             [full["system_state"], full["system_action"], full["system_contact"], full["system_termination"]],
@@ -105,7 +109,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     data = torch.cat(rows, dim=0).numpy()  # [num_steps * num_envs, 66]
     pd.DataFrame(data).to_csv(out, header=False, index=False)
     term_count = int(data[:, -1].sum())
-    print(f"[collect] wrote {data.shape[0]} rows x {data.shape[1]} cols -> {out} (terminations={term_count})")
+    print(f"[collect] wrote {data.shape[0]} rows x {data.shape[1]} cols -> {out} "
+          f"(terminations(obs_buf)={term_count}  dones(step)={done_count})")
 
     env.close()
     simulation_app.close()
