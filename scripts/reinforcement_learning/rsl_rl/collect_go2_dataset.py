@@ -27,6 +27,8 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed for the environment.")
 parser.add_argument("--num_steps", type=int, default=10000, help="Timesteps to record (rows in the CSV).")
 parser.add_argument("--output", type=str, default=None, help="CSV output path (default assets/data/go2/state_action_data_0.csv).")
+parser.add_argument("--action_noise", type=float, default=0.0,
+                    help="Std of Gaussian noise added to (and recorded as) actions. 0 = deterministic.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
