@@ -48,8 +48,11 @@ def main():
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--forecast_horizon", type=int, default=None,
                    help="override; default = config forecast_horizon (8)")
-    p.add_argument("--termination_loss_weight", type=float, default=5.0,
-                   help="upweight termination loss vs the ~0.15%% positive imbalance")
+    p.add_argument("--termination_loss_weight", type=float, default=1.0,
+                   help="scales termination loss vs contact/state heads (head-vs-head, NOT pos/neg balance)")
+    p.add_argument("--termination_pos_weight", type=float, default=0.0,
+                   help="pos_weight INSIDE termination BCE to fix the ~650:1 class imbalance. "
+                        "0 = auto (neg/pos from data). This is the lever that stops the head going blind.")
     p.add_argument("--ensemble_size", type=int, default=5,
                    help="fallback if config attr name differs; config value wins if present")
     p.add_argument("--device", type=str, default="cuda:0")
@@ -123,6 +126,23 @@ def main():
     buf = ReplayBuffer([state_dim, action_dim, ext_dim, contact_dim, term_dim], N, device)
     buf.insert([state, action, None, contact, termination])  # ext slot None (dim 0)
     print(f"[fit] buffer num_transitions={buf.num_transitions}")
+
+    # --- fix termination-head imbalance: inject pos_weight into the termination BCE ---
+    # ETH's compute_termination_loss is naive BCEWithLogitsLoss; at ~0.15% positives it
+    # collapses to all-negative. Override on this instance only (online code untouched).
+    import types
+    pos_w_val = args.termination_pos_weight if args.termination_pos_weight > 0 else (N - n_falls) / max(n_falls, 1)
+    pos_w = torch.tensor([pos_w_val], device=device)
+    print(f"[fit] termination pos_weight = {pos_w_val:.1f} (the anti-blindness lever)")
+
+    def _termination_loss_posweighted(self, termination_pred, termination_target):
+        if termination_pred is None or termination_target is None:
+            return torch.tensor(0.0, device=self.device)
+        if self.prediction_type == "sequence":
+            termination_pred = termination_pred[:, -1]
+        return nn.BCEWithLogitsLoss(pos_weight=pos_w)(termination_pred, termination_target)
+
+    sd.compute_termination_loss = types.MethodType(_termination_loss_posweighted, sd)
 
     seq_len = history_horizon + forecast_horizon
     out_dir = os.path.dirname(args.output)
