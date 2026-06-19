@@ -38,6 +38,8 @@ def main():
     p.add_argument("--clean_rows", type=int, default=10000,
                    help="rows of the leading clean n00 segment to draw negatives from")
     p.add_argument("--num_neg", type=int, default=2000)
+    p.add_argument("--fall_range", default=None, help="LO,HI rows to restrict positive falls (held-out test)")
+    p.add_argument("--neg_range", default=None, help="LO,HI rows to draw negative walking windows from")
     p.add_argument("--seam_lens", type=str, default="10000,20000,35000,65000,90000,115000",
                    help="cumulative segment row counts; their last rows are seam terminations, not real falls")
     p.add_argument("--device", default="cuda:0")
@@ -57,10 +59,15 @@ def main():
     sd.eval()
 
     data = pd.read_csv(args.data, header=None).values.astype(np.float32)
-    state_all, action_all, term_all = data[:, 0:45], data[:, 45:57], data[:, 65]
+    state_all = np.ascontiguousarray(data[:, 0:45])
+    action_all = np.ascontiguousarray(data[:, 45:57])
+    term_all = np.ascontiguousarray(data[:, 65])
 
     seams = set(int(c) - 1 for c in args.seam_lens.split(","))
     fall_idx = [int(f) for f in np.where(term_all > 0.5)[0] if int(f) not in seams and f >= H]
+    if args.fall_range:
+        lo, hi = map(int, args.fall_range.split(","))
+        fall_idx = [f for f in fall_idx if lo <= f < hi]
 
     def window(f):
         xs = torch.from_numpy(state_all[f - H:f]).to(device).unsqueeze(0)
@@ -77,7 +84,11 @@ def main():
     pos = np.array([term_prob(f) for f in fall_idx])
 
     rng = np.random.default_rng(0)
-    neg_cand = [g for g in range(H, args.clean_rows) if term_all[g - H:g + 1].sum() == 0]
+    if args.neg_range:
+        nlo, nhi = map(int, args.neg_range.split(",")); nlo = max(nlo, H)
+    else:
+        nlo, nhi = H, args.clean_rows
+    neg_cand = [g for g in range(nlo, nhi) if term_all[g - H:g + 1].sum() == 0]
     neg_sample = rng.choice(neg_cand, size=min(args.num_neg, len(neg_cand)), replace=False)
     neg = np.array([term_prob(int(g)) for g in neg_sample])
 
