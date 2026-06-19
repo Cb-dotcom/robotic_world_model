@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: BSD-3-Clause
+"""Standalone OFFLINE world-model fit for Go2 RWM-U.
+
+Trains a SystemDynamicsEnsemble on a curated offline CSV
+(state(45)|action(12)|contact(8)|termination(1) = 66 cols), lifting the exact
+loss loop from MBPOPPO.update_system_dynamics so the resulting world model loads
+straight through the offline pipeline's --wm-checkpoint.
+
+No Isaac / sim needed -- pure PyTorch. Identity normalizer (raw values inserted),
+matching the offline pipeline's convention.
+
+Run (container):
+  unset PYTHONPATH; export PYTHONPATH=<rsl_rl_rwm>
+  cd <robotic_world_model>
+  /isaac-sim/python.sh scripts/reinforcement_learning/model_based/fit_world_model.py \
+    --data assets/data/go2_noise/state_action_data_noise.csv \
+    --output logs/wm_fit/go2_curated_wm.pt \
+    --iterations 2000 --termination_loss_weight 5.0 \
+    --reference_wm logs/rsl_rl/unitree_go2_flat/2026-06-12_13-39-03_pretrain_ens5/model_2000.pt
+"""
+import argparse
+import os
+import time
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from rsl_rl.modules import SystemDynamicsEnsemble
+from rsl_rl.storage.replay_buffer import ReplayBuffer
+
+# Pull architecture straight from the offline config so the fitted WM is
+# shape-identical to what --wm-checkpoint loads. (Config import is lightweight:
+# dataclasses only, no Isaac.)
+from configs.go2_flat_cfg import Go2FlatConfig
+
+
+def main():
+    p = argparse.ArgumentParser(description="Offline world-model fit for Go2 RWM-U.")
+    p.add_argument("--data", required=True, help="curated CSV (66 cols)")
+    p.add_argument("--output", required=True, help="output WM checkpoint path")
+    p.add_argument("--iterations", type=int, default=2000)
+    p.add_argument("--num_mini_batches", type=int, default=20)
+    p.add_argument("--mini_batch_size", type=int, default=2048)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--forecast_horizon", type=int, default=None,
+                   help="override; default = config forecast_horizon (8)")
+    p.add_argument("--termination_loss_weight", type=float, default=5.0,
+                   help="upweight termination loss vs the ~0.15%% positive imbalance")
+    p.add_argument("--ensemble_size", type=int, default=5,
+                   help="fallback if config attr name differs; config value wins if present")
+    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--log_interval", type=int, default=50)
+    p.add_argument("--save_interval", type=int, default=500)
+    p.add_argument("--reference_wm", type=str, default=None,
+                   help="ens5 checkpoint: verify architecture match (and warm-start if --warm_start)")
+    p.add_argument("--warm_start", action="store_true",
+                   help="initialize from --reference_wm instead of from scratch")
+    args = p.parse_args()
+
+    device = args.device
+    cfg = Go2FlatConfig()
+    mac = cfg.model_architecture_config
+    # architecture_config dict is essential and cannot be safely hardcoded -> pull from config.
+    architecture_config = mac.architecture_config
+    # dims: pull from config, fall back to known Go2 values if attr name differs.
+    history_horizon = getattr(mac, "history_horizon", 32)
+    cfg_forecast = getattr(mac, "forecast_horizon", 8)
+    forecast_horizon = args.forecast_horizon if args.forecast_horizon is not None else cfg_forecast
+    state_dim, action_dim = 45, 12
+    ext_dim = getattr(mac, "extension_dim", 0)
+    contact_dim = getattr(mac, "contact_dim", 8)
+    term_dim = getattr(mac, "termination_dim", 1)
+    ensemble_size = getattr(mac, "ensemble_size", None) or getattr(mac, "num_models", None) or args.ensemble_size
+
+    print(f"[fit] state={state_dim} action={action_dim} ext={ext_dim} contact={contact_dim} term={term_dim}")
+    print(f"[fit] ensemble={ensemble_size} hist={history_horizon} forecast={forecast_horizon}")
+    print(f"[fit] arch={architecture_config}")
+
+    def build():
+        return SystemDynamicsEnsemble(
+            state_dim, action_dim, ext_dim, contact_dim, term_dim, device,
+            ensemble_size=ensemble_size, history_horizon=history_horizon,
+            architecture_config=architecture_config, freeze_auxiliary=False,
+        ).to(device)
+
+    sd = build()
+
+    # architecture self-check / optional warm start
+    if args.reference_wm is not None:
+        ref = torch.load(args.reference_wm, map_location=device)["system_dynamics_state_dict"]
+        if args.warm_start:
+            sd.load_state_dict(ref, strict=True)
+            print("[fit] warm-started from reference WM (architecture verified by strict load).")
+        else:
+            tmp = build()
+            try:
+                tmp.load_state_dict(ref, strict=True)
+                print("[fit] architecture VERIFIED: reference WM loads strict=True -> "
+                      "fitted WM will load through --wm-checkpoint. Training from scratch.")
+            except Exception as e:
+                print(f"[fit] WARNING: reference WM did not load strict (arch mismatch?): {e}")
+            del tmp
+
+    optimizer = torch.optim.Adam(sd.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_weights = {"state": 1.0, "sequence": 1.0, "bound": 1.0, "kl": 1.0,
+                    "extension": 1.0, "contact": 1.0, "termination": args.termination_loss_weight}
+
+    # --- load CSV into the replay buffer (identity normalizer: raw values) ---
+    data = pd.read_csv(args.data, header=None).values.astype(np.float32)
+    N = data.shape[0]
+    assert data.shape[1] == 66, f"expected 66 cols, got {data.shape[1]}"
+    state = torch.from_numpy(data[:, 0:45]).to(device).view(1, N, 45)
+    action = torch.from_numpy(data[:, 45:57]).to(device).view(1, N, 12)
+    contact = torch.from_numpy(data[:, 57:65]).to(device).view(1, N, 8)
+    termination = torch.from_numpy(data[:, 65:66]).to(device).view(1, N, 1)
+    n_falls = int(termination.sum().item())
+    print(f"[fit] loaded {N} transitions, {n_falls} terminations ({100.0*n_falls/N:.3f}% positive)")
+
+    buf = ReplayBuffer([state_dim, action_dim, ext_dim, contact_dim, term_dim], N, device)
+    buf.insert([state, action, None, contact, termination])  # ext slot None (dim 0)
+    print(f"[fit] buffer num_transitions={buf.num_transitions}")
+
+    seq_len = history_horizon + forecast_horizon
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    keys = ["state", "sequence", "bound", "kl", "extension", "contact", "termination"]
+    t0 = time.time()
+    for it in range(args.iterations):
+        gen = buf.mini_batch_generator(seq_len, args.num_mini_batches, args.mini_batch_size)
+        sums = {k: 0.0 for k in keys}
+        nb = 0
+        for s_b, a_b, ext_b, c_b, term_b in gen:
+            sd.reset()
+            (state_loss, sequence_loss, bound_loss, kl_loss,
+             extension_loss, contact_loss, termination_loss) = sd.compute_loss(
+                s_b, a_b, ext_b, c_b, term_b, bootstrap=True)
+
+            def w(weight, loss):
+                return weight * loss if loss is not None else 0.0
+
+            loss = (w(loss_weights["state"], state_loss)
+                    + w(loss_weights["sequence"], sequence_loss)
+                    + w(loss_weights["bound"], bound_loss)
+                    + w(loss_weights["kl"], kl_loss)
+                    + w(loss_weights["extension"], extension_loss)
+                    + w(loss_weights["contact"], contact_loss)
+                    + w(loss_weights["termination"], termination_loss))
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(sd.parameters(), args.max_grad_norm)
+            optimizer.step()
+
+            def val(x):
+                return x.item() if (x is not None and hasattr(x, "item")) else 0.0
+            sums["state"] += val(state_loss)
+            sums["sequence"] += val(sequence_loss)
+            sums["bound"] += val(bound_loss)
+            sums["kl"] += val(kl_loss)
+            sums["extension"] += val(extension_loss)
+            sums["contact"] += val(contact_loss)
+            sums["termination"] += val(termination_loss)
+            nb += 1
+        if (it + 1) % args.log_interval == 0:
+            m = {k: sums[k] / max(nb, 1) for k in keys}
+            print(f"[fit] it {it+1}/{args.iterations}  state={m['state']:.4f} seq={m['sequence']:.4f} "
+                  f"contact={m['contact']:.4f} term={m['termination']:.4f} kl={m['kl']:.4f} "
+                  f"({(time.time()-t0)/(it+1):.2f}s/it)")
+        if (it + 1) % args.save_interval == 0 or (it + 1) == args.iterations:
+            torch.save({"system_dynamics_state_dict": sd.state_dict(), "iter": it + 1}, args.output)
+
+    print(f"[fit] DONE -> {args.output}  (terminations in data: {n_falls})")
+
+
+if __name__ == "__main__":
+    main()
