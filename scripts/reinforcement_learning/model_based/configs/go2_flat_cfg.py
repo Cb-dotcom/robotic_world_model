@@ -58,7 +58,7 @@ class Go2FlatConfig(BaseConfig):
     @dataclass
     class DataConfig(BaseConfig.DataConfig):
         dataset_root: str = "assets"
-        dataset_folder: str = "data/go2"
+        dataset_folder: str = "data/go2_noise"
         batch_data_size: int = 10000
         state_idx_dict: Dict[str, List[int]] = field(default_factory=lambda: {
             r"$v$\n$[m/s]$":         [0, 1, 2],
