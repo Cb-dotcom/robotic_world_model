@@ -56,6 +56,8 @@ def main():
     p.add_argument("--ensemble_size", type=int, default=5,
                    help="fallback if config attr name differs; config value wins if present")
     p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--no_normalize", action="store_true",
+                   help="train on RAW state/action (debug only; mismatches the normalized deployment)")
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--save_interval", type=int, default=500)
     p.add_argument("--reference_wm", type=str, default=None,
@@ -112,7 +114,7 @@ def main():
     loss_weights = {"state": 1.0, "sequence": 1.0, "bound": 1.0, "kl": 1.0,
                     "extension": 1.0, "contact": 1.0, "termination": args.termination_loss_weight}
 
-    # --- load CSV into the replay buffer (identity normalizer: raw values) ---
+    # --- load CSV into the replay buffer ---
     data = pd.read_csv(args.data, header=None).values.astype(np.float32)
     N = data.shape[0]
     assert data.shape[1] == 66, f"expected 66 cols, got {data.shape[1]}"
@@ -122,6 +124,23 @@ def main():
     termination = torch.from_numpy(data[:, 65:66]).to(device).view(1, N, 1)
     n_falls = int(termination.sum().item())
     print(f"[fit] loaded {N} transitions, {n_falls} terminations ({100.0*n_falls/N:.3f}% positive)")
+
+    # --- CRITICAL: z-score state/action to match the DEPLOYMENT normalizer ---
+    # The offline pipeline's Dataset (train.py ~L131/162) computes mean/std from the
+    # same CSV and feeds the WM normalized state/action at policy time; contact and
+    # termination stay raw (the pipeline only normalizes state/action). Training raw
+    # while deploying normalized makes every head misfire -> episode length pins at 1.
+    s_mean = state.mean(dim=(0, 1), keepdim=True)
+    s_std = state.std(dim=(0, 1), keepdim=True) + 1e-6
+    a_mean = action.mean(dim=(0, 1), keepdim=True)
+    a_std = action.std(dim=(0, 1), keepdim=True) + 1e-6
+    if not args.no_normalize:
+        state = (state - s_mean) / s_std
+        action = (action - a_mean) / a_std
+        print(f"[fit] z-scored state/action to match deployment "
+              f"(s_std[:3]={s_std.flatten()[:3].tolist()}, a_std[:3]={a_std.flatten()[:3].tolist()})")
+    else:
+        print("[fit] --no_normalize set: training on RAW state/action (will mismatch normalized deployment)")
 
     buf = ReplayBuffer([state_dim, action_dim, ext_dim, contact_dim, term_dim], N, device)
     buf.insert([state, action, None, contact, termination])  # ext slot None (dim 0)
@@ -192,7 +211,10 @@ def main():
                   f"contact={m['contact']:.4f} term={m['termination']:.4f} kl={m['kl']:.4f} "
                   f"({(time.time()-t0)/(it+1):.2f}s/it)")
         if (it + 1) % args.save_interval == 0 or (it + 1) == args.iterations:
-            torch.save({"system_dynamics_state_dict": sd.state_dict(), "iter": it + 1}, args.output)
+            torch.save({"system_dynamics_state_dict": sd.state_dict(), "iter": it + 1,
+                        "state_mean": s_mean.cpu(), "state_std": s_std.cpu(),
+                        "action_mean": a_mean.cpu(), "action_std": a_std.cpu(),
+                        "normalized": (not args.no_normalize)}, args.output)
 
     print(f"[fit] DONE -> {args.output}  (terminations in data: {n_falls})")
 

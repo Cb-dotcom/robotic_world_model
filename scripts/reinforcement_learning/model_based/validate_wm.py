@@ -55,13 +55,24 @@ def main():
         ensemble_size=getattr(mac, "ensemble_size", None) or getattr(mac, "num_models", None) or 5,
         history_horizon=H, architecture_config=mac.architecture_config, freeze_auxiliary=False,
     ).to(device)
-    sd.load_state_dict(torch.load(args.wm, map_location=device)["system_dynamics_state_dict"], strict=True)
+    ckpt = torch.load(args.wm, map_location=device)
+    sd.load_state_dict(ckpt["system_dynamics_state_dict"], strict=True)
     sd.eval()
 
     data = pd.read_csv(args.data, header=None).values.astype(np.float32)
     state_all = np.ascontiguousarray(data[:, 0:45])
     action_all = np.ascontiguousarray(data[:, 45:57])
     term_all = np.ascontiguousarray(data[:, 65])
+
+    # match the WM's TRAINING (= deployment) normalization, read straight from the ckpt
+    if ckpt.get("normalized", False) and "state_mean" in ckpt:
+        sm = ckpt["state_mean"].cpu().numpy().reshape(-1); ss = ckpt["state_std"].cpu().numpy().reshape(-1)
+        am = ckpt["action_mean"].cpu().numpy().reshape(-1); asd = ckpt["action_std"].cpu().numpy().reshape(-1)
+        state_all = ((state_all - sm) / ss).astype(np.float32)
+        action_all = ((action_all - am) / asd).astype(np.float32)
+        print(f"[val] normalized inputs to WM training space (state_std[:3]={ss[:3].round(3)})")
+    else:
+        print("[val] WM has no saved normalizer -> validating in RAW space")
 
     seams = set(int(c) - 1 for c in args.seam_lens.split(","))
     fall_idx = [int(f) for f in np.where(term_all > 0.5)[0] if int(f) not in seams and f >= H]
