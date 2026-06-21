@@ -34,6 +34,9 @@ from rsl_rl.storage.replay_buffer import ReplayBuffer
 # shape-identical to what --wm-checkpoint loads. (Config import is lightweight:
 # dataclasses only, no Isaac.)
 from configs.go2_flat_cfg import Go2FlatConfig
+from configs.anymal_d_flat_cfg import AnymalDFlatConfig
+
+_CONFIGS = {"go2_flat": Go2FlatConfig, "anymal_d_flat": AnymalDFlatConfig}
 
 
 def main():
@@ -55,6 +58,8 @@ def main():
                         "0 = auto (neg/pos from data). This is the lever that stops the head going blind.")
     p.add_argument("--ensemble_size", type=int, default=5,
                    help="fallback if config attr name differs; config value wins if present")
+    p.add_argument("--config", type=str, default="go2_flat", choices=["go2_flat", "anymal_d_flat"],
+                   help="which robot config to pull dims/arch from (go2_flat or anymal_d_flat)")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--no_normalize", action="store_true",
                    help="train on RAW state/action (debug only; mismatches the normalized deployment)")
@@ -67,18 +72,24 @@ def main():
     args = p.parse_args()
 
     device = args.device
-    cfg = Go2FlatConfig()
+    cfg = _CONFIGS[args.config]()
+    print(f"[fit] config = {args.config}")
     mac = cfg.model_architecture_config
     # architecture_config dict is essential and cannot be safely hardcoded -> pull from config.
     architecture_config = mac.architecture_config
-    # dims: pull from config, fall back to known Go2 values if attr name differs.
+    # dims: pull from config, fall back to known values if attr name differs.
     history_horizon = getattr(mac, "history_horizon", 32)
     cfg_forecast = getattr(mac, "forecast_horizon", 8)
     forecast_horizon = args.forecast_horizon if args.forecast_horizon is not None else cfg_forecast
-    state_dim, action_dim = 45, 12
     ext_dim = getattr(mac, "extension_dim", 0)
     contact_dim = getattr(mac, "contact_dim", 8)
     term_dim = getattr(mac, "termination_dim", 1)
+    # state_dim/action_dim: Go2 and ANYmal are both 45/12; infer state_dim from the CSV
+    # width (cols - action - ext - contact - term) so this stays correct if a config differs.
+    action_dim = 12
+    _ncols = len(pd.read_csv(args.data, header=None, nrows=1).columns)
+    state_dim = _ncols - action_dim - ext_dim - contact_dim - term_dim
+    print(f"[fit] inferred state_dim={state_dim} from {_ncols}-col CSV (action={action_dim} ext={ext_dim} contact={contact_dim} term={term_dim})")
     ensemble_size = getattr(mac, "ensemble_size", None) or getattr(mac, "num_models", None) or args.ensemble_size
 
     print(f"[fit] state={state_dim} action={action_dim} ext={ext_dim} contact={contact_dim} term={term_dim}")
@@ -117,11 +128,16 @@ def main():
     # --- load CSV into the replay buffer ---
     data = pd.read_csv(args.data, header=None).values.astype(np.float32)
     N = data.shape[0]
-    assert data.shape[1] == 66, f"expected 66 cols, got {data.shape[1]}"
-    state = torch.from_numpy(data[:, 0:45]).to(device).view(1, N, 45)
-    action = torch.from_numpy(data[:, 45:57]).to(device).view(1, N, 12)
-    contact = torch.from_numpy(data[:, 57:65]).to(device).view(1, N, 8)
-    termination = torch.from_numpy(data[:, 65:66]).to(device).view(1, N, 1)
+    expected_cols = state_dim + action_dim + ext_dim + contact_dim + term_dim
+    assert data.shape[1] == expected_cols, f"expected {expected_cols} cols, got {data.shape[1]}"
+    s0, a0 = 0, state_dim
+    e0 = a0 + action_dim
+    c0 = e0 + ext_dim
+    t0 = c0 + contact_dim
+    state = torch.from_numpy(data[:, s0:a0]).to(device).view(1, N, state_dim)
+    action = torch.from_numpy(data[:, a0:e0]).to(device).view(1, N, action_dim)
+    contact = torch.from_numpy(data[:, c0:t0]).to(device).view(1, N, contact_dim)
+    termination = torch.from_numpy(data[:, t0:t0 + term_dim]).to(device).view(1, N, term_dim)
     n_falls = int(termination.sum().item())
     print(f"[fit] loaded {N} transitions, {n_falls} terminations ({100.0*n_falls/N:.3f}% positive)")
 
