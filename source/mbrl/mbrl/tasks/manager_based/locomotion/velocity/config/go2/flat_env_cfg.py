@@ -8,6 +8,8 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.envs.mdp.events import push_by_setting_velocity
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.rough_env_cfg import (
     UnitreeGo2RoughEnvCfg,
@@ -290,3 +292,25 @@ class UnitreeGo2FlatEnvCfg_VISUALIZE(UnitreeGo2FlatEnvCfg_PRETRAIN):
             },
         }
         self.events.reset_robot_joints.func = mdp.reset_joints_by_scale_visualize
+
+# ---------------------------------------------------------------------------
+# Broad pretrain env — Pretrain + re-enabled push_robot so the world-model
+# training buffer contains near-fall and fall transitions (the termination
+# head needs fall positives; the narrow fall-free buffer is the diagnosed
+# coverage gap). Used ONLY for WM pretraining. The eval/benchmark task
+# (Pretrain-v0) stays push-free, so every prior real-env number stays comparable.
+# ---------------------------------------------------------------------------
+@configclass
+class UnitreeGo2FlatEnvCfg_PRETRAIN_BROAD(UnitreeGo2FlatEnvCfg_PRETRAIN):
+    def __post_init__(self):
+        super().__post_init__()
+        # 2x upstream push amplitude (-0.5→-1.0), slightly more frequent:
+        # tips a ~15 kg Go2 often enough to log falls while walking stays
+        # dominant (~2 pushes / 20 s episode). THE knob to tune: too few
+        # falls → raise to ±1.5; pretrain stops walking → drop to ±0.7.
+        self.events.push_robot = EventTerm(
+            func=push_by_setting_velocity,
+            mode="interval",
+            interval_range_s=(8.0, 12.0),
+            params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
+        )

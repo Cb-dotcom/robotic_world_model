@@ -90,7 +90,7 @@ def main():
     _ncols = len(pd.read_csv(args.data, header=None, nrows=1).columns)
     state_dim = _ncols - action_dim - ext_dim - contact_dim - term_dim
     print(f"[fit] inferred state_dim={state_dim} from {_ncols}-col CSV (action={action_dim} ext={ext_dim} contact={contact_dim} term={term_dim})")
-    ensemble_size = getattr(mac, "ensemble_size", None) or getattr(mac, "num_models", None) or args.ensemble_size
+    ensemble_size = args.ensemble_size
 
     print(f"[fit] state={state_dim} action={action_dim} ext={ext_dim} contact={contact_dim} term={term_dim}")
     print(f"[fit] ensemble={ensemble_size} hist={history_horizon} forecast={forecast_horizon}")

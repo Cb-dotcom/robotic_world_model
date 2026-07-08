@@ -32,9 +32,13 @@ parser.add_argument("--seed", type=int, default=None, help="Seed for the environ
 parser.add_argument("--num_steps", type=int, default=2000, help="Rollout steps.")
 parser.add_argument("--trace_envs", type=int, default=6, help="Record cmd-vs-actual base velocity for this many envs (0 = off).")
 parser.add_argument("--trace_out", type=str, default=None, help="Where to save the velocity trace .npz (default: next to checkpoint).")
+parser.add_argument("--video", action="store_true", default=False, help="Record a render video.")
+parser.add_argument("--video_length", type=int, default=400, help="Video length (steps).")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.video:
+    args_cli.enable_cameras = True
 
 sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
@@ -75,7 +79,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     resume_path = retrieve_file_path(args_cli.checkpoint)
     print(f"[eval] checkpoint: {resume_path}")
 
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+    if args_cli.video:
+        import os as _os
+        _preset = _os.environ.get("RENDER_PRESET", "forward")
+        _cmd = env_cfg.commands.base_velocity
+        _cmd.heading_command = False; _cmd.rel_standing_envs = 0.0
+        env_cfg.scene.num_envs = 1
+        _cmd.ranges.lin_vel_x = (0.4, 0.4); _cmd.ranges.lin_vel_y = (0.0, 0.0); _cmd.ranges.ang_vel_z = (0.0, 0.0)
+        env_cfg.viewer.origin_type = "asset_root"; env_cfg.viewer.asset_name = "robot"; env_cfg.viewer.env_index = 0
+        env_cfg.viewer.eye = (2.5, -2.5, 1.3); env_cfg.viewer.lookat = (0.0, 0.0, 0.3)
+        try:
+            env_cfg.scene.sky_light.spawn.intensity = 300.0
+            env_cfg.scene.sky_light.spawn.texture_file = None
+        except Exception as _e:
+            print("[lighting] could not set sky_light:", _e)
+        args_cli.num_envs = 1
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.video:
+        import os as _os2
+        env = gym.wrappers.RecordVideo(env, video_folder=_os2.path.join(_os2.path.dirname(retrieve_file_path(args_cli.checkpoint)), "videos", "eval"), step_trigger=lambda st: st == 0, video_length=args_cli.video_length, disable_logger=True)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     device = env.unwrapped.device
 
@@ -115,6 +137,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     tr_cmd, tr_act = [], []
 
     obs = env.get_observations()
+    if args_cli.video:
+        args_cli.num_steps = args_cli.video_length
     for t in range(args_cli.num_steps):
         with torch.inference_mode():
             actions = policy(obs)

@@ -133,6 +133,8 @@ class ManagerBasedMBRLEnv(ManagerBasedRLEnv):
                 self.imagination_episode_sums[term] += self.uncertainty_penalty_weight * self.epistemic_uncertainty * self.step_dt
             else:
                 term_cfg = self.reward_manager.get_term_cfg(term)
+                if term not in self.imagination_reward_per_step:
+                    continue
                 term_value = self.imagination_reward_per_step[term]
                 rewards += term_cfg.weight * term_value * self.step_dt
                 self.imagination_episode_sums[term] += term_cfg.weight * term_value * self.step_dt

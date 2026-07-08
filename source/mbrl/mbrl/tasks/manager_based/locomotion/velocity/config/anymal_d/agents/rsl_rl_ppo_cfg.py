@@ -87,7 +87,7 @@ class AnymalDFlatPPOPretrainRunnerCfg(AnymalDFlatPPORunnerCfg):
         system_dynamics_len_eval_trajectory=400,
         system_dynamics_eval_traj_noise_scale=[0.1, 0.2, 0.4, 0.5, 0.8],
     )
-    run_name = "pretrain"
+    run_name = "pretrain_budget5000_fresh"
     load_system_dynamics = False
     system_dynamics_load_path = None
     system_dynamics_warmup_iterations = 0
@@ -105,16 +105,16 @@ class AnymalDFlatPPOPretrainRunnerCfg(AnymalDFlatPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 2000
+        self.max_iterations = 5000
 
 @configclass
 class AnymalDFlatPPOFinetuneRunnerCfg(AnymalDFlatPPOPretrainRunnerCfg):
     resume = True
-    load_run = "2025-11-04_09-59-00"
+    load_run = "2026-06-13_14-16-21_pretrain_budget5000_fresh"
     load_system_dynamics = True
-    system_dynamics_load_path = "logs/rsl_rl/anymal_d_flat/2025-11-04_14-31-20_pretrain_rnn/model_5000.pt"
+    system_dynamics_load_path = "logs/rsl_rl/anymal_d_flat/2026-06-13_14-16-21_pretrain_budget5000_fresh/model_5000.pt"
     system_dynamics_warmup_iterations = 500
-    run_name = "finetune"
+    run_name = "finetune_budget5000"
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -124,11 +124,12 @@ class AnymalDFlatPPOFinetuneRunnerCfg(AnymalDFlatPPOPretrainRunnerCfg):
         self.imagination.max_episode_length = 256
         self.imagination.command_resample_interval_range = [100, 120]
         self.imagination.uncertainty_penalty_weight = -0.0
+        self.max_iterations = 2000
 
 
 @configclass
 class AnymalDFlatPPOVisualizeRunnerCfg(AnymalDFlatPPOPretrainRunnerCfg):
     resume = True
     load_system_dynamics = True
-    system_dynamics_load_path = "logs/rsl_rl/anymal_d_flat/2025-11-04_14-31-20_pretrain_rnn/model_5000.pt"
+    system_dynamics_load_path = "logs/rsl_rl/anymal_d_flat/2026-06-13_14-16-21_pretrain_budget5000_fresh/model_5000.pt"
     run_name = "visualize"

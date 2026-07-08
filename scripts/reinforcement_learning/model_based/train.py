@@ -289,7 +289,9 @@ def run_experiment(config: BaseConfig):
     model_experiment = ModelBasedExperiment(**config.experiment_config.to_dict())
     model_experiment.prepare_environment(**config.environment_config.to_dict())
     model_experiment.prepare_model(**config.model_architecture_config.to_dict())
-    model_experiment.prepare_policy(**config.policy_architecture_config.to_dict())
+    policy_config = config.policy_architecture_config.to_dict()
+    policy_config["resume_path"] = args_cli.init_policy_checkpoint
+    model_experiment.prepare_policy(**policy_config)
     model_experiment.prepare_algorithm(**config.policy_algorithm_config.to_dict())
     model_experiment.prepare_data(**config.data_config.to_dict())
     model_experiment.train_policy(log_dir, **config.policy_training_config.to_dict())
@@ -317,10 +319,14 @@ if __name__ == "__main__":
     parser.add_argument("--run_num", type=int, default=None, help="Run number for the experiment on the cluster.")
     parser.add_argument("--penalty", type=float, default=None, help="Override uncertainty_penalty_weight (MOPO penalty).")
     parser.add_argument("--wm-checkpoint", type=str, default=None, help="Path to a checkpoint with system_dynamics_state_dict to load as the world model.")
+    parser.add_argument("--init-policy-checkpoint", type=str, default=None, help="Optional online/RSL policy checkpoint used to initialize the MBPO policy.")
+    parser.add_argument("--wm-ensemble-size", type=int, default=None, help="Override world-model ensemble_size for loading ens1/ens5 checkpoints.")
     args_cli = parser.parse_args()
     config = resolve_task_config(args_cli.task)
     if args_cli.penalty is not None:
         config.environment_config.uncertainty_penalty_weight = args_cli.penalty
     if args_cli.wm_checkpoint is not None:
         config.model_architecture_config.resume_path = args_cli.wm_checkpoint
+    if args_cli.wm_ensemble_size is not None:
+        config.model_architecture_config.ensemble_size = args_cli.wm_ensemble_size
     run(config)

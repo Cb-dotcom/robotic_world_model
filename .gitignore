@@ -72,3 +72,14 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+
+# --- Go2 campaign: never track large datasets or timestamped backups ---
+assets/data/go2/
+assets/data/go2_mixed/
+assets/data/go2_noise/
+assets/data/go2_pilot_1m/
+assets/data/go2_true_mixed_1m_stage_rollout/
+*.bak
+*.bak_*
+*.go2_play_backup_*
+*.go2_render_bak
