@@ -55,17 +55,18 @@ nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv > "$OUT/gpu.tx
 # ---------------------------------------------------------------- 0b. data checks (code review 1.2, ~5 min)
 # (a) reset-row hypothesis: termination rows should show zero action + spawn state.
 # (b) which WM policy _9 was trained against (its training log / config).
+# Diagnostics only: every pipeline ends in "|| true" so a missing dir / no grep match cannot abort the run (set -e + pipefail).
 if [[ "${SKIP_CHECKS:-0}" != 1 ]]; then
   echo "[p1] reset-row check" | tee "$OUT/check_reset_rows.txt"
-  "$PY" analysis/check_reset_rows.py "${TRACE[t9]}" --steps_per_env 1000 2>&1 | grep -v -i warn | tee -a "$OUT/check_reset_rows.txt"
-  "$PY" analysis/check_reset_rows.py "${TRACE[t6]}" --steps_per_env 2000 2>&1 | grep -v -i warn | tee -a "$OUT/check_reset_rows.txt"
+  "$PY" analysis/check_reset_rows.py "${TRACE[t9]}" --steps_per_env 1000 2>&1 | { grep -v -i warn || true; } | tee -a "$OUT/check_reset_rows.txt" || true
+  "$PY" analysis/check_reset_rows.py "${TRACE[t6]}" --steps_per_env 2000 2>&1 | { grep -v -i warn || true; } | tee -a "$OUT/check_reset_rows.txt" || true
   "$PY" analysis/check_reset_rows.py "$ROOT/assets/data/go2_noise/state_action_data_0.csv" \
     "$ROOT/assets/data/go2_pilot_1m/segments_plus_fail_train_flat/*.csv" \
-    "$ROOT/assets/data/go2_true_mixed_1m_stage_rollout/*.csv" 2>&1 | grep -v -i warn | tee -a "$OUT/check_reset_rows.txt"
+    "$ROOT/assets/data/go2_true_mixed_1m_stage_rollout/*.csv" 2>&1 | { grep -v -i warn || true; } | tee -a "$OUT/check_reset_rows.txt" || true
   echo "[p1] which WM was policy _9 trained against?" | tee "$OUT/policy9_wm.txt"
   P9="$ROOT/logs/offline/go2_flat/2026-06-21_14-30-38_9"
-  ls -la "$P9" 2>&1 | head -20 | tee -a "$OUT/policy9_wm.txt"
-  grep -r -h -i -E "load(ing)? (model|wm)|resume_path|wm_path|system_dynamics_load|\.pt" "$P9" --include='*.yaml' --include='*.txt' --include='*.log' --include='*.json' 2>/dev/null | head -20 | tee -a "$OUT/policy9_wm.txt"
+  { ls -la "$P9" 2>&1 || true; } | head -20 | tee -a "$OUT/policy9_wm.txt" || true
+  grep -r -h -i -E "load(ing)? (model|wm)|resume_path|wm_path|system_dynamics_load|\.pt" "$P9" --include='*.yaml' --include='*.txt' --include='*.log' --include='*.json' 2>/dev/null | head -20 | tee -a "$OUT/policy9_wm.txt" || true
 fi
 
 # ---------------------------------------------------------------- 1. main runs (3 WMs x 2 traces)
