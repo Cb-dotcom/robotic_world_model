@@ -96,6 +96,26 @@ Signals (all oriented so that larger = more anomalous)
     tiles with a running top-k (``torch.topk``), then the selected neighbours'
     distances are recomputed directly from coordinate differences.
 
+In-distribution reference (kNN only)
+------------------------------------
+A low kNN AUC can mean "kNN cannot see the pre-fall states" or "the negatives are far
+from the training data too" (e.g. a trace whose policy mostly stands still vs a
+training set without standing). To tell these apart, ``--knn_ref_n`` (default 2000; 0
+disables) training rows are drawn uniformly without replacement
+(``default_rng(--knn_ref_seed)``) from the normalised training feature matrix, and each
+gets its kNN mean distance to the training set *leave-one-out*: exactly its own row
+index is excluded (masked to +inf in its distance tile), so an exact duplicate of it
+elsewhere in the data still counts at distance 0. Per ``k`` the reference median, p90,
+p95, p99 are reported (``summary["knn"]["reference"]["per_k"]["knn{k}"]``), and for
+every positive set and ``neg_scorer`` / ``neg_clean``:
+``frac_above_ref_p95`` = fraction of that set's ``knn{k}`` values strictly above the
+reference p95 (about 0.05 for in-distribution queries) and ``median_ratio`` =
+``median(set) / median(reference)`` (``summary["metrics_ref"]["knn{k}"][set]``).
+Reference distances are saved as ``ref_knn{k}`` (and their rows as ``ref_train_idx``)
+in ``scores.npz``. Note the reference is leave-one-*row*-out: a training row's temporal
+neighbours (rows r-1, r+1 of the same trajectory) remain, so the reference is a lower
+bound on what a genuinely new in-distribution trajectory would score.
+
 Caveat: the ``fall`` / ``lead0`` set is contaminated
 -------------------------------------------------
 IsaacLab resets a terminated env before computing observations, and the reset zeroes
@@ -628,13 +648,24 @@ def wm_norm_stats(ckpt, features: str) -> Tuple[np.ndarray, np.ndarray]:
 
 def knn_mean_distances(
     query: np.ndarray, train: np.ndarray, ks: Sequence[int], device: str = "cpu",
-    query_batch: int = 1024, train_chunk: int = 131072,
+    query_batch: int = 1024, train_chunk: int = 131072, exclude_index: Optional[np.ndarray] = None,
 ) -> Dict[int, np.ndarray]:
-    """Exact kNN: for each k, mean Euclidean distance to the k nearest training rows."""
+    """Exact kNN: for each k, mean Euclidean distance to the k nearest training rows.
+
+    ``exclude_index`` (optional, one training-row index per query, -1 = none): that single
+    training row is never a neighbour of that query (leave-one-out). Only the index is
+    excluded, so an exact duplicate of the row elsewhere in ``train`` still counts (at
+    distance 0).
+    """
     ks = sorted(set(int(k) for k in ks))
     kmax = ks[-1]
-    if kmax > len(train):
-        raise ValueError(f"k={kmax} > number of training rows {len(train)}")
+    n_avail = len(train) - (1 if exclude_index is not None else 0)
+    if kmax > n_avail:
+        raise ValueError(f"k={kmax} > number of available training rows {n_avail}")
+    if exclude_index is not None:
+        exclude_index = np.asarray(exclude_index, dtype=np.int64).reshape(-1)
+        if len(exclude_index) != len(query):
+            raise ValueError("exclude_index must have one entry per query")
     dt = torch.float64
     T = torch.from_numpy(np.ascontiguousarray(train, dtype=np.float64)).to(device=device, dtype=dt)
     Qall = np.ascontiguousarray(query, dtype=np.float64)
@@ -642,10 +673,15 @@ def knn_mean_distances(
     with torch.no_grad():
         for qs in range(0, len(Qall), query_batch):
             Q = torch.from_numpy(Qall[qs:qs + query_batch]).to(device=device, dtype=dt)
+            ex_q = (torch.from_numpy(exclude_index[qs:qs + query_batch]).to(device)
+                    if exclude_index is not None else None)
             best_d: Optional[torch.Tensor] = None
             best_i: Optional[torch.Tensor] = None
             for ts in range(0, T.shape[0], train_chunk):
                 D = torch.cdist(Q, T[ts:ts + train_chunk])
+                if ex_q is not None:  # leave-one-out: mask exactly the self index in this chunk
+                    rows = torch.nonzero((ex_q >= ts) & (ex_q < ts + D.shape[1]), as_tuple=True)[0]
+                    D[rows, ex_q[rows] - ts] = float("inf")
                 kk = min(kmax, D.shape[1])
                 d, i = torch.topk(D, kk, dim=1, largest=False)
                 i = i + ts
@@ -657,6 +693,8 @@ def knn_mean_distances(
                     kk2 = min(kmax, cd.shape[1])
                     best_d, sel = torch.topk(cd, kk2, dim=1, largest=False)
                     best_i = torch.gather(ci, 1, sel)
+            if not bool(torch.isfinite(best_d).all()):
+                raise RuntimeError("kNN selected an excluded row; not enough training rows")
             # recompute the selected neighbours' distances directly (no |a|^2+|b|^2-2ab cancellation)
             nb = T[best_i]  # (q, kmax, dim)
             exact = torch.sqrt(((nb - Q[:, None, :]) ** 2).sum(dim=-1))
@@ -665,6 +703,46 @@ def knn_mean_distances(
             for k in ks:
                 out[k][qs:qs + len(Q)] = ex[:, :k].mean(axis=1)
     return out
+
+
+def sample_reference_rows(n_train: int, n_ref: int, seed: int) -> np.ndarray:
+    """Training-row indices of the in-distribution reference (uniform, no replacement)."""
+    if n_ref <= 0:
+        return np.zeros(0, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    return rng.choice(n_train, size=min(n_ref, n_train), replace=False).astype(np.int64)
+
+
+def reference_quantiles(ref: np.ndarray) -> Dict[str, float]:
+    ref = np.asarray(ref, dtype=np.float64)
+    q = np.percentile(ref, [50, 90, 95, 99])
+    return {"n": int(len(ref)), "median": float(q[0]), "p90": float(q[1]), "p95": float(q[2]), "p99": float(q[3])}
+
+
+def compare_to_reference(vals: np.ndarray, refq: Dict[str, float]) -> Dict[str, float]:
+    """frac of ``vals`` strictly above the reference p95, and median(vals) / median(ref)."""
+    vals = np.asarray(vals, dtype=np.float64)
+    if len(vals) == 0:
+        return {"n": 0, "median": float("nan"), "median_ratio": float("nan"), "frac_above_ref_p95": float("nan")}
+    med = float(np.median(vals))
+    return {"n": int(len(vals)), "median": med,
+            "median_ratio": med / refq["median"] if refq["median"] > 0 else float("inf"),
+            "frac_above_ref_p95": float(np.mean(vals > refq["p95"]))}
+
+
+def print_reference_table(metrics_ref, ref_info, primary: str, rows: Sequence[str]) -> None:
+    q = ref_info["per_k"][primary]
+    print(f"\n=== kNN reference (leave-one-out on training data, n={q['n']}): {primary} ===")
+    print(f"reference {primary}: median={q['median']:.4f} p90={q['p90']:.4f} p95={q['p95']:.4f} p99={q['p99']:.4f}")
+    print(f"{'set':12s} {'n':>6s} {'median':>10s} {'/ref_med':>9s} {'frac>p95':>9s}")
+    for r in rows:
+        m = metrics_ref[primary].get(r)
+        if m is None:
+            continue
+        if m["n"] == 0:
+            print(f"{r:12s} {0:6d} {'n/a':>10s} {'n/a':>9s} {'n/a':>9s}")
+            continue
+        print(f"{r:12s} {m['n']:6d} {m['median']:10.4f} {m['median_ratio']:9.3f} {m['frac_above_ref_p95']:9.3f}")
 
 
 # --------------------------------------------------------------------------------------
@@ -733,6 +811,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--knn_primary_k", type=int, default=10)
     p.add_argument("--knn_query_batch", type=int, default=1024)
     p.add_argument("--knn_train_chunk", type=int, default=131072)
+    p.add_argument("--knn_ref_n", type=int, default=2000,
+                   help="training rows for the leave-one-out in-distribution reference (0 disables)")
+    p.add_argument("--knn_ref_seed", type=int, default=0)
     p.add_argument("--num_neg", type=int, default=5000)
     p.add_argument("--clean_gap", type=int, default=25)
     p.add_argument("--clean_censor_end", type=int, choices=[0, 1], default=1,
@@ -808,6 +889,9 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     signals: Dict[str, np.ndarray] = {}
     inputs: Dict[str, object] = {"trace": file_info(args.trace)}
     knn_meta: Dict[str, object] = {}
+    metrics_ref: Dict[str, Dict[str, Dict[str, float]]] = {}
+    ref_dists: Dict[int, np.ndarray] = {}
+    ref_idx = np.zeros(0, dtype=np.int64)
     parity_lines: List[str] = []
 
     # ---- WM signals
@@ -860,11 +944,26 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         for k in args.knn_k:
             signals[f"knn{k}"] = dists[k]
         print(f"[knn] done in {time.time() - t0:.1f}s")
+        ref_info: Dict[str, object] = {"n": 0, "seed": args.knn_ref_seed}
+        if args.knn_ref_n > 0:
+            t1 = time.time()
+            ref_idx = sample_reference_rows(len(train), args.knn_ref_n, args.knn_ref_seed)
+            ref_dists = knn_mean_distances(train[ref_idx], train, args.knn_k, device, args.knn_query_batch,
+                                           args.knn_train_chunk, exclude_index=ref_idx)
+            ref_info = {"n": int(len(ref_idx)), "seed": args.knn_ref_seed, "leave_one_out": True,
+                        "per_k": {f"knn{k}": reference_quantiles(ref_dists[k]) for k in args.knn_k}}
+            set_rows = {**pos_sets, **{f"neg_{n}": v for n, v in neg_sets.items()}}
+            for k in args.knn_k:
+                sk = f"knn{k}"
+                metrics_ref[sk] = {
+                    name: compare_to_reference(dists[k][np.searchsorted(eval_idx, idx)], ref_info["per_k"][sk])
+                    for name, idx in set_rows.items()}
+            print(f"[knn] reference: {len(ref_idx)} leave-one-out training queries in {time.time() - t1:.1f}s")
         knn_meta = {
             "name": args.knn_name, "patterns": args.knn_train, "files": finfo, "n_train": int(len(train)),
             "dim": int(train.shape[1]), "norm": args.knn_norm, "n_std_floored": n_floored,
             "features": args.knn_features, "pair_offset": args.knn_pair_offset, "ks": args.knn_k,
-            "primary": f"knn{args.knn_primary_k}", "mean": mu, "std": sdv,
+            "primary": f"knn{args.knn_primary_k}", "mean": mu, "std": sdv, "reference": ref_info,
         }
         inputs["knn_train"] = finfo
         del train
@@ -891,6 +990,10 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     npz["in_clean_cand"] = np.isin(eval_idx, clean_cand)
     for sname, sv in signals.items():
         npz[f"sig_{sname}"] = sv
+    if len(ref_idx):
+        npz["ref_train_idx"] = ref_idx
+        for k, v in ref_dists.items():
+            npz[f"ref_knn{k}"] = v
     np.savez_compressed(os.path.join(args.out, "scores.npz"), **npz)
 
     summary = {
@@ -906,6 +1009,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "negative_sets": list(neg_sets.keys()),
         "knn": knn_meta,
         "metrics": metrics,
+        "metrics_ref": metrics_ref,
         "runtime_s": time.time() - t_start,
     }
     with open(os.path.join(args.out, "summary.json"), "w") as fh:
@@ -913,6 +1017,10 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
 
     # ---- printing
     print_table(metrics, pos_sets, neg_sets)
+    if metrics_ref:
+        primary = f"knn{args.knn_primary_k}"
+        rows = [r for r in ("pre5", "pre1", "lead10", "fall") if r in pos_sets] + ["neg_scorer", "neg_clean"]
+        print_reference_table(metrics_ref, knn_meta["reference"], primary, rows)
     if parity_lines:
         print("\n===== BEGIN SCORER-PARITY BLOCK (same lines as score_go2_exploit_trace_uncertainty.py) =====")
         for line in parity_lines:

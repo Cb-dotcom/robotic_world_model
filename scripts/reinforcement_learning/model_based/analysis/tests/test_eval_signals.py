@@ -644,3 +644,131 @@ def test_summarizer(wm_setup):
 
     txt = sp.summarize(str(root))
     assert "curated_t9" in txt and "plusfail_t9" in txt and "pre5" in txt
+
+
+# ======================================================================================
+# In-distribution reference (leave-one-out kNN on the training data)
+# ======================================================================================
+def brute_knn_loo(t, rows, ks):
+    """Leave-one-out brute force: drop exactly column `r` (the self index) for query row r."""
+    d = np.sqrt(((t[rows][:, None, :] - t[None, :, :]) ** 2).sum(-1))
+    d[np.arange(len(rows)), rows] = np.inf
+    d.sort(axis=1)
+    return {k: d[:, :k].mean(axis=1) for k in ks}
+
+
+@needs_torch
+@pytest.mark.parametrize("qb,tc", [(7, 13), (5, 3), (1000, 1000), (4, 1)])
+def test_knn_leave_one_out_excludes_only_self(qb, tc):
+    rng = np.random.default_rng(0)
+    t = rng.normal(size=(120, 6))
+    t[10] = t[3]                 # exact duplicate pair (3, 10)
+    t[50] = t[51] = t[52] = t[7]  # exact quadruplet (7, 50, 51, 52)
+    rows = np.array([3, 10, 7, 50, 0, 119, 64, 52])
+    ks = [1, 2, 3, 5, 10, 50]
+    got = es.knn_mean_distances(t[rows], t, ks, "cpu", query_batch=qb, train_chunk=tc, exclude_index=rows)
+    ref = brute_knn_loo(t, rows, ks)
+    for k in ks:
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-12, atol=1e-12)
+    # a duplicated row gets distance 0 from its twin (not excluded) ...
+    assert got[1][0] == 0.0 and got[1][1] == 0.0
+    # ... and the quadruplet member sees its 3 twins at 0, the 4th neighbour is > 0
+    assert got[3][2] == 0.0 and got[5][2] > 0.0
+    # a non-duplicated row: distance > 0, i.e. self really excluded
+    assert got[1][4] > 0.0
+    # without exclusion the self match is found at 0
+    assert es.knn_mean_distances(t[[0]], t, [1], "cpu")[1][0] == 0.0
+    # per-query exclusion: -1 means no exclusion
+    mix = es.knn_mean_distances(t[[0, 0]], t, [1], "cpu", exclude_index=np.array([0, -1]))
+    assert mix[1][0] > 0 and mix[1][1] == 0.0
+    with pytest.raises(ValueError):
+        es.knn_mean_distances(t[:2], t, [1], "cpu", exclude_index=np.array([0]))
+    with pytest.raises(ValueError):
+        es.knn_mean_distances(t[:2], t[:5], [5], "cpu", exclude_index=np.array([0, 1]))
+
+
+def test_reference_sampling_deterministic():
+    a = es.sample_reference_rows(10000, 2000, 0)
+    b = es.sample_reference_rows(10000, 2000, 0)
+    c = es.sample_reference_rows(10000, 2000, 1)
+    assert np.array_equal(a, b) and not np.array_equal(a, c)
+    assert len(np.unique(a)) == 2000 and a.min() >= 0 and a.max() < 10000
+    assert np.array_equal(a, np.random.default_rng(0).choice(10000, size=2000, replace=False))
+    assert len(es.sample_reference_rows(50, 2000, 0)) == 50  # capped at n_train
+    assert len(es.sample_reference_rows(50, 0, 0)) == 0
+
+
+def test_reference_quantiles_and_frac_above():
+    ref = np.arange(1, 101, dtype=np.float64)  # 1..100
+    q = es.reference_quantiles(ref)
+    assert q["n"] == 100 and q["median"] == 50.5
+    assert q["p95"] == pytest.approx(np.percentile(ref, 95))  # 95.05
+    vals = np.array([10.0, 95.0, 95.05, 96.0, 200.0])
+    m = es.compare_to_reference(vals, q)
+    assert m["frac_above_ref_p95"] == pytest.approx(2 / 5)  # strictly above 95.05: 96, 200
+    assert m["median_ratio"] == pytest.approx(95.05 / 50.5)
+    assert m["n"] == 5 and m["median"] == 95.05
+    e = es.compare_to_reference(np.zeros(0), q)
+    assert e["n"] == 0 and np.isnan(e["frac_above_ref_p95"])
+
+
+@needs_rsl
+def test_end_to_end_reference(wm_setup, capsys):
+    d, wm, trace, knn = wm_setup
+    out = d / "out_ref"
+    summary = _run(out, trace=trace, knn=knn, extra=["--knn_ref_n", "300", "--knn_ref_seed", "3"])
+    printed = capsys.readouterr().out
+    assert "kNN reference (leave-one-out on training data" in printed
+    z = np.load(out / "scores.npz")
+    ref_rows = z["ref_train_idx"]
+    assert len(ref_rows) == 300
+    assert np.array_equal(ref_rows, es.sample_reference_rows(summary["knn"]["n_train"], 300, 3))
+    # recompute the normalised training matrix independently and check LOO distances
+    files = sorted(f for f in glob.glob(knn) if not f.endswith("manifest.csv"))
+    train = []
+    for f in files:
+        x = pd.read_csv(f, header=None).values.astype(np.float32).astype(np.float64)
+        train.append(np.c_[x[:-1, :45], x[1:, 45:57]])
+    train = np.concatenate(train)
+    mu, sd = train.mean(0), np.maximum(train.std(0), 1e-6)
+    tn = (train - mu) / sd
+    ref = brute_knn_loo(tn, ref_rows, [1, 5, 10, 50])
+    for k in (1, 5, 10, 50):
+        np.testing.assert_allclose(z[f"ref_knn{k}"], ref[k], rtol=1e-10, atol=1e-12)
+    with open(out / "summary.json") as fh:
+        js = json.load(fh)
+    r = js["knn"]["reference"]
+    assert r["n"] == 300 and r["leave_one_out"] is True
+    q10 = r["per_k"]["knn10"]
+    assert q10["median"] == pytest.approx(np.median(ref[10]))
+    assert q10["p95"] == pytest.approx(np.percentile(ref[10], 95))
+    mr = js["metrics_ref"]["knn10"]
+    assert {"fall", "pre1", "pre5", "lead10", "neg_scorer", "neg_clean"} <= set(mr)
+    v = z["sig_knn10"][z["in_neg_clean"]]
+    assert mr["neg_clean"]["frac_above_ref_p95"] == pytest.approx(np.mean(v > q10["p95"]))
+    assert mr["neg_clean"]["median_ratio"] == pytest.approx(np.median(v) / q10["median"])
+    assert mr["neg_clean"]["n"] == len(v)
+    # disabled reference
+    s0 = _run(d / "out_ref0", trace=trace, knn=knn, extra=["--knn_ref_n", "0"])
+    assert s0["knn"]["reference"]["n"] == 0 and s0["metrics_ref"] == {}
+    assert "ref_knn10" not in np.load(d / "out_ref0" / "scores.npz").files
+
+
+@needs_rsl
+def test_summarizer_reference_table(wm_setup):
+    d, wm, trace, knn = wm_setup
+    root = d / "results_ref"
+    _run(root / "curated_t9", trace=trace, knn=knn, extra=["--knn_ref_n", "200"])
+    _run(root / "plusfail_t9", wm=wm, trace=trace)  # no kNN -> not in the reference table
+    import summarize_p1_eval as sp
+
+    txt = sp.summarize(str(root))
+    assert "kNN in-distribution reference (knn10" in txt
+    tail = txt.split("kNN in-distribution reference")[1]
+    assert "curated_t9" in tail and "plusfail_t9" not in tail
+    js = json.load(open(root / "curated_t9" / "summary.json"))
+    assert f"{js['metrics_ref']['knn10']['neg_clean']['median_ratio']:.3f}" in tail
+    # existing output unchanged: the new table is appended after the existing note line
+    head = txt.split("\n=== kNN in-distribution")[0].rstrip()
+    assert head.endswith("use pre5/pre1/lead10.")
+    assert head.count("=== negatives = ") == 2

@@ -64,7 +64,31 @@ def summarize(root: str, signals: Sequence[str] = ("epi", "term_logit", "knn10")
         f"{n}:{js['metrics'][s]['pre5']['scorer']['boot_skipped']}"
         for n, js in runs for s in signals[:1] if s in js.get("metrics", {})))
     out.append("note: 'fall' is contaminated by the reset row (spawn state + zero action); use pre5/pre1/lead10.")
+    out.extend(reference_table(runs))
     return "\n".join(out)
+
+
+def reference_table(runs, sk: str = "knn10") -> List[str]:
+    """Per run: median kNN of clean negatives / pre5 relative to the leave-one-out training reference."""
+    runs = [(n, js) for n, js in runs if sk in (js.get("metrics_ref") or {})]
+    if not runs:
+        return []
+    namew = max(12, max(len(n) for n, _ in runs))
+    out = [f"\n=== kNN in-distribution reference ({sk}, leave-one-out on own training data) ===",
+           f"{'run':{namew}s} {'ref_med':>8s} {'ref_p95':>8s} | {'cleanneg/ref':>12s} {'frac>p95':>8s}"
+           f" | {'pre5/ref':>8s} {'frac>p95':>8s}"]
+    nan = float("nan")
+    f = lambda v: nan if v is None else v
+    for name, js in runs:
+        q = js["knn"]["reference"]["per_k"][sk]
+        m = js["metrics_ref"][sk]
+        c, p = m.get("neg_clean", {}), m.get("pre5", {})
+        out.append(f"{name:{namew}s} {q['median']:8.4f} {q['p95']:8.4f} | {f(c.get('median_ratio')):12.3f} "
+                   f"{f(c.get('frac_above_ref_p95')):8.3f} | {f(p.get('median_ratio')):8.3f} "
+                   f"{f(p.get('frac_above_ref_p95')):8.3f}")
+    out.append("(in-distribution queries: ratio ~1, frac>p95 ~0.05; clean negatives far above 1 => the trace's "
+               "walking states are themselves novel w.r.t. this training set)")
+    return out
 
 
 def write_csv(root: str, path: str) -> None:
