@@ -548,6 +548,18 @@ def test_wm_parity_with_scorer_logic(wm_setup):
 
 
 @needs_rsl
+def test_term_logit_consistent_with_term(wm_setup):
+    """term_logit comes from the same forward pass: sigmoid(term_logit) == term."""
+    d, wm, trace, knn = wm_setup
+    out = d / "out_logit"
+    _run(out, wm=wm, trace=trace)
+    z = np.load(out / "scores.npz")
+    assert "sig_term_logit" in z.files
+    sig = 1.0 / (1.0 + np.exp(-z["sig_term_logit"].astype(np.float64)))
+    np.testing.assert_allclose(sig, z["sig_term"], rtol=0, atol=1e-6)
+
+
+@needs_rsl
 def test_scorer_stdout_parity_subprocess(wm_setup):
     """Run the real scorer script and diff its stdout against scorer_parity.txt."""
     d, wm, trace, knn = wm_setup

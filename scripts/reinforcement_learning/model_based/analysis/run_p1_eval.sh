@@ -95,7 +95,7 @@ echo "[p1] headline (expect curated_t9 0.969, plusfail_t9 0.649):"
 for d in "$OUT"/*_t9; do [[ -f "$d/scorer_parity.txt" ]] && echo "  $(basename "$d"): $(grep 'epi(pre5' "$d/scorer_parity.txt")"; done
 
 # ---------------------------------------------------------------- 3. comparison table
-"$PY" analysis/summarize_p1_eval.py "$OUT" --signals epi,term,knn10 --sets pre5,fall
+"$PY" analysis/summarize_p1_eval.py "$OUT" --signals epi,term_logit,knn10 --sets pre5,pre1,lead10,fall
 
 # ---------------------------------------------------------------- 4. optional robustness block (if time allows)
 # kNN variants on trace _9 only: pair offset 0, state-only features, WM normalisation.

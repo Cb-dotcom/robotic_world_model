@@ -36,8 +36,8 @@ def load_runs(root: str):
     return runs
 
 
-def summarize(root: str, signals: Sequence[str] = ("epi", "term", "knn10"),
-              sets: Sequence[str] = ("pre5", "fall")) -> str:
+def summarize(root: str, signals: Sequence[str] = ("epi", "term_logit", "knn10"),
+              sets: Sequence[str] = ("pre5", "pre1", "lead10", "fall")) -> str:
     runs = load_runs(root)
     if not runs:
         return f"no */summary.json under {root}"
@@ -63,6 +63,7 @@ def summarize(root: str, signals: Sequence[str] = ("epi", "term", "knn10"),
     out.append("\nboot_skipped (pre5, scorer negs): " + ", ".join(
         f"{n}:{js['metrics'][s]['pre5']['scorer']['boot_skipped']}"
         for n, js in runs for s in signals[:1] if s in js.get("metrics", {})))
+    out.append("note: 'fall' is contaminated by the reset row (spawn state + zero action); use pre5/pre1/lead10.")
     return "\n".join(out)
 
 
@@ -82,8 +83,8 @@ def write_csv(root: str, path: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
-    ap.add_argument("--signals", default="epi,term,knn10")
-    ap.add_argument("--sets", default="pre5,fall")
+    ap.add_argument("--signals", default="epi,term_logit,knn10")
+    ap.add_argument("--sets", default="pre5,pre1,lead10,fall")
     a = ap.parse_args()
     txt = summarize(a.root, a.signals.split(","), a.sets.split(","))
     print(txt)

@@ -74,6 +74,8 @@ Signals (all oriented so that larger = more anomalous)
   ``window(f)`` input, batch size 1. ``epi`` = sum over state dims of the across-head
   std of the predicted means; ``alea`` = sum over dims of the head-mean predicted std;
   ``term`` = sigmoid of the head-mean termination logit.
+* ``term_logit`` (``--wm``): the head-mean termination logit from the same forward
+  pass; same ranking as ``term`` but without float32 saturation ties at p = 1.0.
 * ``knn{k}`` (``--knn_train``): mean Euclidean distance from the query feature to its
   ``k`` nearest training features, in a normalised feature space.
 
@@ -93,6 +95,15 @@ Signals (all oriented so that larger = more anomalous)
   - Exact distances: float64 ``torch.cdist`` over (query batch x training chunk)
     tiles with a running top-k (``torch.topk``), then the selected neighbours'
     distances are recomputed directly from coordinate differences.
+
+Caveat: the ``fall`` / ``lead0`` set is contaminated
+-------------------------------------------------
+IsaacLab resets a terminated env before computing observations, and the reset zeroes
+the last action. So a logged termination row ``f`` holds the *spawn* state of the next
+episode and an all-zero action. ``window(f)`` ends with that zero action, and the kNN
+query of ``f`` uses it too, so any "fall" AUC partly measures "is the last action zero"
+(code review 1.2, 2026-10-08). Use ``pre1`` / ``pre5`` / ``lead{k>=1}`` as the primary
+sets; ``fall`` is kept only for parity with the scorer.
 
 Metrics (per signal x positive set x negative set)
 --------------------------------------------------
@@ -455,8 +466,12 @@ def wm_normalize(state_all: np.ndarray, action_all: np.ndarray, ckpt) -> Tuple[n
 
 
 def wm_score_indices(sd, state_all: np.ndarray, action_all: np.ndarray, idx: Sequence[int], H: int, device: str,
-                     progress_every: int = 0) -> np.ndarray:
-    """Per-sample scorer path: returns (n, 3) float64 array of (epi, alea, term_p)."""
+                     progress_every: int = 0, with_logit: bool = False) -> np.ndarray:
+    """Per-sample scorer path: returns (n, 3) float64 array of (epi, alea, term_p).
+
+    With ``with_logit=True`` a 4th column holds the raw head-mean termination logit from
+    the same forward pass (no saturation at p = 1.0, so its AUC has no float32 ties).
+    """
 
     def window(f):
         xs = torch.from_numpy(state_all[f - H:f]).to(device).unsqueeze(0)
@@ -471,6 +486,9 @@ def wm_score_indices(sd, state_all: np.ndarray, action_all: np.ndarray, idx: Seq
         epi_v = float(epi.detach().cpu().reshape(-1)[0].item())
         alea_v = float(alea.detach().cpu().reshape(-1)[0].item())
         term_p = float(torch.sigmoid(term).detach().cpu().reshape(-1)[0].item()) if term is not None else float("nan")
+        if with_logit:
+            term_l = float(term.detach().cpu().reshape(-1)[0].item()) if term is not None else float("nan")
+            return epi_v, alea_v, term_p, term_l
         return epi_v, alea_v, term_p
 
     out = []
@@ -479,7 +497,7 @@ def wm_score_indices(sd, state_all: np.ndarray, action_all: np.ndarray, idx: Seq
         out.append(score_one(f))
         if progress_every and (i + 1) % progress_every == 0:
             print(f"[wm] {i + 1}/{len(idx)} samples ({time.time() - t0:.1f}s)")
-    return np.array(out, dtype=np.float64).reshape(-1, 3)
+    return np.array(out, dtype=np.float64).reshape(-1, 4 if with_logit else 3)
 
 
 def scorer_stats_line(name, x) -> str:
@@ -801,14 +819,15 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         inputs["wm"] = file_info(args.wm)
         state_wm, action_wm, norm_msg = wm_normalize(state_raw, action_raw, ckpt)
         print(norm_msg)
-        vals = wm_score_indices(sd, state_wm, action_wm, eval_idx, H, device, progress_every=2000)
+        vals = wm_score_indices(sd, state_wm, action_wm, eval_idx, H, device, progress_every=2000, with_logit=True)
         signals["epi"], signals["alea"], signals["term"] = vals[:, 0], vals[:, 1], vals[:, 2]
+        signals["term_logit"] = vals[:, 3]
         print(f"[wm] scored {len(eval_idx)} indices in {time.time() - t0:.1f}s")
 
         def take(idx):
             if len(idx) == 0:
                 return np.zeros((0, 3))
-            return vals[[pos_in_eval[int(f)] for f in idx]]
+            return vals[[pos_in_eval[int(f)] for f in idx]][:, :3]
 
         parity_lines = scorer_parity_lines(
             norm_msg, args.wm, args.trace, len(data), args.num_envs, args.steps_per_env, H, sets, neg_idx,
