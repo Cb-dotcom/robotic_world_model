@@ -75,8 +75,8 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
-_set_lighting_mode("Grey Studio") # Colored Lights
+# headless: from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
+# headless: _set_lighting_mode("Grey Studio") # Colored Lights
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 import mbrl.tasks  # noqa: F401
@@ -88,7 +88,41 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs *= 2
+    import os as _os
+    _preset = _os.environ.get("RENDER_PRESET", "forward")
+
+    try:
+
+        env_cfg.scene.sky_light.spawn.intensity = 500.0
+
+        env_cfg.scene.sky_light.spawn.texture_file = None
+
+    except Exception as _e:
+
+        print("[lighting] could not set sky_light:", _e)
+    try:
+        env_cfg.scene.sky_light.spawn.intensity = 300.0
+        env_cfg.scene.sky_light.spawn.texture_file = None
+    except Exception as _e:
+        print("[lighting] could not set sky_light:", _e)
+    _cmd = env_cfg.commands.base_velocity
+    _cmd.heading_command = False
+    _cmd.rel_standing_envs = 0.0
+    if _preset == "random":
+        env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else 36
+        _cmd.ranges.lin_vel_x = (-0.8, 1.0); _cmd.ranges.lin_vel_y = (-0.6, 0.6); _cmd.ranges.ang_vel_z = (-1.2, 1.2)
+        _cmd.resampling_time_range = (2.0, 3.0)
+        env_cfg.viewer.origin_type = "world"; env_cfg.viewer.env_index = 0
+        env_cfg.viewer.eye = (16.0, -16.0, 11.0); env_cfg.viewer.lookat = (0.0, 0.0, 0.0)
+    else:
+        env_cfg.scene.num_envs = 1
+        if _preset == "multicmd":
+            _cmd.ranges.lin_vel_x = (0.0, 0.8); _cmd.ranges.lin_vel_y = (-0.4, 0.4); _cmd.ranges.ang_vel_z = (-1.0, 1.0)
+            _cmd.resampling_time_range = (2.0, 2.5)
+        else:
+            _cmd.ranges.lin_vel_x = (0.4, 0.4); _cmd.ranges.lin_vel_y = (0.0, 0.0); _cmd.ranges.ang_vel_z = (0.0, 0.0)
+        env_cfg.viewer.origin_type = "asset_root"; env_cfg.viewer.asset_name = "robot"; env_cfg.viewer.env_index = 0
+        env_cfg.viewer.eye = (2.5, -2.5, 1.3); env_cfg.viewer.lookat = (0.0, 0.0, 0.3)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -154,7 +188,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
-    env.unwrapped.init_imagination_history(agent_cfg.system_dynamics.history_horizon)
+    if hasattr(env.unwrapped, "init_imagination_history"):
+        env.unwrapped.init_imagination_history(agent_cfg.system_dynamics.history_horizon)
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
