@@ -691,3 +691,21 @@ def test_score_refuses_unfinished(fake_layout):
     env = shell_env(fake_layout, TAG="partest_missing", NUM_ENVS=4, STEPS_T9=100, STEPS_T6=120)
     s = run_sh("score_p1_refit.sh", env)
     assert s.returncode != 0 and "missing checkpoint" in s.stdout
+
+
+# ======================================================================================
+# B3 wrapper (refit/fit_reset_per_head.py)
+# ======================================================================================
+def test_b3_wrapper_changes_training_and_marks_provenance(tmp_path):
+    data = pilot64_dir(tmp_path)
+    (tmp_path / "plain").mkdir(); (tmp_path / "b3").mkdir()
+    a, b = str(tmp_path / "plain" / "m.pt"), str(tmp_path / "b3" / "m.pt")
+    run_fitter(FITTER, ["--data", data, "--output", a, "--seed", "0"] + TINY_FIT)
+    p = run_fitter(os.path.join(REFIT_DIR, "fit_reset_per_head.py"), ["--data", data, "--output", b, "--seed", "0"] + TINY_FIT)
+    assert "[b3] SystemDynamicsEnsemble patched" in p.stdout and "[b3] marked" in p.stdout
+    A, B = load(a), load(b)
+    assert "b3_reset_per_head" not in A["provenance"] and B["provenance"]["b3_reset_per_head"] is True
+    assert A["provenance"]["seed"] == B["provenance"]["seed"] == 0
+    assert not same_state_dict(A["system_dynamics_state_dict"], B["system_dynamics_state_dict"])
+    for f in glob.glob(str(tmp_path / "b3" / "*.pt")):
+        assert load(f)["provenance"]["b3_reset_per_head"] is True

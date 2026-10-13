@@ -87,9 +87,36 @@ class BaseEnv:
         num_random_envs = num_reset_envs - num_init_envs
         state_history_init, action_history_init = self.init_dataset.sample_batch(num_init_envs, normalized=True)
         state_history_random, action_history_random = self.dataset.sample_batch(num_random_envs, normalized=True)
-        state_history[env_ids] = torch.cat([state_history_init, state_history_random], dim=0)[:, -state_history.shape[1]:]
-        action_history[env_ids] = torch.cat([action_history_init, action_history_random], dim=0)[:, -action_history.shape[1]:]
+        state_new = torch.cat([state_history_init, state_history_random], dim=0)
+        action_new = torch.cat([action_history_init, action_history_random], dim=0)
+        if getattr(self, "warm_start_resets", False) and self.common_step_counter > 0:
+            # B7 fix (opt-in): the next step feeds only the last state, so rebuild the GRU memory of the
+            # reset envs from the full sampled history. Then the first prediction after a reset sees the
+            # same 32-step context as the very first imagination step (and as WM training).
+            self._warm_memory(env_ids, state_new, action_new)
+        state_history[env_ids] = state_new[:, -state_history.shape[1]:]
+        action_history[env_ids] = action_new[:, -action_history.shape[1]:]
         return state_history, action_history
+
+    def _warm_memory(self, env_ids, state_new, action_new):
+        """Set the GRU memory of env_ids to what a zero-start pass over the sampled history leaves.
+
+        Pairs follow imagination_step: state j goes with action j+1. The last state is fed by the next
+        step together with the policy's new action, so the warm-up covers states 0..H-2.
+        """
+        if state_new.shape[1] < 2:
+            return
+        x = torch.cat([state_new[:, :-1], action_new[:, 1:]], dim=-1)
+        for base in (self.system_dynamics.state_base, self.system_dynamics.auxiliary_base):
+            mem = getattr(base, "memory", None)
+            if mem is None:  # MLP base: no memory to warm
+                continue
+            if isinstance(mem.hidden_states, tuple):
+                raise NotImplementedError("warm_start_resets supports GRU memory only")
+            _, h = mem.rnn(x)
+            if mem.hidden_states is None:
+                mem.hidden_states = torch.zeros(h.shape[0], self._num_envs, h.shape[2], device=h.device, dtype=h.dtype)
+            mem.hidden_states[:, env_ids] = h
 
     def _init_imagination_reward_buffer(self):
         self.episode_length_buf = torch.zeros(self._num_envs, device=self.device, dtype=torch.long)
