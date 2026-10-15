@@ -49,6 +49,10 @@ class EpisodeStats:
         self._batch_fall_frac: list[float] = []
         self._batch_to_frac: list[float] = []
         self.all_step_r: list[float] = []  # per-step tracking, all counted env-steps
+        # command changes (xy part only; it changes only when the command is resampled)
+        self._prev_cmd = np.full((self.n, 2), np.nan)
+        self._last_change_len = np.zeros(self.n, dtype=np.int64)
+        self._last_jump = np.full(self.n, np.nan)
 
     def _reset_acc(self, ids):
         if not hasattr(self, "_r_sum"):
@@ -93,6 +97,11 @@ class EpisodeStats:
             if len(tail) > 50:
                 tail.pop(0)
         self.all_step_r.extend(r[use].tolist())
+        jump = np.linalg.norm(cmd - self._prev_cmd, axis=-1)
+        changed = use & ~np.isnan(jump) & (jump > 1e-6)
+        self._last_change_len[changed] = self._len[changed]
+        self._last_jump[changed] = jump[changed]
+        self._prev_cmd[use] = cmd[use]
 
         ids = np.nonzero(done)[0]
         if len(ids):
@@ -108,6 +117,9 @@ class EpisodeStats:
             self._reset_acc(ids)
             self._start[ids] = self._t + 1
             self._len[ids] = 0
+            self._prev_cmd[ids] = cmd[ids]  # the new episode's first command (sampled at reset)
+            self._last_change_len[ids] = 0
+            self._last_jump[ids] = np.nan
 
         if self._last_batch_track is not None:
             self._stale_track_sum += self._last_batch_track
@@ -131,6 +143,10 @@ class EpisodeStats:
             "mean_speed_cmd": float(self._spd_cmd[i] / c) if self._r_cnt[i] else float("nan"),
             "mean_speed_act": float(self._spd_act[i] / c) if self._r_cnt[i] else float("nan"),
             "track_last50": float(np.mean(self._r_tail[i])) if self._r_tail[i] else float("nan"),
+            # steps from the last command change (or episode start) to the end of the episode
+            "steps_since_cmd_change": int(self._len[i] - self._last_change_len[i]),
+            "last_cmd_jump": float(self._last_jump[i]),
+            "cmd_speed_end": float(np.linalg.norm(self._prev_cmd[i])) if not np.isnan(self._prev_cmd[i]).any() else float("nan"),
         }
         self.episodes.append(ep)
         return ep
@@ -166,6 +182,12 @@ class EpisodeStats:
             "emulated_reset_steps_track": _nanmean(self._batch_track),
             "emulated_reset_steps_base_contact": _nanmean(self._batch_fall_frac),
             "emulated_reset_steps_time_out": _nanmean(self._batch_to_frac),
+            # old method if env.reset() at step 0 already wrote a zero-valued log (C7 follow-up)
+            "emulated_logged_track_from_step0": self._stale_track_sum / self._t if self._t else float("nan"),
+            "emulated_logged_base_contact_from_step0": self._stale_fall_sum / self._t if self._t else float("nan"),
+            "emulated_logged_time_out_from_step0": self._stale_to_sum / self._t if self._t else float("nan"),
+            "falls_within_100_steps_of_cmd_change": sum(1 for e in falls if e["steps_since_cmd_change"] <= 100),
+            "median_steps_since_cmd_change_at_fall": float(np.median([e["steps_since_cmd_change"] for e in falls])) if falls else float("nan"),
             "speed_cmd_fall": _nanmean([e["mean_speed_cmd"] for e in falls]),
             "speed_cmd_no_fall": _nanmean([e["mean_speed_cmd"] for e in eps if not e["fall"]]),
         }

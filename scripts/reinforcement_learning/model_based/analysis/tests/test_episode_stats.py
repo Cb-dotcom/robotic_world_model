@@ -114,3 +114,30 @@ def test_censored_never_a_fall_and_format():
     assert np.isnan(s["fall_rate_completed"])
     txt = format_summary(s)
     assert "EPISODE STATS" in txt and "time_to_fall" in txt
+
+
+def test_command_change_tracking():
+    n = 1
+    # command 0.5 until step 99, then 1.0; fall at step 149 -> 49 steps after the change step (t=100)
+    cmd = lambda t: np.array([[0.5 if t < 100 else 1.0, 0.0]])
+    st = _run(n, 300, cmd, cmd, lambda t: np.array([t == 149]), lambda t: np.array([False]))
+    ep = [e for e in st.episodes if e["fall"]][0]
+    assert ep["length"] == 150
+    assert ep["steps_since_cmd_change"] == 49
+    assert ep["last_cmd_jump"] == pytest.approx(0.5)
+    assert ep["cmd_speed_end"] == pytest.approx(1.0)
+    s = st.summary()
+    assert s["falls_within_100_steps_of_cmd_change"] == 1
+    # the next episode starts with the post-reset command: no false "change" at its step 1
+    nxt = [e for e in st.episodes if e["censored"]][0]
+    assert nxt["steps_since_cmd_change"] == nxt["length"]
+
+
+def test_zero_log_from_step0_variant():
+    n = 2
+    st = _run(n, 100, lambda t: np.zeros((n, 2)), lambda t: np.zeros((n, 2)),
+              lambda t: np.array([t == 19, False]), lambda t: np.zeros(n, bool))
+    s = st.summary()
+    # stale values start at step 19 (81 steps); the step-0 variant divides by all 100 steps
+    assert s["emulated_logged_base_contact"] == pytest.approx(0.5)
+    assert s["emulated_logged_base_contact_from_step0"] == pytest.approx(0.5 * 81 / 100)

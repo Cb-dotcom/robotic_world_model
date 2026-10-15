@@ -31,6 +31,8 @@ parser.add_argument("--task", type=str, default=None)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--num_steps", type=int, default=2000)
 parser.add_argument("--std", type=float, default=0.5, help="Tracking sigma (Isaac Lab track_lin_vel_xy_exp: sqrt(0.25)).")
+parser.add_argument("--no_push", action="store_true", default=False, help="Disable the push_robot interval event (diagnosis).")
+parser.add_argument("--cmd_resample_s", type=float, default=None, help="Set the command resampling time (s), e.g. 30 = never within a 20 s episode.")
 parser.add_argument("--out_csv", type=str, default=None, help="Per-episode CSV (default: next to checkpoint).")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -72,6 +74,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
+    if args_cli.no_push:
+        env_cfg.events.push_robot = None
+        print("[eval_ep] push_robot event DISABLED")
+    if args_cli.cmd_resample_s is not None:
+        env_cfg.commands.base_velocity.resampling_time_range = (args_cli.cmd_resample_s, args_cli.cmd_resample_s)
+        print(f"[eval_ep] command resampling_time_range = {env_cfg.commands.base_velocity.resampling_time_range}")
+    try:
+        print("[eval_ep] push_robot cfg:", env_cfg.events.push_robot)
+        print("[eval_ep] command resampling_time_range:", env_cfg.commands.base_velocity.resampling_time_range)
+    except Exception as e:
+        print(f"[eval_ep] (could not read event/command cfg: {e})")
     if not args_cli.checkpoint:
         raise ValueError("--checkpoint must point to a policy_*.pt (offline) or model_*.pt (pretrain)")
     resume_path = retrieve_file_path(args_cli.checkpoint)
@@ -145,6 +158,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"  (variant 'log cleared every step': track {s['emulated_reset_steps_track']:.4f}, "
           f"base_contact {s['emulated_reset_steps_base_contact']:.4f}, time_out {s['emulated_reset_steps_time_out']:.4f})")
     ratio = old_bc / (old_bc + old_to) if (old_bc + old_to) > 0 else float("nan")
+    print(f"  (variant 'zero log from step 0': track {s['emulated_logged_track_from_step0']:.4f}, "
+          f"base_contact {s['emulated_logged_base_contact_from_step0']:.4f}, time_out {s['emulated_logged_time_out_from_step0']:.4f})")
     print(f"  old falls ratio base_contact/(base_contact+time_out): {ratio:.4f}   per-episode fall rate: {s['fall_rate_completed']:.4f}")
     print("----------------------------------------------------------------------")
 
@@ -157,7 +172,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             w.writerow(e)
     with open(os.path.splitext(out_csv)[0] + "_summary.json", "w") as f:
         json.dump({"checkpoint": resume_path, "task": args_cli.task, "num_envs": args_cli.num_envs,
-                   "num_steps": args_cli.num_steps, "summary": s, "old_logs": old}, f, indent=1)
+                   "num_steps": args_cli.num_steps, "no_push": args_cli.no_push,
+                   "cmd_resample_s": args_cli.cmd_resample_s, "summary": s, "old_logs": old}, f, indent=1)
     print(f"[eval_ep] wrote {out_csv}")
 
     env.close()
