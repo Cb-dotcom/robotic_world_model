@@ -61,6 +61,49 @@ def test_done_step_measurement_not_counted():
     assert st.summary()["track_per_step"] == pytest.approx(1.0)
 
 
+def test_speed_aggregation_uses_counted_steps_and_excludes_reset_measurements():
+    # Different episode lengths and speeds expose episode-mean / length-weighting errors.
+    # The first episode closes at step 1 (one counted step); the second closes at
+    # step 4 (two counted steps); the last is censored (one counted step).
+    commands = [1.0, 1000.0, 2.0, 4.0, 2000.0, 3.0]
+    speeds = [0.5, 9000.0, 1.0, 3.0, 8000.0, 1.5]
+    st = _run(1, len(commands), lambda t: np.array([[commands[t], 0.0]]),
+              lambda t: np.array([[speeds[t], 0.0]]),
+              lambda t: np.array([t in (1, 4)]), lambda t: np.array([t == 4]))
+    assert [e["length"] for e in st.episodes] == [2, 3, 1]
+    assert [e["counted_steps"] for e in st.episodes] == [1, 2, 1]
+    s = st.summary()
+    assert s["counted_steps"] == 4
+    assert s["speed_cmd_per_step"] == pytest.approx(10.0 / 4)
+    assert s["speed_act_per_step"] == pytest.approx(6.0 / 4)
+    assert s["speed_ratio"] == pytest.approx(6.0 / 10)
+
+
+def test_speed_aggregation_skips_episodes_without_measurements():
+    st = _run(1, 2, lambda t: np.array([[1.0, 0.0]]), lambda t: np.array([[0.5, 0.0]]),
+              lambda t: np.array([t == 0]), lambda t: np.array([False]))
+    assert [e["counted_steps"] for e in st.episodes] == [0, 1]
+    assert np.isnan(st.episodes[0]["mean_speed_cmd"])
+    assert st.summary()["speed_ratio"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("case", ["empty", "all_done", "zero_command"])
+def test_speed_aggregation_without_valid_denominator(case):
+    st = _run(1, 0 if case == "empty" else 2,
+              lambda t: np.array([[0.0 if case == "zero_command" else 1.0, 0.0]]),
+              lambda t: np.array([[0.5, 0.0]]),
+              lambda t: np.array([case == "all_done"]), lambda t: np.array([False]))
+    s = st.summary()
+    assert np.isnan(s["speed_ratio"])
+    if case == "zero_command":
+        assert s["speed_cmd_per_step"] == 0.0
+        assert s["speed_act_per_step"] == 0.5
+    else:
+        assert s["counted_steps"] == 0
+        assert np.isnan(s["speed_cmd_per_step"])
+        assert np.isnan(s["speed_act_per_step"])
+
+
 def test_tracking_formula():
     n = 1
     st = _run(n, 10, lambda t: np.array([[1.0, 0.0]]), lambda t: np.array([[0.5, 0.0]]),

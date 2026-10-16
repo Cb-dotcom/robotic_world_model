@@ -61,42 +61,71 @@ def setup(tmp_path):
 
 
 @torch.no_grad()
-def test_warm_reset_equals_full_window_start(setup):
+@pytest.mark.parametrize("selected_member", [False, True], ids=["ensemble-mean", "selected-member"])
+def test_warm_reset_equals_full_window_start(setup, selected_member):
     sd, S_run, A_run, S_new, A_new, a_next = setup
-    ids = torch.tensor([1, 4])
+    # Unsorted, nonconsecutive ids catch warming the wrong batch rows or reordering them.
+    ids = torch.tensor([4, 1])
+    keep = [0, 2, 3, 5]
+    model_ids = (torch.arange(N) % sd.ensemble_size).reshape(1, N, 1) if selected_member else None
+    ref_model_ids = model_ids[:, ids] if selected_member else None
     # reference: what the very first imagination step does with the full sampled window
     sd.reset()
-    ref_mean, _, ref_epi, *_ = sd.forward(S_new[ids], torch.cat([A_new[ids, 1:], a_next[ids, None]], 1))
+    reference = sd.forward(
+        S_new[ids], torch.cat([A_new[ids, 1:], a_next[ids, None]], 1), ref_model_ids
+    )
+    ref_hidden = {
+        name: getattr(sd, name).memory.hidden_states.clone()
+        for name in ("state_base", "auxiliary_base")
+    }
+    assert reference[4] is not None and reference[4].shape == (len(ids), 8)
+    assert reference[5] is not None and reference[5].shape == (len(ids), 1)
     # running envs: memory built from other trajectories
     sd.reset()
     sd.forward(S_run, A_run)
-    keep = [0, 2, 3, 5]
-    h_keep = sd.state_base.memory.hidden_states[:, keep].clone()
+    h_keep = {
+        name: getattr(sd, name).memory.hidden_states[:, keep].clone()
+        for name in ("state_base", "auxiliary_base")
+    }
     sd.reset_partial(ids)                                   # as _reset_idx does
     env = _env(sd, S_new[ids], A_new[ids], warm=True)
     sh = torch.zeros(N, 1, 45); ah = torch.zeros(N, 1, 12)
     sh, ah = env._reset_imagination_history(ids, sh, ah)
     assert torch.equal(sh[ids, 0], S_new[ids, -1]) and torch.equal(ah[ids, 0], A_new[ids, -1])
-    assert torch.equal(sd.state_base.memory.hidden_states[:, keep], h_keep)   # others untouched
+    for name, before in h_keep.items():
+        assert torch.equal(getattr(sd, name).memory.hidden_states[:, keep], before), name
     ah_step = torch.cat([ah[:, 1:], a_next[:, None]], 1)                      # as imagination_step
-    mean, _, epi, *_ = sd.forward(sh, ah_step)
-    assert torch.allclose(mean[ids], ref_mean, atol=1e-5)
-    assert torch.allclose(epi[ids], ref_epi, atol=1e-5)
+    actual = sd.forward(sh, ah_step, model_ids)
+    # Exercise real auxiliary heads as well as state prediction: termination/contact
+    # logits need exactly the same history even when a single ensemble member is used.
+    for name, observed, expected in zip(
+        ("state", "aleatoric", "epistemic", "extensions", "contacts", "terminations"), actual, reference
+    ):
+        if expected is None:
+            assert observed is None, name
+        else:
+            assert torch.allclose(observed[ids], expected, atol=1e-5), name
+    for name, expected in ref_hidden.items():
+        assert torch.allclose(getattr(sd, name).memory.hidden_states[:, ids], expected, atol=1e-5), name
 
 
 @torch.no_grad()
 def test_default_keeps_eth_cold_start(setup):
     sd, S_run, A_run, S_new, A_new, a_next = setup
-    ids = torch.tensor([1, 4])
+    ids = torch.tensor([4, 1])
     sd.reset()
     sd.forward(S_run, A_run)
     sd.reset_partial(ids)
-    h_before = sd.state_base.memory.hidden_states.clone()
+    h_before = {
+        name: getattr(sd, name).memory.hidden_states.clone()
+        for name in ("state_base", "auxiliary_base")
+    }
     env = _env(sd, S_new[ids], A_new[ids], warm=False)
     sh = torch.zeros(N, 1, 45); ah = torch.zeros(N, 1, 12)
     env._reset_imagination_history(ids, sh, ah)
-    assert torch.equal(sd.state_base.memory.hidden_states, h_before)          # no change: ETH behaviour
-    assert torch.equal(h_before[:, ids], torch.zeros_like(h_before[:, ids]))  # cold memory
+    for name, before in h_before.items():
+        assert torch.equal(getattr(sd, name).memory.hidden_states, before), name  # ETH behaviour
+        assert torch.equal(before[:, ids], torch.zeros_like(before[:, ids])), name  # cold memory
 
 
 @torch.no_grad()

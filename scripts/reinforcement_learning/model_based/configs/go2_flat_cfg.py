@@ -68,8 +68,8 @@ class Go2FlatConfig(BaseConfig):
             r"$\dot{q}$\n$[rad/s]$": [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
             r"$\tau$\n$[Nm]$":       [33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44],
         })
-        # None -> trainer auto-computes from the collected Go2 dataset
-        # (SystemDynamicsDataset uses provided values when not None, else data mean/std)
+        # A refit WM checkpoint must provide its trained normalization statistics.
+        # Missing checkpoint stats and missing explicit legacy constants abort training.
         state_data_mean:  List[float] | None = None
         state_data_std:   List[float] | None = None
         action_data_mean: List[float] | None = None
@@ -93,7 +93,7 @@ class Go2FlatConfig(BaseConfig):
             "contact_shape":      [128],
             "termination_shape":  [128],
         })
-        resume_path: str | None = None     # no Go2 RWM-U checkpoint yet -> train from scratch
+        resume_path: str | None = None     # --wm-checkpoint must name a trained Go2 WM
 
     @dataclass
     class PolicyArchitectureConfig(BaseConfig.PolicyArchitectureConfig):

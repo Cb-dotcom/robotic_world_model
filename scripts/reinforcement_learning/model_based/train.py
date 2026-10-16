@@ -1,8 +1,8 @@
 from configs import BaseConfig, AnymalDFlatConfig, Go2FlatConfig
 from envs import BaseEnv, AnymalDFlatEnv, Go2FlatEnv
-from configs import BaseConfig, AnymalDFlatConfig
-from envs import BaseEnv, AnymalDFlatEnv
 from policy_training import PolicyTraining
+from normalization_contract import resolve_normalization
+from run_provenance import seed_everything, validate_seed, write_run_args
 from rsl_rl.modules import ActorCritic, SystemDynamicsEnsemble
 from rsl_rl.algorithms import PPO
 from rsl_rl.utils import resolve_obs_groups
@@ -54,6 +54,12 @@ class ModelBasedExperiment:
                 time.sleep(1)
                 continue
             else:
+                expected_columns = self.state_dim + self.action_dim + self.extension_dim + self.contact_dim + self.termination_dim
+                if data.shape[1] != expected_columns:
+                    raise ValueError(
+                        f"{file} has {data.shape[1]} columns; expected {expected_columns}. "
+                        "Keep episode metadata in a sidecar or segment manifest."
+                    )
                 state_data = torch.tensor(data.iloc[:, :self.state_dim].values, dtype=torch.float32, device=self.device).unsqueeze(0)
                 action_data = torch.tensor(data.iloc[:, self.state_dim:self.state_dim + self.action_dim].values, dtype=torch.float32, device=self.device).unsqueeze(0)
                 extension_data = torch.tensor(data.iloc[:, self.state_dim + self.action_dim:self.state_dim + self.action_dim + self.extension_dim].values, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -108,6 +114,17 @@ class ModelBasedExperiment:
 
 
     def prepare_data(self, dataset_root, dataset_folder, file_data_size, batch_data_size, state_data_mean=None, state_data_std=None, action_data_mean=None, action_data_std=None, init_data_ratio=0.0, num_eval_trajectories=100, num_visualizations=2, len_eval_trajectory=400, state_idx_dict=None):
+        self.normalization_contract = resolve_normalization(
+            getattr(self, "wm_checkpoint", {}),
+            {"state_data_mean": state_data_mean, "state_data_std": state_data_std,
+             "action_data_mean": action_data_mean, "action_data_std": action_data_std},
+            self.state_dim, self.action_dim,
+        )
+        print(
+            f"[Normalizer] source={self.normalization_contract.source} "
+            f"norm_stats_sha256={self.normalization_contract.norm_stats_sha256}", flush=True,
+        )
+        stats = self.normalization_contract.dataset_kwargs()
         state_data, action_data, extension_data, contact_data, termination_data = self._load_data(dataset_root, dataset_folder=dataset_folder, file_data_size=file_data_size, batch_data_size=batch_data_size)
         self._build_eval_traj_config(state_data, action_data, extension_data, contact_data, termination_data, num_eval_trajectories, num_visualizations, len_eval_trajectory, state_idx_dict)
         class SystemDynamicsDataset(Dataset):
@@ -128,10 +145,10 @@ class ModelBasedExperiment:
                 self.history_horizon = history_horizon
                 self.forecast_horizon = forecast_horizon
                 
-                self.state_data_mean = torch.tensor(state_data_mean, device=state_data.device) if state_data_mean is not None else state_data.mean(dim=(0, 1))
-                self.state_data_std = torch.tensor(state_data_std, device=state_data.device) if state_data_std is not None else state_data.std(dim=(0, 1)) + 1e-6
-                self.action_data_mean = torch.tensor(action_data_mean, device=action_data.device) if action_data_mean is not None else action_data.mean(dim=(0, 1))
-                self.action_data_std = torch.tensor(action_data_std, device=action_data.device) if action_data_std is not None else action_data.std(dim=(0, 1)) + 1e-6
+                self.state_data_mean = state_data_mean.to(state_data.device)
+                self.state_data_std = state_data_std.to(state_data.device)
+                self.action_data_mean = action_data_mean.to(action_data.device)
+                self.action_data_std = action_data_std.to(action_data.device)
                 state_data, action_data = self.normalize(state_data, action_data)
                 
                 reset_indices = termination_data.flatten().nonzero(as_tuple=False).squeeze(-1)
@@ -183,10 +200,7 @@ class ModelBasedExperiment:
             extension_data,
             contact_data,
             termination_data,
-            state_data_mean=state_data_mean,
-            state_data_std=state_data_std,
-            action_data_mean=action_data_mean,
-            action_data_std=action_data_std
+            **stats,
             )
         # init env dataset
         self.env.set_dataset(self.dataset)
@@ -195,6 +209,8 @@ class ModelBasedExperiment:
 
 
     def prepare_model(self, history_horizon, forecast_horizon, extension_dim, contact_dim, termination_dim, ensemble_size, architecture_config, freeze_auxiliary=False, resume_path=None):
+        if resume_path is None:
+            raise ValueError("Offline policy training requires a trained --wm-checkpoint")
         self.history_horizon = history_horizon
         self.forecast_horizon = forecast_horizon
         self.state_dim = self.env.state_dim
@@ -217,9 +233,13 @@ class ModelBasedExperiment:
         self.model_learning_iteration = 0
         if resume_path is not None:
             print(f"[Prepare Model] Loading model from {resume_path}.")
-            loaded_dict = torch.load(resume_path)
+            loaded_dict = torch.load(resume_path, map_location=self.device, weights_only=False)
             self.system_dynamics.load_state_dict(loaded_dict["system_dynamics_state_dict"])
             self.model_learning_iteration = loaded_dict["iter"]
+            # Keep only the small deployment contract, not checkpoint optimizer tensors.
+            self.wm_checkpoint = {key: loaded_dict[key] for key in (
+                "normalized", "state_mean", "state_std", "action_mean", "action_std"
+            ) if key in loaded_dict}
         # init env system dynamics
         self.env.set_system_dynamics(self.system_dynamics)
             
@@ -294,13 +314,21 @@ def run_experiment(config: BaseConfig):
     model_experiment.prepare_policy(**policy_config)
     model_experiment.prepare_algorithm(**config.policy_algorithm_config.to_dict())
     model_experiment.prepare_data(**config.data_config.to_dict())
+    write_run_args(
+        log_dir, args_cli, config,
+        normalizer_contract=model_experiment.normalization_contract.metadata(),
+    )
     model_experiment.train_policy(log_dir, **config.policy_training_config.to_dict())
     print(f"Training completed. Policy saved to {log_dir}.")
 
 
 def run(config: BaseConfig):
+    seed = validate_seed(args_cli.seed)
     wandb.init(project=config.experiment_name)
     wandb.config.update(config.to_dict())
+    # Tracking setup may consume RNGs. Initialize the training stream afterwards,
+    # before any model, policy, data, command or imagination draws.
+    seed_everything(seed)
     run_experiment(config)
 
 def resolve_task_config(task: str):
@@ -317,6 +345,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Online learning training.")
     parser.add_argument("--task", type=str, default="anymal_d_flat", help="Task to use for the experiment.")
     parser.add_argument("--run_num", type=int, default=None, help="Run number for the experiment on the cluster.")
+    parser.add_argument("--seed", type=int, required=True, help="Explicit policy-training RNG seed (independent of run number).")
     parser.add_argument("--penalty", type=float, default=None, help="Override uncertainty_penalty_weight (MOPO penalty).")
     parser.add_argument("--wm-checkpoint", type=str, default=None, help="Path to a checkpoint with system_dynamics_state_dict to load as the world model.")
     parser.add_argument("--init-policy-checkpoint", type=str, default=None, help="Optional online/RSL policy checkpoint used to initialize the MBPO policy.")

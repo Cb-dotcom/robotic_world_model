@@ -74,6 +74,13 @@ Signals (all oriented so that larger = more anomalous)
   ``window(f)`` input, batch size 1. ``epi`` = sum over state dims of the across-head
   std of the predicted means; ``alea`` = sum over dims of the head-mean predicted std;
   ``term`` = sigmoid of the head-mean termination logit.
+  Legacy checkpoints without saved statistics retain the historical raw-input path
+  unless ``--norm_stats FILE.npz`` is supplied. That NPZ must contain finite
+  ``state_mean``, ``state_std`` (45 values each), ``action_mean``, ``action_std``
+  (12 each), with strictly positive standard deviations. It supplies the model's
+  training-space constants, never estimates them from the trace. For a checkpoint
+  with saved statistics the file must match its effective float32 statistics exactly;
+  disagreement is an error. Summary metadata records the file and statistics hashes.
 * ``term_logit`` (``--wm``): the head-mean termination logit from the same forward
   pass; same ranking as ``term`` but without float32 saturation ties at p = 1.0.
 * ``knn{k}`` (``--knn_train``): mean Euclidean distance from the query feature to its
@@ -441,8 +448,39 @@ def history_horizon() -> int:
     return getattr(mac, "history_horizon", 32)
 
 
-def load_wm(path: str, device: str):
-    """Scorer's checkpoint load + model construction + strict state-dict load."""
+def checkpoint_with_norm_stats(ckpt, path: str):
+    """Return a checkpoint copy with validated explicit NPZ normalization.
+
+    Saved checkpoint statistics remain authoritative: an explicit file must agree
+    with them. This helper never mutates the caller's checkpoint or the disk file.
+    """
+    from normalization_contract import CONFIG_KEYS, KEYS, resolve_normalization
+
+    path = os.fspath(path)
+    archive = np.load(path, allow_pickle=False)
+    if not isinstance(archive, np.lib.npyio.NpzFile):
+        raise ValueError("--norm_stats must be an NPZ archive")
+    with archive:
+        values = {key: archive[key] if key in archive else None for key in KEYS}
+    config_stats = dict(zip(CONFIG_KEYS, (values[key] for key in KEYS)))
+    explicit = resolve_normalization({}, config_stats, STATE_DIM, ACTION_DIM)
+    effective = resolve_normalization(ckpt, config_stats, STATE_DIM, ACTION_DIM)
+    if effective.norm_stats_sha256 != explicit.norm_stats_sha256:
+        raise ValueError("--norm_stats differs from saved checkpoint normalization; refusing to override it")
+    metadata = effective.metadata()
+    metadata["source"] = ("checkpoint_verified_against_norm_stats_file"
+                          if ckpt.get("normalized", False) else "norm_stats_file")
+    metadata["file"] = file_info(path)
+    return {**ckpt, "normalized": True, **effective.statistics, "_analysis_normalization": metadata}
+
+
+def load_wm(path: str, device: str, norm_stats: Optional[str] = None):
+    """Strict scorer load; optional explicit statistics repair legacy input coordinates.
+
+    Omitting ``norm_stats`` preserves the scorer's historical behavior, including
+    raw inputs for legacy checkpoints. Supplying it validates all four NPZ vectors
+    through normalization_contract and rejects mismatches with checkpoint statistics.
+    """
     from rsl_rl.modules import SystemDynamicsEnsemble
     from configs.go2_flat_cfg import Go2FlatConfig
 
@@ -451,6 +489,8 @@ def load_wm(path: str, device: str):
     H = getattr(mac, "history_horizon", 32)
 
     ckpt = torch.load(path, map_location=device)
+    if norm_stats is not None:
+        ckpt = checkpoint_with_norm_stats(ckpt, norm_stats)
 
     sd = SystemDynamicsEnsemble(
         45,
@@ -801,6 +841,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_envs", type=int, default=64)
     p.add_argument("--steps_per_env", type=int, default=1000)
     p.add_argument("--wm", default=None, help="WM checkpoint; enables epi/alea/term signals")
+    p.add_argument("--norm_stats", default=None,
+                   help="explicit training-space NPZ (state_mean/std, action_mean/std); requires --wm; "
+                        "saved checkpoint statistics must match")
     p.add_argument("--knn_train", action="append", default=None,
                    help="glob of kNN training CSVs (repeatable); enables knn signals")
     p.add_argument("--knn_name", default="", help="label of the kNN training set")
@@ -835,6 +878,8 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         raise RuntimeError("torch is required")
     os.makedirs(args.out, exist_ok=True)
     device = resolve_device(args.device)
+    if args.norm_stats and not args.wm:
+        raise SystemExit("--norm_stats requires --wm")
     if args.knn_norm == "wm" and args.knn_train and not args.wm:
         raise SystemExit("--knn_norm wm requires --wm")
     if args.knn_train and args.knn_primary_k not in args.knn_k:
@@ -898,9 +943,11 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
     ckpt = None
     if args.wm:
         t0 = time.time()
-        sd, ckpt, H_wm = load_wm(args.wm, device)
+        sd, ckpt, H_wm = load_wm(args.wm, device, norm_stats=args.norm_stats)
         assert H_wm == H
         inputs["wm"] = file_info(args.wm)
+        if args.norm_stats:
+            inputs["norm_stats"] = ckpt["_analysis_normalization"]["file"]
         state_wm, action_wm, norm_msg = wm_normalize(state_raw, action_raw, ckpt)
         print(norm_msg)
         vals = wm_score_indices(sd, state_wm, action_wm, eval_idx, H, device, progress_every=2000, with_logit=True)
@@ -1003,6 +1050,7 @@ def run(args: argparse.Namespace) -> Dict[str, object]:
         "device_used": device,
         "torch_version": torch.__version__,
         "inputs": inputs,
+        "wm_normalization": ckpt.get("_analysis_normalization") if ckpt is not None else None,
         "counts": counts,
         "signals": list(signals.keys()),
         "positive_sets": list(pos_sets.keys()),

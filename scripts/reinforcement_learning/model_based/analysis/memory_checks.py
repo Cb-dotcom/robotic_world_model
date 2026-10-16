@@ -22,6 +22,13 @@ B7  Imagination cold start.
 Usage (from scripts/reinforcement_learning/model_based):
     python analysis/memory_checks.py --trace T.csv --steps_per_env 1000 --out report.txt \
         NAME=CKPT [NAME=CKPT ...]
+
+For a legacy checkpoint use ``--norm_stats FILE.npz`` with the exact training-space
+state_mean/std (45 values) and action_mean/std (12 values). Statistics must be finite,
+and standard deviations positive. The same file applies to every supplied model;
+saved checkpoint statistics must match it exactly in float32. Without the flag the
+historical raw-input path remains unchanged. The report records the source file,
+its SHA-256, and a hash of the effective statistics.
 """
 import argparse
 import os
@@ -184,6 +191,9 @@ def main():
     ap.add_argument("--repeats", type=int, default=3, help="B3 bootstrap repeats")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--norm_stats", default=None,
+                    help="explicit training-space NPZ (state_mean/std, action_mean/std); "
+                         "saved checkpoint statistics must match")
     ap.add_argument("models", nargs="+", help="NAME=CKPT")
     a = ap.parse_args()
 
@@ -198,7 +208,7 @@ def main():
     first = True
     for spec in a.models:
         name, ck = spec.split("=", 1)
-        sd, ckpt, H = load_wm(ck, a.device)
+        sd, ckpt, H = load_wm(ck, a.device, norm_stats=a.norm_stats)
         if first:
             L = max(a.forecast, a.rollout)
             starts = clean_window_starts(data, a.steps_per_env, H, L)
@@ -212,6 +222,10 @@ def main():
             first = False
         st, ac, msg = wm_normalize(data[:, 0:45].copy(), data[:, 45:57].copy(), ckpt)
         say(f"\n=== {name}  ({ck})  {msg}")
+        if a.norm_stats:
+            meta = ckpt["_analysis_normalization"]
+            say(f"[normalization] source={meta['source']} file={meta['file']['realpath']} "
+                f"file_sha256={meta['file']['sha256']} stats_sha256={meta['norm_stats_sha256']}")
         dev = a.device
         S3 = torch.from_numpy(gather(st, starts, -H, a.forecast)).to(dev)
         A3 = torch.from_numpy(gather(ac, starts, -H, a.forecast)).to(dev)

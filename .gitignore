@@ -69,6 +69,7 @@ datasets
 
 # Tests
 tests/
+!scripts/reinforcement_learning/model_based/analysis/tests/
 
 # Docker history
 .isaac-lab-docker-history

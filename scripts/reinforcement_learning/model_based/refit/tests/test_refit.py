@@ -23,7 +23,11 @@ ANALYSIS_DIR = os.path.join(MB_DIR, "analysis")
 REPO_DIR = os.path.abspath(os.path.join(MB_DIR, "..", "..", ".."))
 FITTER = os.path.join(MB_DIR, "fit_world_model_go2_pilot_segments.py")
 FITTER_REL = "scripts/reinforcement_learning/model_based/fit_world_model_go2_pilot_segments.py"
-BASE_COMMIT = "c5bcfe5"
+# Published 8 July fitter, unchanged until the October instrumentation commit
+# cab0637. Its blob also equals cab0637^:FITTER_REL. The former c5bcfe5 ref was
+# unavailable; this pins an independently identified historical source, not HEAD.
+BASE_COMMIT = "109bdd4"
+BASE_BLOB = "223d07714fa667600bd66055f62228379cb8af3b"
 RSL_RL_PATH = os.environ.get("RSL_RL_PATH", "/home/claude/cb-dotcom/rsl_rl_rwm")
 for p in (REFIT_DIR, MB_DIR, RSL_RL_PATH):
     if os.path.isdir(p) and p not in sys.path:
@@ -130,6 +134,9 @@ NORM_KEYS = ("state_mean", "state_std", "action_mean", "action_std")
 
 @pytest.fixture(scope="module")
 def original_fitter(tmp_path_factory):
+    blob = subprocess.run(["git", "-C", REPO_DIR, "rev-parse", f"{BASE_COMMIT}:{FITTER_REL}"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    assert blob == BASE_BLOB, "Historical fitter identity changed"
     src = subprocess.run(["git", "-C", REPO_DIR, "show", f"{BASE_COMMIT}:{FITTER_REL}"], capture_output=True, text=True,
                          check=True).stdout
     path = tmp_path_factory.mktemp("orig") / "fit_world_model_go2_pilot_segments_orig.py"
@@ -141,7 +148,7 @@ def original_fitter(tmp_path_factory):
 # 1. fitter: default behaviour unchanged, seed, lazy windows, norm_stats, num_envs
 # ======================================================================================
 def test_default_args_identical_to_original(tmp_path, original_fitter):
-    """Modified fitter with June-style args == original fitter (same external seeds, CPU, 1 thread)."""
+    """June-style default args match the published July fitter, on fixed CPU seeds."""
     data = pilot64_dir(tmp_path)
     o_old, o_new = str(tmp_path / "old.pt"), str(tmp_path / "new.pt")
     p_old = run_fitter(original_fitter, ["--data", data, "--output", o_old] + TINY_FIT)

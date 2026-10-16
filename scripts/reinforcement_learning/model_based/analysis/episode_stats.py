@@ -134,6 +134,7 @@ class EpisodeStats:
             "env": int(i),
             "start": int(self._start[i]),
             "length": int(self._len[i]),
+            "counted_steps": int(self._r_cnt[i]),
             "fall": bool(fall),
             "censored": bool(censored),
             "mean_track": float(self._r_sum[i] / c) if self._r_cnt[i] else float("nan"),
@@ -163,6 +164,10 @@ class EpisodeStats:
         falls = [e for e in done if e["fall"]]
         tos = [e for e in done if not e["fall"]]
         n_all = len(eps)
+        counted = [e for e in eps if e["counted_steps"] > 0]
+        counted_steps = sum(e["counted_steps"] for e in counted)
+        speed_cmd_sum = sum(e["mean_speed_cmd"] * e["counted_steps"] for e in counted)
+        speed_act_sum = sum(e["mean_speed_act"] * e["counted_steps"] for e in counted)
         out = {
             "episodes_completed": len(done),
             "episodes_censored": n_all - len(done),
@@ -171,6 +176,10 @@ class EpisodeStats:
             "fall_rate_completed": len(falls) / len(done) if done else float("nan"),
             "fall_rate_all": len(falls) / n_all if n_all else float("nan"),
             "track_per_step": float(np.mean(self.all_step_r)) if self.all_step_r else float("nan"),
+            "counted_steps": counted_steps,
+            "speed_cmd_per_step": speed_cmd_sum / counted_steps if counted_steps else float("nan"),
+            "speed_act_per_step": speed_act_sum / counted_steps if counted_steps else float("nan"),
+            "speed_ratio": speed_act_sum / speed_cmd_sum if speed_cmd_sum > 0 else float("nan"),
             "track_per_episode": _nanmean([e["mean_track"] for e in eps]),
             "track_per_episode_no_fall": _nanmean([e["mean_track"] for e in eps if not e["fall"]]),
             "track_per_episode_fall": _nanmean([e["mean_track"] for e in falls]),

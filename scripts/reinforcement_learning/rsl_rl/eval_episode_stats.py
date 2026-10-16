@@ -105,6 +105,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     step_dt = float(base.step_dt)
     ep_len_s = float(base.max_episode_length_s)
+    command_resampling_s = list(base.command_manager.get_term("base_velocity").cfg.resampling_time_range)
+    try:
+        push_cfg = base.event_manager.get_term_cfg("push_robot")
+    except ValueError:  # disabled event terms are absent from the manager
+        push_cfg = None
+    push_metadata = {"enabled": push_cfg is not None}
+    if push_cfg is not None:
+        push_metadata.update({"mode": push_cfg.mode,
+                              "interval_range_s": push_cfg.interval_range_s,
+                              "velocity_range": push_cfg.params.get("velocity_range")})
     print(f"[eval_ep] step_dt={step_dt} episode_length_s={ep_len_s} max_episode_length={base.max_episode_length}")
     try:
         print("[eval_ep] termination terms:", base.termination_manager.active_terms)
@@ -173,7 +183,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     with open(os.path.splitext(out_csv)[0] + "_summary.json", "w") as f:
         json.dump({"checkpoint": resume_path, "task": args_cli.task, "num_envs": args_cli.num_envs,
                    "num_steps": args_cli.num_steps, "no_push": args_cli.no_push,
-                   "cmd_resample_s": args_cli.cmd_resample_s, "summary": s, "old_logs": old}, f, indent=1)
+                   "cmd_resample_s": args_cli.cmd_resample_s,
+                   "seed": int(env_cfg.seed) if env_cfg.seed is not None else None,
+                   "std": args_cli.std, "step_dt": step_dt, "episode_length_s": ep_len_s,
+                   "command_resampling_time_range_s": command_resampling_s,
+                   "push_robot": push_metadata, "summary": s, "old_logs": old}, f, indent=1)
     print(f"[eval_ep] wrote {out_csv}")
 
     env.close()
