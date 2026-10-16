@@ -43,6 +43,8 @@ def project(tmp_path):
         if os.environ.get("QUEUE_TEST_FAIL") == "warm":
             raise SystemExit(7)
         mode, run, task = sys.argv[1:4]
+        if os.environ.get("QUEUE_TEST_FAIL") == "warm_only" and mode == "paper_warm":
+            raise SystemExit(7)
         seed = int(sys.argv[sys.argv.index("--seed") + 1])
         root = pathlib.Path("logs/offline/anymal_d_flat")
         d = json.loads((root / "cold_1601/run_args.json").read_text())
@@ -71,7 +73,7 @@ def project(tmp_path):
         cmd = 1.0 if a.seed == 42 else 2.0
         s = dict(counted_steps=n, falls=1 if warm else 4, episodes_completed=10,
                  track_per_step=track, speed_cmd_per_step=cmd,
-                 speed_act_per_step=.9*cmd, speed_ratio=.9)
+                 speed_act_per_step=.9*cmd, speed_ratio=.9, time_to_fall_median=float("nan"))
         d = dict(checkpoint=a.checkpoint, task="Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0",
                  num_envs=32, num_steps=a.num_steps, seed=a.seed, std=.5, step_dt=.02,
                  episode_length_s=20, command_resampling_time_range_s=[10., 10.],
@@ -225,3 +227,117 @@ def test_cpu_scoring_helper_forces_cpu_and_keeps_six_seed_scope(tmp_path):
     assert len(outputs) == 1
     assert len(outputs[0].read_text().splitlines()) == 7
     assert "two existing own-normalizer models" in result.stdout
+
+
+def launch_remaining(project, skip_references=True, **env):
+    command = [sys.executable, str(MB / "queue_remaining_pairs.py"),
+               "--repo-root", str(project.repo), "--seed1-dir", str(project.out),
+               "--out", str(project.out.parent / "remaining"), "--python", sys.executable]
+    if skip_references:
+        command.append("--skip-references")
+    return subprocess.run(command, env=dict(os.environ, **env), capture_output=True, text=True, timeout=20)
+
+
+def test_remaining_queue_completes_exactly_three_pairs_and_eight_new_evals(project):
+    assert launch(project).returncode == 0
+    result = launch_remaining(project)
+    assert result.returncode == 0, result.stderr
+    out = project.out.parent / "remaining"
+    assert json.loads((out / "status.json").read_text())["state"] == "complete"
+    summary = json.loads((out / "all_pairs.json").read_text())
+    assert summary["pairs_completed"] == 3
+    assert [r["training_seed"] for r in summary["pairs"]] == [1, 2, 3]
+    assert isinstance(summary["step2_pass"], bool)
+    for seed, cold, warm in ((2, 1603, 1604), (3, 1605, 1606)):
+        output = out / f"seed{seed}_pair"
+        assert len(list(output.glob("*_eval_*"))) == 4
+        for run, mode in ((cold, "paper"), (warm, "paper_warm")):
+            record = json.loads((queue.run_directory(project.repo, run) / "run_args.json").read_text())
+            assert record["seed"] == seed and record["mode"] == mode
+
+
+@pytest.mark.parametrize("stage", ["warm", "warm_only", "eval", "conditions"])
+def test_remaining_queue_stops_on_failure_without_starting_seed3(project, stage):
+    assert launch(project).returncode == 0
+    result = launch_remaining(project, QUEUE_TEST_FAIL=stage)
+    assert result.returncode == 1
+    out = project.out.parent / "remaining"
+    assert json.loads((out / "status.json").read_text())["state"] == "failed"
+    assert not list(project.cold.parent.glob("*_1605"))
+    partial = json.loads((out / "all_pairs.json").read_text())
+    assert partial["pairs_completed"] == 1 and partial["step2_pass"] is None
+
+
+def test_remaining_queue_will_not_follow_a_failed_seed1(project):
+    assert launch(project).returncode == 0
+    (project.out / "status.json").write_text(json.dumps({"state": "failed", "error": "test failure"}))
+    result = launch_remaining(project)
+    assert result.returncode == 1 and "Seed-1 queue failed" in result.stderr
+    assert not list(project.cold.parent.glob("*_1603"))
+
+
+def test_remaining_queue_rejects_duplicate_training_ids(project):
+    assert launch(project).returncode == 0
+    (project.cold.parent / "existing_1603").mkdir()
+    result = launch_remaining(project)
+    assert result.returncode == 1 and "already exists" in result.stderr
+    assert not list(project.cold.parent.glob("*_1604"))
+
+
+def test_remaining_queue_keeps_pair_results_when_references_are_missing(project):
+    assert launch(project).returncode == 0
+    result = launch_remaining(project, skip_references=False)
+    assert result.returncode == 0, result.stderr
+    out = project.out.parent / "remaining"
+    assert json.loads((out / "status.json").read_text())["state"] == "complete_with_reference_issues"
+    refs = json.loads((out / "reference_status.json").read_text())
+    assert len(refs) == 3 and all(r["state"] == "missing" for r in refs)
+    assert json.loads((out / "all_pairs.json").read_text())["pairs_completed"] == 3
+
+
+def test_remaining_queue_requires_the_same_seed1_evaluation_horizon(project):
+    assert launch(project).returncode == 0
+    path = project.out / "comparison.json"
+    d = json.loads(path.read_text())
+    d["num_steps"] = 2000
+    path.write_text(json.dumps(d))
+    result = launch_remaining(project)
+    assert result.returncode == 1 and "identity/exposure" in result.stderr
+    assert not list(project.cold.parent.glob("*_1603"))
+
+
+def test_remaining_queue_accepts_completion_during_pid_check(project, monkeypatch):
+    import queue_remaining_pairs as remaining
+
+    assert launch(project).returncode == 0
+    status = project.out / "status.json"
+    status.write_text(json.dumps({"state": "evaluating"}))
+    pid_file = project.repo / "pid.txt"
+    pid_file.write_text("999999998")
+
+    def finish_during_check(pid):
+        status.write_text(json.dumps({"state": "complete"}))
+        return False
+
+    monkeypatch.setattr(remaining, "alive_queue", finish_during_check)
+    args = SimpleNamespace(seed1_dir=project.out, seed1_pid_file=pid_file,
+                           wait_hours=1, poll_seconds=1, num_steps=10000)
+    result = remaining.wait_for_seed1(args, lambda *a, **k: None)
+    assert result["training_seed"] == 1
+
+
+def test_reference_queue_preserves_valid_metrics_with_undefined_fall_diagnostics(project):
+    import queue_remaining_pairs as remaining
+
+    checkpoint = project.repo / "assets/models/pretrain_rnn_ens.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"reference")
+    out = project.out.parent / "references"
+    out.mkdir()
+    args = SimpleNamespace(repo_root=project.repo, out=out, python=sys.executable, num_steps=10000)
+    records = remaining.references(args, lambda *a, **k: None)
+    assert records[0]["state"] == "complete"
+    saved = json.loads((out / "reference_status.json").read_text())
+    assert saved[0]["summary"]["time_to_fall_median"] is None
+    assert saved[0]["summary"]["track_per_step"] == pytest.approx(.9)
+    assert saved[1]["state"] == saved[2]["state"] == "missing"
