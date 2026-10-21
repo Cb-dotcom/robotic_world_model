@@ -13,6 +13,24 @@ import run_acceleration_probe as probe
 from test_policy_queue import project  # shared tiny saved-baseline fixture
 
 
+@pytest.mark.parametrize("dirty,status", [(False, []), (True, ["?? assets/models/vel_trace.npz"])])
+def test_review_accepts_only_clean_or_exact_reviewed_diagnostic(dirty, status):
+    assert probe.review_baseline_git(dict(commit=probe.BASELINE_COMMIT, dirty=dirty, status=status))
+
+
+@pytest.mark.parametrize("status", [[], [" M scripts/reinforcement_learning/model_based/train.py"],
+                                    ["?? assets/models/other.npz"],
+                                    ["?? assets/models/vel_trace.npz", " M assets/data/state_action_data_0.csv"]])
+def test_review_rejects_unknown_or_training_changes(status):
+    with pytest.raises(RuntimeError, match="Unreviewed"):
+        probe.review_baseline_git(dict(commit=probe.BASELINE_COMMIT, dirty=True, status=status))
+
+
+def test_review_rejects_other_baseline_commit():
+    with pytest.raises(RuntimeError, match="source commit"):
+        probe.review_baseline_git(dict(commit="different", dirty=False, status=[]))
+
+
 def test_nohup_launch_accepts_its_log_and_pid_files(tmp_path):
     # Exercise the actual main() entry point and the supplied shell launch.
     # Only replace the GPU orchestration body; startup and freshness checks run.
@@ -86,7 +104,7 @@ def test_one_training_two_evaluations_or_stop_before_extra_jobs(project, monkeyp
     monkeypatch.chdir(project.repo)
     p = project.cold / "run_args.json"
     baseline = json.loads(p.read_text())
-    baseline["git"] = {"dirty": False}
+    baseline["git"] = {"commit": probe.BASELINE_COMMIT, "dirty": False, "status": []}
     p.write_text(json.dumps(baseline))
     old_ckpt = project.cold / "policy_2499.pt"
     saved = project.repo / "saved_pair"

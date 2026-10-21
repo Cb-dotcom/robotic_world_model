@@ -18,6 +18,20 @@ from queue_remaining_pairs import validate_episode_csv, validate_reference
 
 MB = pair.MB
 RUN = 1701
+BASELINE_COMMIT = "0cebd87d4386b42ba23e6449d7ce3402b792c2a5"
+
+
+def review_baseline_git(git):
+    if git.get("commit") != BASELINE_COMMIT:
+        raise RuntimeError("Unexpected baseline source commit")
+    status = git.get("status", [])
+    if status == ["?? assets/models/vel_trace.npz"]:
+        # Reviewed workstation evidence: this diagnostic file is not read by
+        # p15_train/train, their configs, reward envs or normalization loader.
+        return "Reviewed untracked diagnostic vel_trace.npz; training inputs unchanged"
+    if status == [] and git.get("dirty") is False:
+        return "Recorded baseline working tree clean"
+    raise RuntimeError(f"Unreviewed baseline working-tree changes: {status!r}")
 
 
 def gpu_free_gib():
@@ -80,8 +94,7 @@ def run(args, status):
     check_source(repo)
     baseline_dir = pair.run_directory(repo, 1601)
     baseline = pair.provenance(baseline_dir, 1601, "paper", 1)
-    if baseline["git"]["dirty"]:
-        raise RuntimeError("Baseline training was dirty; inspect before comparing")
+    baseline_source_review = review_baseline_git(baseline["git"])
     if list((repo / "logs/offline/anymal_d_flat").glob(f"*_{RUN}")):
         raise RuntimeError(f"Run {RUN} already exists; refusing duplicate training")
     wm = Path(baseline["world_model_checkpoint"]["path"])
@@ -103,6 +116,7 @@ def run(args, status):
     check_training_match(baseline, corrected)
     pair.write_json(out / "manifest.json", {
         "baseline": baseline, "corrected": corrected,
+        "baseline_source_review": baseline_source_review,
         "policy_sha256": pair.sha256(new_checkpoint),
         "data_sha256": pair.sha256(repo / "assets/data/state_action_data_0.csv"),
         "baseline_policy_sha256": pair.sha256(old_checkpoint),
