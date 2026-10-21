@@ -1,5 +1,6 @@
 """Exercise the real queue/subprocess path with tiny CPU trainer/evaluator stubs."""
 import fcntl
+import csv
 import hashlib
 import json
 import os
@@ -341,3 +342,90 @@ def test_reference_queue_preserves_valid_metrics_with_undefined_fall_diagnostics
     assert saved[0]["summary"]["time_to_fall_median"] is None
     assert saved[0]["summary"]["track_per_step"] == pytest.approx(.9)
     assert saved[1]["state"] == saved[2]["state"] == "missing"
+
+
+def saved_reference_artifacts(project):
+    import queue_remaining_pairs as remaining
+
+    directory = project.out.parent / "saved_references"
+    directory.mkdir()
+    originals = []
+    for name, task, relative, seed, push in remaining.reference_jobs():
+        checkpoint = project.repo / relative
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(name.encode())
+        out = directory / name
+        out.mkdir()
+        rows = [dict(fall=False, censored=False, counted_steps=10, mean_track=.9,
+                     mean_speed_cmd=1., mean_speed_act=.9),
+                dict(fall=True, censored=False, counted_steps=5, mean_track=.6,
+                     mean_speed_cmd=1., mean_speed_act=.5)]
+        with (out / "episodes.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        d = dict(checkpoint=str(checkpoint), task=task, seed=seed, num_envs=32,
+                 num_steps=10000, std=.5, command_resampling_time_range_s=[10., 10.],
+                 push_robot=dict(enabled=push),
+                 summary=dict(falls=1, episodes_completed=2, counted_steps=15,
+                              track_per_step=.8, speed_ratio=11.5/15))
+        (out / "episodes_summary.json").write_text(json.dumps(d))
+        originals.append(dict(name=name, checkpoint_sha256=queue.sha256(checkpoint),
+                              state="complete" if push else "failed"))
+    (directory / "reference_status.json").write_text(json.dumps(originals))
+    return directory
+
+
+def test_saved_reference_review_is_read_only_and_recovers_push_free_go2(project, monkeypatch):
+    import queue_remaining_pairs as remaining
+
+    directory = saved_reference_artifacts(project)
+    before = {p: p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+
+    def forbidden(*a, **k):
+        raise AssertionError("A read-only review must never launch a child process")
+
+    monkeypatch.setattr(queue, "execute", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    records = remaining.inspect_saved_references(directory, project.repo, 10000)
+    assert all(r["state"] == "validated_saved_result" for r in records)
+    assert records[0]["push_enabled"] is True
+    assert records[1]["push_enabled"] is records[2]["push_enabled"] is False
+    assert records[1]["original_state"] == "failed"
+    assert records[1]["metrics"]["falls"] == 1
+    assert before == {p: p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("failure", ["push", "seed", "csv", "checkpoint"])
+def test_saved_reference_review_rejects_mismatches(project, failure):
+    import queue_remaining_pairs as remaining
+
+    directory = saved_reference_artifacts(project)
+    path = directory / "go2_jun12/episodes_summary.json"
+    d = json.loads(path.read_text())
+    if failure == "push":
+        d["push_robot"]["enabled"] = True
+    elif failure == "seed":
+        d["seed"] = 43
+    elif failure == "csv":
+        d["summary"]["falls"] = 2
+    else:
+        checkpoint = project.repo / remaining.reference_jobs()[1][2]
+        checkpoint.write_bytes(b"changed checkpoint")
+    path.write_text(json.dumps(d))
+    records = remaining.inspect_saved_references(directory, project.repo, 10000)
+    assert records[1]["state"] == "needs_inspection"
+    assert records[0]["state"] == records[2]["state"] == "validated_saved_result"
+    if failure == "push":
+        assert "push_robot.enabled" in records[1]["error"]
+
+
+def test_read_only_reference_cli_does_not_require_queue_launch_arguments(project):
+    directory = saved_reference_artifacts(project)
+    result = subprocess.run([sys.executable, str(MB / "queue_remaining_pairs.py"),
+                             "--repo-root", str(project.repo),
+                             "--inspect-saved-references", str(directory)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert all(r["state"] == "validated_saved_result" for r in json.loads(result.stdout))
+    assert not (project.repo / "logs/p2/remaining_pairs.lock").exists()

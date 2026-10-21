@@ -6,6 +6,7 @@ switch is needed. All GPU jobs are sequential. No extra hyperparameter sweep
 or Go2 training is launched. Missing optional reference checkpoints are logged.
 """
 import argparse
+import csv
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -92,17 +93,92 @@ def report(out, results):
     print("\n".join(lines), flush=True)
 
 
-def references(args, status):
+def reference_jobs():
     root = Path("logs/rsl_rl/unitree_go2_flat")
-    jobs = [
-        ("ceiling_43", pair.TASK, Path("assets/models/pretrain_rnn_ens.pt"), 43),
+    return [
+        ("ceiling_43", pair.TASK, Path("assets/models/pretrain_rnn_ens.pt"), 43, True),
         ("go2_jun12", "Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0",
-         root / "2026-06-12_13-39-03_pretrain_ens5/model_2000.pt", 42),
+         root / "2026-06-12_13-39-03_pretrain_ens5/model_2000.pt", 42, False),
         ("go2_jun17", "Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0",
-         root / "2026-06-17_22-09-04_pretrain_ens5/model_2000.pt", 42),
+         root / "2026-06-17_22-09-04_pretrain_ens5/model_2000.pt", 42, False),
     ]
+
+
+def validate_reference(record, task, checkpoint, seed, steps, push_enabled):
+    # Go2's parent UnitreeGo2RoughEnvCfg disables pushes. ANYmal keeps them.
+    # Check that intended difference explicitly, rather than weakening the gate.
+    expected = {"task": task, "seed": seed, "num_steps": steps, "num_envs": 32,
+                "std": .5, "command_resampling_time_range_s": [10., 10.]}
+    errors = [f"{key}: expected {value!r}, got {record.get(key)!r}"
+              for key, value in expected.items() if record.get(key) != value]
+    actual_push = record.get("push_robot", {}).get("enabled")
+    if actual_push is not push_enabled:
+        errors.append(f"push_robot.enabled: expected {push_enabled}, got {actual_push!r}")
+    if Path(record.get("checkpoint", "")).resolve() != checkpoint.resolve():
+        errors.append("checkpoint path differs")
+    if errors:
+        raise RuntimeError("Unexpected reference evaluation settings: " + "; ".join(errors))
+    if not all(math.isfinite(record["summary"][key]) for key in ("track_per_step", "speed_ratio")):
+        raise RuntimeError("Non-finite primary reference metrics")
+
+
+def validate_episode_csv(path, summary):
+    with path.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+
+    def boolean(value):
+        if value not in ("True", "False"):
+            raise RuntimeError(f"Unexpected CSV boolean: {value!r}")
+        return value == "True"
+
+    completed = [r for r in rows if not boolean(r["censored"])]
+    counted = [r for r in rows if int(r["counted_steps"]) > 0]
+    n = sum(int(r["counted_steps"]) for r in counted)
+    cmd = sum(int(r["counted_steps"]) * float(r["mean_speed_cmd"]) for r in counted)
+    if n <= 0 or cmd <= 0:
+        raise RuntimeError("CSV has no counted steps or commanded speed")
+    recomputed = {
+        "falls": sum(boolean(r["fall"]) for r in completed),
+        "episodes_completed": len(completed), "counted_steps": n,
+        "track_per_step": sum(int(r["counted_steps"]) * float(r["mean_track"])
+                              for r in counted) / n,
+        "speed_ratio": sum(int(r["counted_steps"]) * float(r["mean_speed_act"])
+                           for r in counted) / cmd,
+    }
+    for key, value in recomputed.items():
+        if not math.isclose(value, summary[key], rel_tol=1e-7, abs_tol=1e-9):
+            raise RuntimeError(f"CSV/JSON mismatch: {key}: {value!r} vs {summary[key]!r}")
+    return recomputed
+
+
+def inspect_saved_references(directory, repo, steps):
+    """Read and validate existing artifacts only; never execute, rewrite or rerun."""
+    original = {d["name"]: d for d in json.loads((directory / "reference_status.json").read_text())}
     records = []
-    for name, task, relative, seed in jobs:
+    for name, task, relative, seed, push in reference_jobs():
+        checkpoint = repo / relative
+        item = {"name": name, "original_state": original.get(name, {}).get("state")}
+        try:
+            source = directory / name / "episodes_summary.json"
+            csv_path = source.with_name("episodes.csv")
+            d = json.loads(source.read_text())
+            validate_reference(d, task, checkpoint, seed, steps, push)
+            expected_hash = original[name]["checkpoint_sha256"]
+            if pair.sha256(checkpoint) != expected_hash:
+                raise RuntimeError("Current checkpoint hash differs from recorded evaluation identity")
+            metrics = validate_episode_csv(csv_path, d["summary"])
+            item.update(state="validated_saved_result", push_enabled=push, metrics=metrics,
+                        checkpoint_sha256=expected_hash, summary_sha256=pair.sha256(source),
+                        csv_sha256=pair.sha256(csv_path), source=str(source))
+        except Exception as exc:
+            item.update(state="needs_inspection", error=f"{type(exc).__name__}: {exc}")
+        records.append(item)
+    return records
+
+
+def references(args, status):
+    records = []
+    for name, task, relative, seed, push in reference_jobs():
         checkpoint = args.repo_root / relative
         item = {"name": name, "checkpoint": str(checkpoint)}
         if not checkpoint.is_file():
@@ -120,14 +196,7 @@ def references(args, status):
                               "--out_csv", str(directory / "episodes.csv")],
                              directory / "eval.log", args.repo_root)
                 d = json.loads((directory / "episodes_summary.json").read_text())
-                if (d["task"] != task or d["seed"] != seed or d["num_steps"] != args.num_steps
-                        or d["num_envs"] != 32 or d["std"] != .5
-                        or d["command_resampling_time_range_s"] != [10., 10.]
-                        or not d["push_robot"]["enabled"]
-                        or Path(d["checkpoint"]).resolve() != checkpoint.resolve()):
-                    raise RuntimeError("Unexpected reference evaluation settings")
-                if not all(math.isfinite(d["summary"][key]) for key in ("track_per_step", "speed_ratio")):
-                    raise RuntimeError("Non-finite primary reference metrics")
+                validate_reference(d, task, checkpoint, seed, args.num_steps, push)
                 item.update(state="complete", summary=json_safe(d["summary"]))
             except Exception as exc:
                 item.update(state="failed", error=str(exc), log=str(directory / "eval.log"))
@@ -185,15 +254,24 @@ def run(args, status):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--seed1-dir", type=Path, required=True)
+    parser.add_argument("--seed1-dir", type=Path)
     parser.add_argument("--seed1-pid-file", type=Path, default=Path("logs/p2/seed1_queue.pid"))
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--inspect-saved-references", type=Path,
+                        help="Read-only review of existing reference JSON/CSV and checkpoint hashes; no jobs start")
     parser.add_argument("--python", default="/isaac-sim/python.sh")
     parser.add_argument("--num-steps", type=int, default=10000)
     parser.add_argument("--wait-hours", type=float, default=8)
     parser.add_argument("--poll-seconds", type=float, default=30)
     parser.add_argument("--skip-references", action="store_true")
     args = parser.parse_args(argv)
+    if args.inspect_saved_references is not None:
+        records = inspect_saved_references(args.inspect_saved_references.resolve(),
+                                           args.repo_root.resolve(), args.num_steps)
+        print(json.dumps(records, indent=2, allow_nan=False))
+        return 0 if all(d["state"] == "validated_saved_result" for d in records) else 1
+    if args.seed1_dir is None or args.out is None:
+        parser.error("--seed1-dir and --out are required to launch a queue")
     if args.num_steps <= 0 or args.wait_hours <= 0 or args.poll_seconds <= 0:
         parser.error("Horizon and wait durations must be positive")
     for name in ("repo_root", "seed1_dir", "seed1_pid_file", "out"):
