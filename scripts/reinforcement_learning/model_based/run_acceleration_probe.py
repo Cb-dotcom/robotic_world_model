@@ -156,7 +156,8 @@ def main():
     args.out = args.out.resolve()
     args.baseline_pair = args.baseline_pair.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
-    if any(p.name != "queue.log" for p in args.out.iterdir()):
+    # The nohup launcher creates these two files before this process starts.
+    if any(p.name not in {"queue.log", "queue.pid"} or not p.is_file() for p in args.out.iterdir()):
         parser.error("Output directory is not fresh")
     def status(state, **details):
         pair.write_json(args.out / "status.json", dict(state=state, utc=datetime.now(timezone.utc).isoformat(), **details))

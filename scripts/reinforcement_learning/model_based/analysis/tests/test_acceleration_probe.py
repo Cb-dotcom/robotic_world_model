@@ -2,6 +2,7 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -10,6 +11,39 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import run_acceleration_probe as probe
 from test_policy_queue import project  # shared tiny saved-baseline fixture
+
+
+def test_nohup_launch_accepts_its_log_and_pid_files(tmp_path):
+    # Exercise the actual main() entry point and the supplied shell launch.
+    # Only replace the GPU orchestration body; startup and freshness checks run.
+    code = (
+        f"import sys; sys.path.insert(0, {str(Path(probe.__file__).parent)!r}); "
+        "import run_acceleration_probe as p; "
+        "p.run = lambda args, status: status('cpu_launch_checked'); "
+        "raise SystemExit(p.main())"
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    launch = '''
+nohup "$1" -c "$2" --baseline-pair "$3" --out "$3" > "$3/queue.log" 2>&1 < /dev/null &
+launcher_pid=$!
+printf '%s\n' "$launcher_pid" > "$3/queue.pid"
+wait "$launcher_pid"
+'''
+    run = subprocess.run(["bash", "-c", launch, "launch", sys.executable, code, str(out)],
+                         cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    assert run.returncode == 0, (out / "queue.log").read_text()
+    assert json.loads((out / "status.json").read_text())["state"] == "cpu_launch_checked"
+
+
+@pytest.mark.parametrize("existing", ["status.json", "train.log", "manifest.json", "corrected_eval_42"])
+def test_main_still_rejects_prior_run_artifacts(tmp_path, monkeypatch, existing):
+    (tmp_path / existing).write_text("previous result")
+    monkeypatch.setattr(sys, "argv", [probe.__file__, "--baseline-pair", str(tmp_path), "--out", str(tmp_path)])
+    monkeypatch.setattr(probe, "run", lambda *args: pytest.fail("must reject before starting jobs"))
+    with pytest.raises(SystemExit) as exc:
+        probe.main()
+    assert exc.value.code == 2
 
 
 def records(falls=10, tracking=.9, speed=.9):
