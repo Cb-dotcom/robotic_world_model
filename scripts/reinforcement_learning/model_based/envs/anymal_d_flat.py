@@ -102,7 +102,8 @@ class AnymalDFlatEnv(BaseEnv):
         joint_pos = parsed_imagination_states["joint_pos"]
         joint_vel = parsed_imagination_states["joint_vel"]
         joint_torque = parsed_imagination_states["joint_torque"]
-        joint_acc = (joint_vel - self.last_obs["policy"][:, 12:24]) / self._step_dt
+        # Policy observation: joint position [12:24], joint velocity [24:36].
+        joint_acc = (joint_vel - self.last_obs["policy"][:, 24:36]) / self._step_dt
         thigh_contact = parsed_contacts["thigh_contact"]
         foot_contact = parsed_contacts["foot_contact"]
 
