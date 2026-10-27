@@ -27,6 +27,11 @@ def parse_args(argv=None):
     parser.add_argument("task", nargs="?", default="anymal_d_flat", choices=("anymal_d_flat", "go2_flat"))
     parser.add_argument("positional_seed", nargs="?", type=validate_seed, metavar="SEED")
     parser.add_argument("--seed", type=validate_seed, help="Explicit training seed (0 through 4294967295).")
+    parser.add_argument("--termination-rule", dest="termination_rule", default="selected",
+                        choices=("selected", "max", "mean"),
+                        help="Imagined termination: selected head (ETH), max or mean over heads (termination_rule.py).")
+    parser.add_argument("--termination-threshold", dest="termination_threshold", type=float, default=0.5,
+                        help="Probability threshold for the termination rule (ETH: 0.5).")
     args = parser.parse_args(argv)
     if args.positional_seed is not None and args.seed is not None:
         parser.error("provide a seed once, as positional SEED or --seed SEED")
@@ -47,8 +52,13 @@ def main(argv=None):
     import train as T
     from envs import BaseEnv
 
+    import termination_rule
+    if args.termination_rule != "selected" and args.task != "anymal_d_flat":
+        raise SystemExit("--termination-rule max/mean is implemented for anymal_d_flat only")
+    patched = termination_rule.install(args.termination_rule, args.termination_threshold)
     T.args_cli = types.SimpleNamespace(
         task=args.task, run_num=args.run_num, seed=args.seed, mode=args.mode, init_policy_checkpoint=None,
+        termination_rule=args.termination_rule, termination_threshold=args.termination_threshold,
     )
     cfg = T.resolve_task_config(args.task)
     cfg.environment_config.uncertainty_penalty_weight = -1.0
@@ -66,7 +76,8 @@ def main(argv=None):
         cfg.policy_training_config.max_iterations, cfg.policy_algorithm_config.learning_rate,
         cfg.policy_algorithm_config.entropy_coef, cfg.environment_config.uncertainty_penalty_weight,
         cfg.model_architecture_config.resume_path, cfg.model_architecture_config.ensemble_size,
-        "warm_start_resets=", BaseEnv.warm_start_resets, flush=True,
+        "warm_start_resets=", BaseEnv.warm_start_resets,
+        "termination=", args.termination_rule, args.termination_threshold, "patched=", patched, flush=True,
     )
     T.run(cfg)
 
