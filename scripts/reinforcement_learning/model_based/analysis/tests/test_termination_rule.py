@@ -333,7 +333,8 @@ def test_probe_sequences_calibration_one_training_two_evaluations(tmp_path, monk
     monkeypatch.setattr(probe.pair, "run_directory", lambda *a: run)
     monkeypatch.setattr(probe.pair, "completed", lambda *a: checkpoint)
     monkeypatch.setattr(probe.pair, "provenance", lambda *a: dict(old, mode="paper_warm", args={
-        "termination_rule": "max", "termination_threshold": .1, "termination_uncertainty": None}))
+        "termination_rule": "max", "termination_threshold": .1, "termination_uncertainty": None,
+        "only_positive_rewards": True}))
     monkeypatch.setattr(probe, "validate_reference", lambda *a: None)
     monkeypatch.setattr(probe, "validate_episode_csv", lambda *a: None)
     monkeypatch.setattr(probe.pair, "pool", lambda *a: dict(falls=80, episodes_completed=700, track_per_step=.9, speed_ratio=.9))
@@ -371,7 +372,7 @@ def test_probe_sequences_calibration_one_training_two_evaluations(tmp_path, monk
         assert calls == ["calibration"]
 
 
-def _fake_trainer(lengths, header="[p1.5] paper_warm 1802 warm_start_resets= True termination= selected 0.3 uncertainty_stop= 6.0 patched= True", sleep=0.0, rc=0):
+def _fake_trainer(lengths, header="[p1.5] paper_warm 1803 warm_start_resets= True termination= selected 0.3 uncertainty_stop= 6.0 only_positive_rewards= True patched= True", sleep=0.0, rc=0):
     code = ("import sys,time\nprint(%r, flush=True)\n" % header +
             "for x in %r:\n    print('  Mean episode length: %%.2f' %% x, flush=True)\n    time.sleep(%r)\n" % (list(lengths), sleep) +
             "time.sleep(0.5)\nsys.exit(%d)\n" % rc)
@@ -411,3 +412,31 @@ def test_guard_rule_and_mode_match():
         probe.check_training_match_except_mode(dict(base, mode="paper"), dict(base, mode="paper"))
     with pytest.raises(RuntimeError):
         probe.check_training_match_except_mode(dict(base, mode="paper"), dict(base, mode="paper_warm", seed=2))
+
+
+def test_only_positive_rewards_clip_in_post_step():
+    from envs.base import BaseEnv
+    env = BaseEnv.__new__(BaseEnv)
+    env._num_envs, env.device, env._step_dt, env._max_episode_length = 3, "cpu", 0.02, 256
+    env.episode_length_buf = torch.zeros(3, dtype=torch.long)
+    env.common_step_counter = 1
+    env.reward_term_weights = {"track": 1.0}
+    env.imagination_episode_sums = {"track": torch.zeros(3), "uncertainty": torch.zeros(3)}
+    env.imagination_reward_per_step = {"track": torch.tensor([1.0, 0.5, 0.1])}
+    env.uncertainty_penalty_weight = -1.0
+    env.epistemic_uncertainty = torch.tensor([0.5, 2.0, 0.0])
+    env.termination_flags = torch.zeros(3, dtype=torch.bool)
+    env.extras = {}
+    env._reset_idx = lambda ids: None
+    r, d, _ = env._post_imagination_step()
+    assert torch.allclose(r, torch.tensor([0.01, -0.03, 0.002]))
+    env.only_positive_rewards = True
+    r, d, _ = env._post_imagination_step()
+    assert torch.allclose(r, torch.tensor([0.01, 0.0, 0.002]))
+    assert not getattr(BaseEnv, "only_positive_rewards", False)
+
+
+def test_p15_flag_only_positive_rewards():
+    import p15_train
+    assert p15_train.parse_args(["paper_warm", "1803", "--seed", "1", "--only-positive-rewards"]).only_positive_rewards
+    assert not p15_train.parse_args(["paper", "1601", "--seed", "1"]).only_positive_rewards

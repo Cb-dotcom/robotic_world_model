@@ -17,6 +17,10 @@ Steps (stop on any error; fresh output folder; one simulator/training job at a t
     (mean imagined episode length 1.0). The calibration uses a full 32-step context, so
     training must rebuild that context after resets. Warm resets alone had no consistent
     policy effect in Step 2 (fall wins 1/3, tracking wins 0/3).
+    Run 1802 (warm resets) also collapsed (mean imagined episode length 1.2 after 72
+    iterations, guard stop). Hypothesis: early imagined rewards are negative, and a stop
+    without a terminal cost lets the policy escape them. Run 1803 therefore also clips
+    the total imagined reward per step at zero (legged_gym "only_positive_rewards").
     Guard: training is stopped if, after GUARD_AFTER logged iterations, the median mean
     imagined episode length of the last 20 iterations is below GUARD_MIN_LENGTH.
  3. Evaluate seeds 42/43, 32 envs x 10000 steps, std .5, commands 10 s, pushes on.
@@ -43,8 +47,9 @@ import queue_paired_policy as pair
 from queue_remaining_pairs import validate_episode_csv, validate_reference
 
 MB = pair.MB
-RUN = 1802
+RUN = 1803
 MODE = "paper_warm"
+ONLY_POSITIVE_REWARDS = True
 GUARD_AFTER, GUARD_MIN_LENGTH, GUARD_POLL_S = 50, 20.0, 30
 CONTROL = {"run": 1701, "falls": 178, "episodes_completed": 708, "track_per_step": .894513,
            "speed_ratio": .884107, "source": "run-log 2026-10-27, logs/p2/accel1701.37ZhDk/comparison.json"}
@@ -118,7 +123,7 @@ def run(args, status):
     threshold = None if chosen["tau"] is None else float(chosen["tau"])
     uncertainty = None if chosen["u"] is None else float(chosen["u"])
     pair.write_json(out / "manifest.json", {
-        "run": RUN, "mode": MODE, "training_seed": 1, "commit": commit, "termination_rule": rule,
+        "run": RUN, "mode": MODE, "only_positive_rewards": ONLY_POSITIVE_REWARDS, "training_seed": 1, "commit": commit, "termination_rule": rule,
         "termination_threshold": threshold, "termination_uncertainty": uncertainty, "calibration_row": chosen,
         "control": CONTROL, "control_verified_pooled": control_pooled,
         "control_probe": str(args.control_probe),
@@ -138,7 +143,8 @@ def run(args, status):
     check_training_match_except_mode(control_record, record)
     saved = record["args"]
     if (saved.get("termination_rule") != rule or saved.get("termination_threshold") != threshold
-            or saved.get("termination_uncertainty") != uncertainty):
+            or saved.get("termination_uncertainty") != uncertainty
+            or bool(saved.get("only_positive_rewards")) != ONLY_POSITIVE_REWARDS):
         raise RuntimeError("Saved run_args do not record the intended stop rule")
     records = []
     for seed in (42, 43):
@@ -160,10 +166,10 @@ def run(args, status):
               "per_seed": [{k: r["summary"][k] for k in ("track_per_step", "falls", "episodes_completed", "speed_ratio")}
                            for r in records],
               "control": CONTROL, "ceiling": CEILING, **verdicts(pooled, records),
-              "mode": MODE,
-              "scope": "One training seed; stop rule plus warm resets versus cold 1701. Screen selects replication (seeds 2, 3); not a causal proof."}
+              "mode": MODE, "only_positive_rewards": ONLY_POSITIVE_REWARDS,
+              "scope": "One training seed; stop rule plus warm resets plus reward clip versus cold 1701. Screen selects replication (seeds 2, 3); not a causal proof."}
     pair.write_json(out / "comparison.json", report)
-    text = (f"run {RUN} ({MODE}; head {rule} > {threshold}, uncertainty > {uncertainty}): tracking={pooled['track_per_step']:.6f}, "
+    text = (f"run {RUN} ({MODE}, clip={ONLY_POSITIVE_REWARDS}; head {rule} > {threshold}, uncertainty > {uncertainty}): tracking={pooled['track_per_step']:.6f}, "
             f"falls={pooled['falls']}/{pooled['episodes_completed']}, speed_ratio={pooled['speed_ratio']:.6f}\n"
             f"control 1701: tracking={CONTROL['track_per_step']}, falls={CONTROL['falls']}/{CONTROL['episodes_completed']}\n"
             f"screen_pass={report['screen_pass']} (falls<=89, tracking>=.874513, speeds>=.8)\n"
@@ -210,10 +216,11 @@ def guarded_training(command, log, repo, status, poll_s=GUARD_POLL_S, launcher=N
             text = log.read_text(errors="replace")
             if not checked and "[p1.5]" in text:
                 line = next(l for l in text.splitlines() if "[p1.5]" in l)
-                if "warm_start_resets= True" not in line or "patched= True" not in line:
+                need = ["warm_start_resets= True", "patched= True"] + (["only_positive_rewards= True"] if ONLY_POSITIVE_REWARDS else [])
+                if any(n not in line for n in need):
                     os.killpg(proc.pid, signal.SIGTERM)
                     proc.wait()
-                    raise RuntimeError(f"Training did not start with warm resets and the stop rule: {line}")
+                    raise RuntimeError(f"Training did not start with warm resets, the stop rule and the reward clip: {line}")
                 checked = True
             problem = guard_verdict(episode_lengths(text))
             if problem:
@@ -254,6 +261,8 @@ def training_child(rule, threshold, uncertainty):
                 "--termination-rule", rule, "--termination-threshold", threshold]
     if uncertainty != "None":
         sys.argv += ["--termination-uncertainty", uncertainty]
+    if ONLY_POSITIVE_REWARDS:
+        sys.argv += ["--only-positive-rewards"]
     runpy.run_path(script, run_name="__main__")
 
 

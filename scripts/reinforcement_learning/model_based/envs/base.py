@@ -197,6 +197,10 @@ class BaseEnv:
                 rewards += self.reward_term_weights[term] * term_value * self._step_dt
                 self.imagination_episode_sums[term] += self.reward_term_weights[term] * term_value * self._step_dt
         
+        if getattr(self, "only_positive_rewards", False):
+            # Opt-in (27 Oct 2026, legged_gym "only_positive_rewards"): clip the total imagined
+            # reward at zero so that ending an imagined episode early can never pay.
+            rewards = torch.clamp(rewards, min=0.0)
         terminated = self.termination_flags if self.termination_flags is not None else torch.zeros(self._num_envs, dtype=torch.bool, device=self.device)
         time_outs = self.episode_length_buf >= self._max_episode_length
         dones = (terminated | time_outs).to(dtype=torch.long)
