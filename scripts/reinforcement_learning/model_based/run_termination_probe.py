@@ -10,12 +10,20 @@ Steps (stop on any error; fresh output folder; one simulator/training job at a t
     imagined 25-step paths; head rule and/or disagreement stop (revised 27 Oct after the
     paired fall replay showed the fall signal fades inside imagination; selection rule
     fixed in that file; infeasible -> stop, no training).
- 2. Train run 1801: paper recipe, cold, training seed 1, current env (acceleration fix
-    d9d2a66 included, as in run 1701), ONLY the imagined stop rule changed.
+ 2. Train run 1802: paper recipe, training seed 1, current env (acceleration fix d9d2a66
+    included, as in run 1701), the imagined stop rule AND warm resets (mode paper_warm).
+    Run 1801 (cold resets) was stopped on 27 Oct: after every cold reset the disagreement
+    spikes (doubt B7), so the stop fired at step 1 of almost every imagined episode
+    (mean imagined episode length 1.0). The calibration uses a full 32-step context, so
+    training must rebuild that context after resets. Warm resets alone had no consistent
+    policy effect in Step 2 (fall wins 1/3, tracking wins 0/3).
+    Guard: training is stopped if, after GUARD_AFTER logged iterations, the median mean
+    imagined episode length of the last 20 iterations is below GUARD_MIN_LENGTH.
  3. Evaluate seeds 42/43, 32 envs x 10000 steps, std .5, commands 10 s, pushes on.
  4. Pool and apply the rules fixed below.
 
-Rules fixed 27 Oct before training (control = run 1701, same code path except the rule):
+Rules fixed 27 Oct before training (control = run 1701, same code path except the rule
+and warm resets):
   screen ("promising": train seeds 2 and 3): pooled falls <= 89 (= 0.5 x 178),
           pooled tracking >= .874513 (1701 - .02), speed ratio >= .8 in both evaluations.
   walker bar (plan): pooled falls <= 6, pooled tracking >= .859 (0.9 x pooled ceiling
@@ -35,7 +43,9 @@ import queue_paired_policy as pair
 from queue_remaining_pairs import validate_episode_csv, validate_reference
 
 MB = pair.MB
-RUN = 1801
+RUN = 1802
+MODE = "paper_warm"
+GUARD_AFTER, GUARD_MIN_LENGTH, GUARD_POLL_S = 50, 20.0, 30
 CONTROL = {"run": 1701, "falls": 178, "episodes_completed": 708, "track_per_step": .894513,
            "speed_ratio": .884107, "source": "run-log 2026-10-27, logs/p2/accel1701.37ZhDk/comparison.json"}
 CEILING = {"track_per_step_pooled": .9546, "falls": 3,
@@ -108,7 +118,7 @@ def run(args, status):
     threshold = None if chosen["tau"] is None else float(chosen["tau"])
     uncertainty = None if chosen["u"] is None else float(chosen["u"])
     pair.write_json(out / "manifest.json", {
-        "run": RUN, "training_seed": 1, "commit": commit, "termination_rule": rule,
+        "run": RUN, "mode": MODE, "training_seed": 1, "commit": commit, "termination_rule": rule,
         "termination_threshold": threshold, "termination_uncertainty": uncertainty, "calibration_row": chosen,
         "control": CONTROL, "control_verified_pooled": control_pooled,
         "control_probe": str(args.control_probe),
@@ -120,13 +130,12 @@ def run(args, status):
         raise RuntimeError("Less than 12 GiB free on GPU 0; calibration saved, no training started")
     status("training", run=RUN, rule=rule, threshold=threshold, uncertainty=uncertainty)
     train_log = out / "train.log"
-    pair.execute([args.python, str(Path(__file__).resolve()), "--training-child", rule, str(threshold),
-                  str(uncertainty)], train_log, repo)
+    guarded_training([args.python, str(Path(__file__).resolve()), "--training-child", rule, str(threshold),
+                      str(uncertainty)], train_log, repo, status)
     new_dir = pair.run_directory(repo, RUN)
     checkpoint = pair.completed(new_dir, train_log)
-    record = pair.provenance(new_dir, RUN, "paper", 1)
-    from run_acceleration_probe import check_training_match
-    check_training_match(control_record, record)
+    record = pair.provenance(new_dir, RUN, MODE, 1)
+    check_training_match_except_mode(control_record, record)
     saved = record["args"]
     if (saved.get("termination_rule") != rule or saved.get("termination_threshold") != threshold
             or saved.get("termination_uncertainty") != uncertainty):
@@ -151,9 +160,10 @@ def run(args, status):
               "per_seed": [{k: r["summary"][k] for k in ("track_per_step", "falls", "episodes_completed", "speed_ratio")}
                            for r in records],
               "control": CONTROL, "ceiling": CEILING, **verdicts(pooled, records),
-              "scope": "One training seed. Screen selects replication (seeds 2, 3); not a causal proof."}
+              "mode": MODE,
+              "scope": "One training seed; stop rule plus warm resets versus cold 1701. Screen selects replication (seeds 2, 3); not a causal proof."}
     pair.write_json(out / "comparison.json", report)
-    text = (f"run {RUN} (head {rule} > {threshold}, uncertainty > {uncertainty}): tracking={pooled['track_per_step']:.6f}, "
+    text = (f"run {RUN} ({MODE}; head {rule} > {threshold}, uncertainty > {uncertainty}): tracking={pooled['track_per_step']:.6f}, "
             f"falls={pooled['falls']}/{pooled['episodes_completed']}, speed_ratio={pooled['speed_ratio']:.6f}\n"
             f"control 1701: tracking={CONTROL['track_per_step']}, falls={CONTROL['falls']}/{CONTROL['episodes_completed']}\n"
             f"screen_pass={report['screen_pass']} (falls<=89, tracking>=.874513, speeds>=.8)\n"
@@ -161,6 +171,71 @@ def run(args, status):
     (out / "comparison.txt").write_text(text)
     print(text, flush=True)
     status("complete", comparison=str(out / "comparison.json"))
+
+
+def episode_lengths(text):
+    out = []
+    for line in text.splitlines():
+        if "Mean episode length:" in line:
+            try:
+                out.append(float(line.rsplit(":", 1)[1]))
+            except ValueError:
+                pass
+    return out
+
+
+def guard_verdict(lengths):
+    """None while too early or healthy; a message when imagined episodes collapse."""
+    if len(lengths) < GUARD_AFTER:
+        return None
+    recent = sorted(lengths[-20:])
+    median = recent[len(recent) // 2]
+    if median < GUARD_MIN_LENGTH:
+        return f"median mean imagined episode length {median:.2f} < {GUARD_MIN_LENGTH} after {len(lengths)} iterations"
+    return None
+
+
+def guarded_training(command, log, repo, status, poll_s=GUARD_POLL_S, launcher=None):
+    import os
+    import signal
+    import time
+    env = dict(os.environ, WANDB_MODE="offline", PYTHONUNBUFFERED="1")
+    with log.open("x") as stream:
+        launch = launcher or subprocess.Popen
+        proc = launch(command, cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=stream,
+                      stderr=subprocess.STDOUT, start_new_session=True)
+        checked = False
+        while proc.poll() is None:
+            time.sleep(poll_s)
+            text = log.read_text(errors="replace")
+            if not checked and "[p1.5]" in text:
+                line = next(l for l in text.splitlines() if "[p1.5]" in l)
+                if "warm_start_resets= True" not in line or "patched= True" not in line:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait()
+                    raise RuntimeError(f"Training did not start with warm resets and the stop rule: {line}")
+                checked = True
+            problem = guard_verdict(episode_lengths(text))
+            if problem:
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=120)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                status("guard_stopped", reason=problem)
+                raise RuntimeError(f"Guard stopped training: {problem}")
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, command)
+
+
+def check_training_match_except_mode(old, new):
+    if new["mode"] != MODE or old["mode"] != "paper":
+        raise RuntimeError(f"Unexpected modes: control {old['mode']!r}, new {new['mode']!r}")
+    for key in ("seed", "task", "resolved_config", "normalizer_contract",
+                "world_model_checkpoint", "initial_policy_checkpoint"):
+        if old[key] != new[key]:
+            raise RuntimeError(f"Control/new training mismatch: {key}")
 
 
 def pair_gpu_free():
@@ -175,7 +250,7 @@ def training_child(rule, threshold, uncertainty):
     torch.cuda.set_per_process_memory_fraction(min(.5, 22 * 1024**3 / total), 0)
     script = str(MB / "p15_train.py")
     sys.path.insert(0, str(MB.resolve()))
-    sys.argv = [script, "paper", str(RUN), "anymal_d_flat", "--seed", "1",
+    sys.argv = [script, MODE, str(RUN), "anymal_d_flat", "--seed", "1",
                 "--termination-rule", rule, "--termination-threshold", threshold]
     if uncertainty != "None":
         sys.argv += ["--termination-uncertainty", uncertainty]

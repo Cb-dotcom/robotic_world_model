@@ -1,5 +1,6 @@
 """CPU tests: opt-in imagination termination rule, its calibration, and the probe rules."""
 import json
+import subprocess
 from pathlib import Path
 import sys
 
@@ -331,7 +332,8 @@ def test_probe_sequences_calibration_one_training_two_evaluations(tmp_path, monk
     monkeypatch.setattr(probe, "pair_gpu_free", lambda: 24)
     monkeypatch.setattr(probe.pair, "run_directory", lambda *a: run)
     monkeypatch.setattr(probe.pair, "completed", lambda *a: checkpoint)
-    monkeypatch.setattr(probe.pair, "provenance", lambda *a: dict(old, args={"termination_rule": "max", "termination_threshold": .1}))
+    monkeypatch.setattr(probe.pair, "provenance", lambda *a: dict(old, mode="paper_warm", args={
+        "termination_rule": "max", "termination_threshold": .1, "termination_uncertainty": None}))
     monkeypatch.setattr(probe, "validate_reference", lambda *a: None)
     monkeypatch.setattr(probe, "validate_episode_csv", lambda *a: None)
     monkeypatch.setattr(probe.pair, "pool", lambda *a: dict(falls=80, episodes_completed=700, track_per_step=.9, speed_ratio=.9))
@@ -353,6 +355,7 @@ def test_probe_sequences_calibration_one_training_two_evaluations(tmp_path, monk
             record = {"summary": dict(speed_ratio=.9, track_per_step=.9, falls=40, episodes_completed=350)}
             (log.parent / "episodes_summary.json").write_text(json.dumps(record))
     monkeypatch.setattr(probe.pair, "execute", execute)
+    monkeypatch.setattr(probe, "guarded_training", lambda command, log, repo, status: execute(command, log, repo))
     args = SimpleNamespace(out=out, diagnostic=diag, control_probe=tmp_path / "control", calib_device="cuda:0", python="python")
     states = []
     status = lambda value, **kw: states.append(value)
@@ -366,3 +369,45 @@ def test_probe_sequences_calibration_one_training_two_evaluations(tmp_path, monk
         with pytest.raises(RuntimeError, match="No feasible"):
             probe.run(args, status)
         assert calls == ["calibration"]
+
+
+def _fake_trainer(lengths, header="[p1.5] paper_warm 1802 warm_start_resets= True termination= selected 0.3 uncertainty_stop= 6.0 patched= True", sleep=0.0, rc=0):
+    code = ("import sys,time\nprint(%r, flush=True)\n" % header +
+            "for x in %r:\n    print('  Mean episode length: %%.2f' %% x, flush=True)\n    time.sleep(%r)\n" % (list(lengths), sleep) +
+            "time.sleep(0.5)\nsys.exit(%d)\n" % rc)
+    return [sys.executable, "-c", code]
+
+
+def test_guard_stops_collapsed_imagination(tmp_path):
+    import run_termination_probe as probe
+    statuses = []
+    with pytest.raises(RuntimeError, match="Guard stopped"):
+        probe.guarded_training(_fake_trainer([67.4] + [1.0] * 80, sleep=0.01), tmp_path / "t.log", tmp_path,
+                               lambda s, **d: statuses.append((s, d)), poll_s=0.05)
+    assert statuses and statuses[-1][0] == "guard_stopped"
+
+
+def test_guard_passes_healthy_training_and_checks_header(tmp_path):
+    import run_termination_probe as probe
+    probe.guarded_training(_fake_trainer([67.0] + [150.0] * 60), tmp_path / "a.log", tmp_path,
+                           lambda *a, **k: None, poll_s=0.05)
+    with pytest.raises(RuntimeError, match="warm resets"):
+        probe.guarded_training(_fake_trainer([100.0] * 5, header="[p1.5] paper 1802 warm_start_resets= False patched= True", sleep=0.2),
+                               tmp_path / "b.log", tmp_path, lambda *a, **k: None, poll_s=0.05)
+    with pytest.raises(subprocess.CalledProcessError):
+        probe.guarded_training(_fake_trainer([100.0] * 3, rc=2), tmp_path / "c.log", tmp_path, lambda *a, **k: None, poll_s=0.05)
+
+
+def test_guard_rule_and_mode_match():
+    import run_termination_probe as probe
+    assert probe.guard_verdict([1.0] * 49) is None
+    assert probe.guard_verdict([1.0] * 50) is not None
+    assert probe.guard_verdict([300.0] * 30 + [19.0] * 9 + [30.0] * 11) is None
+    assert probe.episode_lengths("x\n  Mean episode length: 12.50\nMean episode length: bad\n") == [12.5]
+    base = {"seed": 1, "task": "anymal_d_flat", "resolved_config": {"a": 1}, "normalizer_contract": {},
+            "world_model_checkpoint": {"sha256": "x"}, "initial_policy_checkpoint": None}
+    probe.check_training_match_except_mode(dict(base, mode="paper"), dict(base, mode="paper_warm"))
+    with pytest.raises(RuntimeError):
+        probe.check_training_match_except_mode(dict(base, mode="paper"), dict(base, mode="paper"))
+    with pytest.raises(RuntimeError):
+        probe.check_training_match_except_mode(dict(base, mode="paper"), dict(base, mode="paper_warm", seed=2))
