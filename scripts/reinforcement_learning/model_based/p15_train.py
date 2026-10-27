@@ -38,6 +38,8 @@ def parse_args(argv=None):
                         help="Probability threshold for the termination rule (ETH: 0.5); 'none' disables the head rule.")
     parser.add_argument("--only-positive-rewards", dest="only_positive_rewards", action="store_true",
                         help="Clip the total imagined reward per step at zero (legged_gym only_positive_rewards).")
+    parser.add_argument("--alive-bonus", dest="alive_bonus", type=float, default=0.0,
+                        help="Constant reward added to every imagined step (dt-scaled units, as summed per step).")
     parser.add_argument("--termination-uncertainty", dest="termination_uncertainty", type=float, default=None,
                         help="Also end an imagined episode when ensemble disagreement exceeds this value.")
     args = parser.parse_args(argv)
@@ -69,6 +71,7 @@ def main(argv=None):
         task=args.task, run_num=args.run_num, seed=args.seed, mode=args.mode, init_policy_checkpoint=None,
         termination_rule=args.termination_rule, termination_threshold=args.termination_threshold,
         termination_uncertainty=args.termination_uncertainty, only_positive_rewards=args.only_positive_rewards,
+        alive_bonus=args.alive_bonus,
     )
     cfg = T.resolve_task_config(args.task)
     cfg.environment_config.uncertainty_penalty_weight = -1.0
@@ -80,6 +83,9 @@ def main(argv=None):
         cfg.policy_algorithm_config.entropy_coef = 5e-3
     BaseEnv.warm_start_resets = args.mode.endswith("_warm")
     BaseEnv.only_positive_rewards = bool(args.only_positive_rewards)
+    if args.alive_bonus < 0:
+        raise SystemExit("--alive-bonus must be >= 0")
+    BaseEnv.alive_bonus = float(args.alive_bonus)
     print(
         "[p1.5]", args.mode, args.run_num, args.task,
         "seed=", args.seed,
@@ -90,6 +96,7 @@ def main(argv=None):
         "warm_start_resets=", BaseEnv.warm_start_resets,
         "termination=", args.termination_rule, args.termination_threshold,
         "uncertainty_stop=", args.termination_uncertainty, "only_positive_rewards=", BaseEnv.only_positive_rewards,
+        "alive_bonus=", BaseEnv.alive_bonus,
         "patched=", patched, flush=True,
     )
     T.run(cfg)

@@ -17,6 +17,10 @@ Steps (stop on any error; fresh output folder; one simulator/training job at a t
     (mean imagined episode length 1.0). The calibration uses a full 32-step context, so
     training must rebuild that context after resets. Warm resets alone had no consistent
     policy effect in Step 2 (fall wins 1/3, tracking wins 0/3).
+    Run 1803 (reward clip at 0) collapsed too: early per-step rewards are negative almost
+    everywhere, so the clip removed all signal (mean reward 0.00). Run 1804 drops the clip
+    and adds a constant alive bonus ALIVE_BONUS per imagined step, so a stop always costs
+    future reward. If 1804 is also guard-stopped, the stop approach is abandoned.
     Run 1802 (warm resets) also collapsed (mean imagined episode length 1.2 after 72
     iterations, guard stop). Hypothesis: early imagined rewards are negative, and a stop
     without a terminal cost lets the policy escape them. Run 1803 therefore also clips
@@ -47,9 +51,15 @@ import queue_paired_policy as pair
 from queue_remaining_pairs import validate_episode_csv, validate_reference
 
 MB = pair.MB
-RUN = 1803
+RUN = 1804
 MODE = "paper_warm"
-ONLY_POSITIVE_REWARDS = True
+ONLY_POSITIVE_REWARDS = False
+# Alive bonus per imagined step (dt-scaled reward units). Rule fixed 27 Oct before run 1804:
+# b = 2 x |median per-step reward of the first logged iterations of run 1802| = 2 x .0568,
+# from (return, length) = (-5.22, 89.60) (-9.62, 166.93) (-7.46, 128.82) (-9.85, 176.29)
+# (-11.74, 216.80) (-9.29, 173.65). Trained 1601/1701 policies earn about +.0139 per step
+# (median return 3.56 over 256 steps), so negative rewards occur early in training only.
+ALIVE_BONUS = 0.1135
 GUARD_AFTER, GUARD_MIN_LENGTH, GUARD_POLL_S = 50, 20.0, 30
 CONTROL = {"run": 1701, "falls": 178, "episodes_completed": 708, "track_per_step": .894513,
            "speed_ratio": .884107, "source": "run-log 2026-10-27, logs/p2/accel1701.37ZhDk/comparison.json"}
@@ -123,7 +133,7 @@ def run(args, status):
     threshold = None if chosen["tau"] is None else float(chosen["tau"])
     uncertainty = None if chosen["u"] is None else float(chosen["u"])
     pair.write_json(out / "manifest.json", {
-        "run": RUN, "mode": MODE, "only_positive_rewards": ONLY_POSITIVE_REWARDS, "training_seed": 1, "commit": commit, "termination_rule": rule,
+        "run": RUN, "mode": MODE, "only_positive_rewards": ONLY_POSITIVE_REWARDS, "alive_bonus": ALIVE_BONUS, "training_seed": 1, "commit": commit, "termination_rule": rule,
         "termination_threshold": threshold, "termination_uncertainty": uncertainty, "calibration_row": chosen,
         "control": CONTROL, "control_verified_pooled": control_pooled,
         "control_probe": str(args.control_probe),
@@ -144,7 +154,8 @@ def run(args, status):
     saved = record["args"]
     if (saved.get("termination_rule") != rule or saved.get("termination_threshold") != threshold
             or saved.get("termination_uncertainty") != uncertainty
-            or bool(saved.get("only_positive_rewards")) != ONLY_POSITIVE_REWARDS):
+            or bool(saved.get("only_positive_rewards")) != ONLY_POSITIVE_REWARDS
+            or float(saved.get("alive_bonus", 0.0)) != ALIVE_BONUS):
         raise RuntimeError("Saved run_args do not record the intended stop rule")
     records = []
     for seed in (42, 43):
@@ -166,10 +177,10 @@ def run(args, status):
               "per_seed": [{k: r["summary"][k] for k in ("track_per_step", "falls", "episodes_completed", "speed_ratio")}
                            for r in records],
               "control": CONTROL, "ceiling": CEILING, **verdicts(pooled, records),
-              "mode": MODE, "only_positive_rewards": ONLY_POSITIVE_REWARDS,
-              "scope": "One training seed; stop rule plus warm resets plus reward clip versus cold 1701. Screen selects replication (seeds 2, 3); not a causal proof."}
+              "mode": MODE, "only_positive_rewards": ONLY_POSITIVE_REWARDS, "alive_bonus": ALIVE_BONUS,
+              "scope": "One training seed; stop rule plus warm resets plus alive bonus versus cold 1701. Screen selects replication (seeds 2, 3); not a causal proof."}
     pair.write_json(out / "comparison.json", report)
-    text = (f"run {RUN} ({MODE}, clip={ONLY_POSITIVE_REWARDS}; head {rule} > {threshold}, uncertainty > {uncertainty}): tracking={pooled['track_per_step']:.6f}, "
+    text = (f"run {RUN} ({MODE}, alive_bonus={ALIVE_BONUS}; head {rule} > {threshold}, uncertainty > {uncertainty}): tracking={pooled['track_per_step']:.6f}, "
             f"falls={pooled['falls']}/{pooled['episodes_completed']}, speed_ratio={pooled['speed_ratio']:.6f}\n"
             f"control 1701: tracking={CONTROL['track_per_step']}, falls={CONTROL['falls']}/{CONTROL['episodes_completed']}\n"
             f"screen_pass={report['screen_pass']} (falls<=89, tracking>=.874513, speeds>=.8)\n"
@@ -216,7 +227,8 @@ def guarded_training(command, log, repo, status, poll_s=GUARD_POLL_S, launcher=N
             text = log.read_text(errors="replace")
             if not checked and "[p1.5]" in text:
                 line = next(l for l in text.splitlines() if "[p1.5]" in l)
-                need = ["warm_start_resets= True", "patched= True"] + (["only_positive_rewards= True"] if ONLY_POSITIVE_REWARDS else [])
+                need = ["warm_start_resets= True", "patched= True", f"only_positive_rewards= {ONLY_POSITIVE_REWARDS}",
+                        f"alive_bonus= {ALIVE_BONUS}"]
                 if any(n not in line for n in need):
                     os.killpg(proc.pid, signal.SIGTERM)
                     proc.wait()
@@ -263,6 +275,8 @@ def training_child(rule, threshold, uncertainty):
         sys.argv += ["--termination-uncertainty", uncertainty]
     if ONLY_POSITIVE_REWARDS:
         sys.argv += ["--only-positive-rewards"]
+    if ALIVE_BONUS:
+        sys.argv += ["--alive-bonus", str(ALIVE_BONUS)]
     runpy.run_path(script, run_name="__main__")
 
 

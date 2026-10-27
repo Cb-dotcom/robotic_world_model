@@ -197,6 +197,11 @@ class BaseEnv:
                 rewards += self.reward_term_weights[term] * term_value * self._step_dt
                 self.imagination_episode_sums[term] += self.reward_term_weights[term] * term_value * self._step_dt
         
+        alive_bonus = float(getattr(self, "alive_bonus", 0.0))
+        if alive_bonus:
+            # Opt-in (27 Oct 2026): constant per-step survival bonus. With fixed-length episodes it
+            # leaves the optimal policy unchanged; with imagined stops it makes a stop cost future reward.
+            rewards = rewards + alive_bonus
         if getattr(self, "only_positive_rewards", False):
             # Opt-in (27 Oct 2026, legged_gym "only_positive_rewards"): clip the total imagined
             # reward at zero so that ending an imagined episode early can never pay.

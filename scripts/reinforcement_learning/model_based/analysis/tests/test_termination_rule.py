@@ -334,7 +334,7 @@ def test_probe_sequences_calibration_one_training_two_evaluations(tmp_path, monk
     monkeypatch.setattr(probe.pair, "completed", lambda *a: checkpoint)
     monkeypatch.setattr(probe.pair, "provenance", lambda *a: dict(old, mode="paper_warm", args={
         "termination_rule": "max", "termination_threshold": .1, "termination_uncertainty": None,
-        "only_positive_rewards": True}))
+        "only_positive_rewards": False, "alive_bonus": 0.1135}))
     monkeypatch.setattr(probe, "validate_reference", lambda *a: None)
     monkeypatch.setattr(probe, "validate_episode_csv", lambda *a: None)
     monkeypatch.setattr(probe.pair, "pool", lambda *a: dict(falls=80, episodes_completed=700, track_per_step=.9, speed_ratio=.9))
@@ -372,7 +372,7 @@ def test_probe_sequences_calibration_one_training_two_evaluations(tmp_path, monk
         assert calls == ["calibration"]
 
 
-def _fake_trainer(lengths, header="[p1.5] paper_warm 1803 warm_start_resets= True termination= selected 0.3 uncertainty_stop= 6.0 only_positive_rewards= True patched= True", sleep=0.0, rc=0):
+def _fake_trainer(lengths, header="[p1.5] paper_warm 1803 warm_start_resets= True termination= selected 0.3 uncertainty_stop= 6.0 only_positive_rewards= False alive_bonus= 0.1135 patched= True", sleep=0.0, rc=0):
     code = ("import sys,time\nprint(%r, flush=True)\n" % header +
             "for x in %r:\n    print('  Mean episode length: %%.2f' %% x, flush=True)\n    time.sleep(%r)\n" % (list(lengths), sleep) +
             "time.sleep(0.5)\nsys.exit(%d)\n" % rc)
@@ -440,3 +440,27 @@ def test_p15_flag_only_positive_rewards():
     import p15_train
     assert p15_train.parse_args(["paper_warm", "1803", "--seed", "1", "--only-positive-rewards"]).only_positive_rewards
     assert not p15_train.parse_args(["paper", "1601", "--seed", "1"]).only_positive_rewards
+
+
+def test_alive_bonus_in_post_step_and_flag():
+    from envs.base import BaseEnv
+    import p15_train
+    env = BaseEnv.__new__(BaseEnv)
+    env._num_envs, env.device, env._step_dt, env._max_episode_length = 2, "cpu", 0.02, 256
+    env.episode_length_buf = torch.zeros(2, dtype=torch.long)
+    env.common_step_counter = 1
+    env.reward_term_weights = {"track": 1.0}
+    env.imagination_episode_sums = {"track": torch.zeros(2), "uncertainty": torch.zeros(2)}
+    env.imagination_reward_per_step = {"track": torch.tensor([1.0, 0.0])}
+    env.uncertainty_penalty_weight = -1.0
+    env.epistemic_uncertainty = torch.tensor([0.0, 5.0])
+    env.termination_flags = torch.zeros(2, dtype=torch.bool)
+    env.extras = {}
+    env._reset_idx = lambda ids: None
+    env.alive_bonus = 0.1135
+    r, _, _ = env._post_imagination_step()
+    assert torch.allclose(r, torch.tensor([0.02 + 0.1135, -0.1 + 0.1135]))
+    assert float(getattr(BaseEnv, "alive_bonus", 0.0)) == 0.0
+    a = p15_train.parse_args(["paper_warm", "1804", "--seed", "1", "--alive-bonus", "0.1135"])
+    assert a.alive_bonus == 0.1135
+    assert p15_train.parse_args(["paper", "1601", "--seed", "1"]).alive_bonus == 0.0
