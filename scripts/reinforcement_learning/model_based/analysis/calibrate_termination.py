@@ -23,6 +23,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from types import MethodType
 
 import numpy as np
 import torch
@@ -34,13 +35,19 @@ from pre_reset_transitions import gather, sha256, validate_trace, windows  # noq
 
 GRID = (0.5, 0.3, 0.2, 0.1, 0.05, 0.03, 0.02, 0.01, 0.005)
 RULES = ("max", "mean")
-MAX_FALSE = 2e-4   # per imagined step: ~5% of 256-step imagined episodes cut falsely
+MAX_FALSE = 2e-4   # Empirical window false rate; not a certified new-episode risk bound.
 HORIZONS = (1, 8)
 
 
 @torch.no_grad()
 def head_term_probs(model, stats, trace, origins, horizon, device, batch=2048):
-    """[ensemble, n] termination probability at the window end, per fixed head."""
+    """[selected state-path head, classifier head, window] endpoint probability.
+
+    Every classifier must see the SAME selected state path, as at deployment.
+    Taking max/mean across different state paths is not the deployed rule.
+    """
+    from termination_rule import ensemble_forward_with_head_terminations
+    model.forward = MethodType(ensemble_forward_with_head_terminations, model)
     out = []
     sm, ss = stats["state_mean"].to(device), stats["state_std"].to(device)
     am, ast = stats["action_mean"].to(device), stats["action_std"].to(device)
@@ -57,41 +64,48 @@ def head_term_probs(model, stats, trace, origins, horizon, device, batch=2048):
                 mean, _, _, _, _, term = model(xs, xa, ids)
                 if k < horizon - 1:
                     xs, xa = mean[:, None], ac[:, 32 + k:33 + k]
-            heads.append(torch.sigmoid(term).squeeze(-1).float().cpu().numpy())
+            heads.append(torch.sigmoid(model.last_head_termination_logits).squeeze(-1).float().cpu().numpy())
         out.append(np.stack(heads))
-    return np.concatenate(out, axis=1) if out else np.zeros((model.ensemble_size, 0))
+        print(f"[calibrate] h={horizon} windows {min(b+batch,len(origins))}/{len(origins)}", flush=True)
+    return np.concatenate(out, axis=2) if out else np.zeros((model.ensemble_size, model.ensemble_size, 0))
 
 
 def table(probs_by_arm, labels_by_arm):
+    # A 2D input is a one-state-path test fixture; real calibration is 3D.
+    probs_by_arm = {a: p[None] if p.ndim == 2 else p for a, p in probs_by_arm.items()}
     rows = []
-    surv = {a: probs_by_arm[a][:, labels_by_arm[a] == "surviving_25"] for a in probs_by_arm}
+    surv = {a: probs_by_arm[a][:, :, labels_by_arm[a] == "surviving_25"] for a in probs_by_arm}
     pos_mask = np.isin(labels_by_arm["baseline"], ("fall_now", "pre_fall_1_25"))
-    groups = {g: probs_by_arm["baseline"][:, labels_by_arm["baseline"] == g] for g in ("fall_now", "pre_fall_1_25")}
-    pos = probs_by_arm["baseline"][:, pos_mask]
-    agg = {"max": lambda p: p.max(0), "mean": lambda p: p.mean(0)}
+    groups = {g: probs_by_arm["baseline"][:, :, labels_by_arm["baseline"] == g] for g in ("fall_now", "pre_fall_1_25")}
+    pos = probs_by_arm["baseline"][:, :, pos_mask]
+    agg = {"max": lambda p: p.max(1), "mean": lambda p: p.mean(1)}
     for rule in RULES:
         for tau in GRID:
             row = {"rule": rule, "threshold": tau}
             for arm, p in surv.items():
-                row[f"false_rate_{arm}"] = float((agg[rule](p) > tau).mean()) if p.shape[1] else float("nan")
-                row[f"n_surv_{arm}"] = int(p.shape[1])
-            row["recall_pooled"] = float((agg[rule](pos) > tau).mean()) if pos.shape[1] else float("nan")
+                row[f"false_rate_{arm}"] = float((agg[rule](p) > tau).mean()) if p.shape[2] else float("nan")
+                row[f"n_surv_{arm}"] = int(p.shape[2])
+            row["recall_pooled"] = float((agg[rule](pos) > tau).mean()) if pos.shape[2] else float("nan")
             for g, p in groups.items():
-                row[f"recall_{g}"] = float((agg[rule](p) > tau).mean()) if p.shape[1] else float("nan")
+                row[f"recall_{g}"] = float((agg[rule](p) > tau).mean()) if p.shape[2] else float("nan")
             rows.append(row)
     # ETH's deployed rule for reference: a random selected head > 0.5 (average over heads)
     eth = {"rule": "selected(eth)", "threshold": 0.5}
+    def selected(p):
+        if p.shape[0] == 1:  # simple one-path fixtures: average over random heads
+            return p[0]
+        return np.stack([p[h, h] for h in range(p.shape[0])])
     for arm, p in surv.items():
-        eth[f"false_rate_{arm}"] = float((p > 0.5).mean()) if p.shape[1] else float("nan")
-        eth[f"n_surv_{arm}"] = int(p.shape[1])
-    eth["recall_pooled"] = float((pos > 0.5).mean()) if pos.shape[1] else float("nan")
+        eth[f"false_rate_{arm}"] = float((selected(p) > 0.5).mean()) if p.shape[2] else float("nan")
+        eth[f"n_surv_{arm}"] = int(p.shape[2])
+    eth["recall_pooled"] = float((selected(pos) > 0.5).mean()) if pos.shape[2] else float("nan")
     for g, p in groups.items():
-        eth[f"recall_{g}"] = float((p > 0.5).mean()) if p.shape[1] else float("nan")
+        eth[f"recall_{g}"] = float((selected(p) > 0.5).mean()) if p.shape[2] else float("nan")
     return rows, eth
 
 
 def select(rows):
-    feasible = [r for r in rows if r["false_rate_baseline"] <= MAX_FALSE and r["false_rate_reference"] <= MAX_FALSE]
+    feasible = [r for r in rows if np.isfinite(r["recall_pooled"]) and r["false_rate_baseline"] <= MAX_FALSE and r["false_rate_reference"] <= MAX_FALSE]
     if not feasible:
         return None
     return sorted(feasible, key=lambda r: (-r["recall_pooled"], -r["threshold"], r["rule"] != "mean"))[0]
@@ -106,6 +120,8 @@ def main(argv=None):
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max_windows_per_group", type=int, default=10**9)
     a = ap.parse_args(argv)
+    if a.out.exists():
+        raise FileExistsError(a.out)
     from analyse_transition_fidelity import load_model
     device = a.device if (a.device == "cpu" or torch.cuda.is_available()) else "cpu"
     torch.set_num_threads(2)
@@ -113,7 +129,11 @@ def main(argv=None):
     model = model.to(device)
     model.device = device
     stats = contract.statistics
-    report = {"world_model_sha256": sha256(a.wm), "grid": GRID, "rules": RULES, "max_false_rate": MAX_FALSE,
+    report = {"schema": "same_path_all_head_termination_v2", "world_model_sha256": sha256(a.wm), "grid": GRID, "rules": RULES, "max_false_rate": MAX_FALSE,
+              "normalization": contract.metadata(),
+              "scope": "Empirical selection on these recordings; no held-out calibration claim. Windows overlap. "
+                       "Aggregate classifiers within each selected state-head path, then average uniformly over paths/windows. "
+                       "Endpoint window rates do not certify cumulative rollout risk or future-policy generalization.",
               "selection": "horizon 8; false rate <= max on both actors' surviving windows; max pooled recall; "
                            "ties -> larger threshold, then mean", "horizons": {}}
     for horizon in HORIZONS:
@@ -122,6 +142,7 @@ def main(argv=None):
             with np.load(path, allow_pickle=False) as z:
                 trace = {k: z[k] for k in z.files}
             validate_trace(trace)
+            report.setdefault("recordings", {})[arm] = {"sha256": sha256(path), "metadata": json.loads(str(trace["metadata"]))}
             origins, lab, cnt = windows(trace, 32, horizon, per_group=a.max_windows_per_group)
             probs[arm] = head_term_probs(model, stats, trace, origins, horizon, device)
             labels[arm], counts[arm] = lab, cnt
@@ -130,6 +151,9 @@ def main(argv=None):
         report["horizons"][str(horizon)] = {"counts": counts, "eth_rule": eth, "rows": rows,
                                             "selected": select(rows)}
     chosen = report["horizons"]["8"]["selected"]
+    if chosen is not None and chosen["recall_pooled"] <= report["horizons"]["8"]["eth_rule"]["recall_pooled"]:
+        chosen = None
+        report["stop_reason"] = "No strict recall improvement over the deployed selected-head rule"
     report["chosen"] = chosen
     a.out.parent.mkdir(parents=True, exist_ok=True)
     with a.out.open("x") as f:

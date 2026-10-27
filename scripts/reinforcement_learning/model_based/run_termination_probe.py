@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Calibrate the imagined stop rule, train ONE ANYmal seed with it, evaluate.
 
-Evidence (27 Oct, logs/p2/transition_fidelity.*): on real falls of the offline policy,
-ETH's termination rule (selected head p > 0.5) fires in 6-56% of cases per head, while
-the head probabilities separate falls from survival by ~100x. Imagination therefore
-almost never ends in a fall (P1.5 log: 2007/2498 iterations at the 256-step cap).
+Evidence (27 Oct): the paired fall replay shows fewer cumulative predicted stops with imagined-state
+feedback than with real-state feedback. This motivates one engineering test; it
+does not prove termination is the cause or that the rule will repair the policy.
 
 Steps (stop on any error; fresh output folder; one simulator/training job at a time):
  1. analysis/calibrate_imagined_stops.py on the diagnostic's baseline.npz / reference.npz:
@@ -27,6 +26,7 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -42,6 +42,28 @@ CEILING = {"track_per_step_pooled": .9546, "falls": 3,
            "source": "run-log: ceiling s42 10k .9536 3/321; s43 10k .955695 0/320"}
 SCREEN = {"max_falls": 89, "min_tracking": .874513, "min_speed": .8}
 WALKER = {"max_falls": 6, "min_tracking": .859, "min_speed": .8}
+
+
+def verified_control(repo, directory):
+    from run_acceleration_probe import read_eval
+    run = pair.run_directory(repo, 1701)
+    checkpoint = run / "policy_2499.pt"
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if pair.sha256(checkpoint) != manifest["policy_sha256"]:
+        raise RuntimeError("Control 1701 policy hash differs from its saved evaluation")
+    records = [read_eval(directory / f"corrected_eval_{seed}", checkpoint, seed) for seed in (42, 43)]
+    pooled = pair.pool(records)
+    for key in ("falls", "episodes_completed", "track_per_step", "speed_ratio"):
+        if not math.isclose(pooled[key], CONTROL[key], rel_tol=0, abs_tol=1e-6):
+            raise RuntimeError(f"Saved control differs from the prewritten screen: {key}")
+    provenance = pair.provenance(run, 1701, "paper", 1)
+    wm = repo / "assets/models/pretrain_rnn_ens.pt"
+    expected = "2ac8686c8c7736287853c0fe1438c379320068adf97be71609b5f1afb52c6e5a"
+    if pair.sha256(wm) != expected or provenance["world_model_checkpoint"]["sha256"] != expected:
+        raise RuntimeError("Control/current WM is not the supplied ETH asset")
+    if pair.sha256(repo / "assets/data/state_action_data_0.csv") != manifest["data_sha256"]:
+        raise RuntimeError("Imagination start data differ from run 1701")
+    return provenance, pooled
 
 
 def verdicts(pooled, records):
@@ -63,6 +85,9 @@ def run(args, status):
         if not (diag / name).is_file():
             raise RuntimeError(f"Missing {diag / name}")
     wm = repo / "assets/models/pretrain_rnn_ens.pt"
+    control_record, control_pooled = verified_control(repo, args.control_probe)
+    if args.calib_device.startswith("cuda") and pair_gpu_free() < 12:
+        raise RuntimeError("Less than 12 GiB free before GPU calibration; no job started")
     status("calibrating")
     calib = out / "stop_calibration.json"
     proc = subprocess.run([args.python, str(MB / "analysis/calibrate_imagined_stops.py"),
@@ -73,14 +98,21 @@ def run(args, status):
         raise RuntimeError("No feasible termination rule; no training started")
     if proc.returncode != 0:
         raise RuntimeError(f"Calibration failed (rc={proc.returncode}); see calibration.log")
-    chosen = json.loads(calib.read_text())["chosen"]
+    calibration = json.loads(calib.read_text())
+    if calibration.get("schema") != "imagined_stop_paths_v2":
+        raise RuntimeError("Calibration does not use the validated cumulative same-path stop rule")
+    if calibration["normalization"]["norm_stats_sha256"] != control_record["normalizer_contract"]["norm_stats_sha256"]:
+        raise RuntimeError("Calibration and control normalization differ")
+    chosen = calibration["chosen"]
     rule = chosen["agg"]
     threshold = None if chosen["tau"] is None else float(chosen["tau"])
     uncertainty = None if chosen["u"] is None else float(chosen["u"])
     pair.write_json(out / "manifest.json", {
         "run": RUN, "training_seed": 1, "commit": commit, "termination_rule": rule,
         "termination_threshold": threshold, "termination_uncertainty": uncertainty, "calibration_row": chosen,
-        "control": CONTROL, "ceiling": CEILING, "screen_rule": SCREEN, "walker_rule": WALKER,
+        "control": CONTROL, "control_verified_pooled": control_pooled,
+        "control_probe": str(args.control_probe),
+        "ceiling": CEILING, "screen_rule": SCREEN, "walker_rule": WALKER,
         "world_model_sha256": pair.sha256(wm), "diagnostic": str(diag),
         "data_sha256": pair.sha256(repo / "assets/data/state_action_data_0.csv"),
     })
@@ -93,6 +125,8 @@ def run(args, status):
     new_dir = pair.run_directory(repo, RUN)
     checkpoint = pair.completed(new_dir, train_log)
     record = pair.provenance(new_dir, RUN, "paper", 1)
+    from run_acceleration_probe import check_training_match
+    check_training_match(control_record, record)
     saved = record["args"]
     if (saved.get("termination_rule") != rule or saved.get("termination_threshold") != threshold
             or saved.get("termination_uncertainty") != uncertainty):
@@ -157,8 +191,11 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--python", default="/isaac-sim/python.sh")
     parser.add_argument("--calib-device", default="cpu")
+    parser.add_argument("--control-probe", type=Path, default=Path("logs/p2/accel1701.37ZhDk"),
+                        help="Saved run-1701 probe with manifest and both validated evaluations")
     args = parser.parse_args()
     args.out, args.diagnostic = args.out.resolve(), args.diagnostic.resolve()
+    args.control_probe = args.control_probe.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
     if any(p.name not in {"queue.log", "queue.pid"} or not p.is_file() for p in args.out.iterdir()):
         parser.error("Output directory is not fresh")

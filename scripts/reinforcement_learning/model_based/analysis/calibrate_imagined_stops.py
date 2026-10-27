@@ -125,7 +125,7 @@ def evaluate(paths):
 
 
 def select(rows):
-    feasible = [r for r in rows if r["false_path_baseline"] <= MAX_FALSE_PATH and r["false_path_reference"] <= MAX_FALSE_PATH]
+    feasible = [r for r in rows if np.isfinite(r["recall_fall"]) and r["false_path_baseline"] <= MAX_FALSE_PATH and r["false_path_reference"] <= MAX_FALSE_PATH]
     if not feasible:
         return None
     key = lambda r: (-r["recall_fall"], r["u"] is not None, -(r["u"] or 0.0), r["tau"] is not None,
@@ -142,11 +142,16 @@ def main(argv=None):
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--n_surviving", type=int, default=N_SURVIVING)
     a = ap.parse_args(argv)
+    if a.out.exists():
+        raise FileExistsError(a.out)
+    if a.n_surviving < 1:
+        ap.error("Require at least one surviving path per actor")
     from analyse_transition_fidelity import load_model
     device = a.device if (a.device == "cpu" or torch.cuda.is_available()) else "cpu"
     torch.set_num_threads(2)
     model, contract = load_model(a.wm)
     model = model.to(device)
+    model.device = device
     stats = contract.statistics
     paths, counts = {}, {}
     for arm, path in (("baseline", a.baseline), ("reference", a.reference)):
@@ -168,11 +173,18 @@ def main(argv=None):
         raise SystemExit("No fall path with reset-safe context")
     rows, eth = evaluate(paths)
     chosen = select(rows)
+    if chosen is not None and chosen["recall_fall"] <= eth["recall_fall"]:
+        chosen = None
     summary = {k: {"epi_step1_mean": float(v[1][:, 0].mean()), "epi_step25_mean": float(v[1][:, -1].mean()),
                    "epi_path_max_median": float(np.median(v[1].max(1))),
                    "term_max_heads_path_max_median": float(np.median(v[0].max(-1).max(1)))}
                for k, v in paths.items()}
-    report = {"world_model_sha256": sha256(a.wm), "horizon": HORIZON, "counts": counts,
+    report = {"schema": "imagined_stop_paths_v2", "normalization": contract.metadata(),
+              "world_model_sha256": sha256(a.wm), "horizon": HORIZON, "counts": counts,
+              "recording_sha256": {"baseline": sha256(a.baseline), "reference": sha256(a.reference)},
+              "scope": "Empirical rule selection on these recordings, not held-out validation. Overlapping paths and "
+                       "heads are not independent replications. The measured 25-step false-stop fraction does not "
+                       "certify new 256-step episode risk. Only a strict recall gain over ETH justifies training.",
               "max_false_path": MAX_FALSE_PATH, "aggs": AGGS, "taus": TAUS, "us": US,
               "selection": __doc__.split("Selection")[1].split("No feasible")[0].strip(),
               "path_summary": summary, "eth_rule": eth, "rows": rows, "chosen": chosen}
