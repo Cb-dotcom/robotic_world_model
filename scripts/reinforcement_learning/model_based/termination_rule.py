@@ -10,6 +10,10 @@ This module changes only that decision:
   rule "selected": selected head probability > threshold  (ETH default at 0.5)
   rule "max":      max over all heads > threshold           (pessimistic ensemble)
   rule "mean":     mean over all heads > threshold
+Optional uncertainty stop (27 Oct, after the paired fall replay): also end the
+imagined episode when the ensemble disagreement of the step (the same quantity
+the penalty uses) exceeds ``uncertainty_threshold``. Inside imagination the fall
+signal fades while the real error grows; disagreement is still high early on.
 State predictions, rewards, the uncertainty penalty and the selected head are
 unchanged. ``install`` must run before the training builds its environment; the
 default ("selected", 0.5) installs nothing.
@@ -68,8 +72,19 @@ def ensemble_forward_with_head_terminations(self, x_state_batch, x_action_batch,
     return output_state_means, aleatoric_uncertainty, epistemic_uncertainty, output_extensions, output_contacts, output_terminations
 
 
-def decide(selected_logits, head_logits, rule, threshold):
+def decide(selected_logits, head_logits, rule, threshold, epistemic=None, uncertainty_threshold=None):
     """Termination decision [batch] (bool). ``head_logits``: [ensemble, batch, 1]."""
+    stop = _term_decision(selected_logits, head_logits, rule, threshold)
+    if uncertainty_threshold is not None:
+        if epistemic is None or epistemic.shape[0] != stop.shape[0]:
+            raise RuntimeError("Epistemic uncertainty missing or misaligned")
+        stop = stop | (epistemic.reshape(-1) > uncertainty_threshold)
+    return stop
+
+
+def _term_decision(selected_logits, head_logits, rule, threshold):
+    if threshold is None:
+        return torch.zeros(selected_logits.shape[0], dtype=torch.bool, device=selected_logits.device)
     if rule == "selected":
         p = torch.sigmoid(selected_logits).squeeze(-1)
     elif rule == "max":
@@ -81,14 +96,23 @@ def decide(selected_logits, head_logits, rule, threshold):
     return p > threshold
 
 
-def install(rule: str, threshold: float, env_cls=None, ensemble_cls=None):
-    """Patch the ensemble forward (stash only) and the env's termination parser."""
+def install(rule: str, threshold, env_cls=None, ensemble_cls=None, uncertainty_threshold=None):
+    """Patch the ensemble forward (stash only) and the env's termination parser.
+
+    ``threshold=None`` disables the head rule (uncertainty stop only)."""
     if rule not in RULES:
         raise ValueError(f"termination rule must be one of {RULES}")
-    threshold = float(threshold)
-    if not 0.0 < threshold < 1.0:
-        raise ValueError("termination threshold must lie in (0, 1)")
-    if (rule, threshold) == DEFAULT:
+    if threshold is not None:
+        threshold = float(threshold)
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("termination threshold must lie in (0, 1)")
+    if uncertainty_threshold is not None:
+        uncertainty_threshold = float(uncertainty_threshold)
+        if not uncertainty_threshold > 0.0:
+            raise ValueError("uncertainty threshold must be > 0")
+    if threshold is None and uncertainty_threshold is None:
+        raise ValueError("at least one of threshold / uncertainty_threshold is required")
+    if (rule, threshold) == DEFAULT and uncertainty_threshold is None:
         return False
     if ensemble_cls is None:
         from rsl_rl.modules import SystemDynamicsEnsemble as ensemble_cls
@@ -100,10 +124,12 @@ def install(rule: str, threshold: float, env_cls=None, ensemble_cls=None):
         if terminations is None:
             return None
         heads = getattr(self.system_dynamics, "last_head_termination_logits", None)
-        if rule != "selected" and (heads is None or heads.shape[1] != terminations.shape[0]):
+        if threshold is not None and rule != "selected" and (heads is None or heads.shape[1] != terminations.shape[0]):
             raise RuntimeError("Head termination logits missing or misaligned")
-        return decide(terminations, heads, rule, threshold)
+        # BaseEnv.imagination_step stores this step's disagreement before parsing terminations.
+        epistemic = getattr(self, "epistemic_uncertainty", None) if uncertainty_threshold is not None else None
+        return decide(terminations, heads, rule, threshold, epistemic, uncertainty_threshold)
 
     env_cls._parse_terminations = _parse_terminations
-    env_cls.termination_rule = (rule, threshold)
+    env_cls.termination_rule = (rule, threshold, uncertainty_threshold)
     return True

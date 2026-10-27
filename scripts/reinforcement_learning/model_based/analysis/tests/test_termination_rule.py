@@ -144,3 +144,75 @@ def test_probe_rules_and_cli_flags():
     assert (a.termination_rule, a.termination_threshold, a.seed) == ("max", .05, 1)
     d = p15_train.parse_args(["paper", "1601", "--seed", "1"])
     assert (d.termination_rule, d.termination_threshold) == ("selected", .5)
+
+
+def test_uncertainty_stop_rule_and_install():
+    logit = lambda p: torch.logit(torch.tensor(p))
+    sel = logit([0.01, 0.01, 0.9])[:, None]
+    epi = torch.tensor([0.5, 3.0, 0.1])
+    assert tr.decide(sel, None, "selected", None, epi, 2.0).tolist() == [False, True, False]
+    assert tr.decide(sel, None, "selected", .5, epi, 2.0).tolist() == [False, True, True]
+    with pytest.raises(RuntimeError):
+        tr.decide(sel, None, "selected", .5, None, 2.0)
+
+    class Ens(SystemDynamicsEnsemble):
+        pass
+
+    class Env:
+        def _parse_terminations(self, terminations):
+            return "eth"
+    with pytest.raises(ValueError):
+        tr.install("max", None, env_cls=Env, ensemble_cls=Ens)
+    with pytest.raises(ValueError):
+        tr.install("selected", .5, env_cls=Env, ensemble_cls=Ens, uncertainty_threshold=0.0)
+    assert tr.install("selected", None, env_cls=Env, ensemble_cls=Ens, uncertainty_threshold=2.0) is True
+    env = Env()
+    env.system_dynamics = type("SD", (), {"last_head_termination_logits": None})()
+    env.epistemic_uncertainty = torch.tensor([2.5, 1.0])
+    assert env._parse_terminations(logit([0.9, 0.9])[:, None]).tolist() == [True, False]
+
+
+def test_imagined_stop_calibration_rules():
+    import calibrate_imagined_stops as cis
+    E, K = 5, cis.HORIZON
+    # fall paths: termination low everywhere but disagreement high at step 3
+    tf = np.full((E, K, 4, E), .001); ef = np.full((E, K, 4), .5); ef[:, 2] = 5.0
+    # surviving paths: low everything, one path with p=.04 on one head
+    ts = np.full((E, K, 50, E), .0005); es = np.full((E, K, 50), .6); ts[0, 5, 0, 0] = .04
+    paths = {"fall": (tf, ef), "surv_baseline": (ts, es), "surv_reference": (ts.copy(), es.copy())}
+    rows, eth = cis.evaluate(paths)
+    assert eth["recall_fall"] == 0.0
+    chosen = cis.select(rows)
+    # head rules cannot catch these falls; the least-intervening full-recall rule is u = 4.0
+    assert chosen["recall_fall"] == 1.0 and chosen["u"] == 4.0 and chosen["tau"] is None
+    # selected-head mapping: term[h, :, :, h]
+    t = np.zeros((E, K, 1, E)); t[2, 0, 0, 2] = .9; t[1, 0, 0, 3] = .9
+    s = cis.stops(t, np.zeros((E, K, 1)), "selected", .5, None)
+    assert s[:, 0].tolist() == [False, False, True, False, False]
+    assert cis.stops(t, np.zeros((E, K, 1)), "max", .5, None)[:, 0].tolist() == [False, True, True, False, False]
+
+
+def test_imagined_stop_calibration_end_to_end(tmp_path):
+    import calibrate_imagined_stops as cis
+    sd = small_anymal(2)
+    wm = tmp_path / "wm.pt"
+    torch.save({"system_dynamics_state_dict": sd.state_dict()}, wm)
+    trace = sample_trace(T=160, N=2)
+    # make env 0's terminal a fall with full 32+25 context (fall at row 69 in sample_trace)
+    for name in ("baseline", "reference"):
+        np.savez_compressed(tmp_path / f"{name}.npz", **trace)
+    out = tmp_path / "stops.json"
+    rc = cis.main(["--baseline", str(tmp_path / "baseline.npz"), "--reference", str(tmp_path / "reference.npz"),
+                   "--wm", str(wm), "--out", str(out), "--device", "cpu", "--n_surviving", "20"])
+    rep = json.loads(out.read_text())
+    assert rep["counts"]["fall"] == 1 and rc in (0, 3)
+    assert (rc == 0) == (rep["chosen"] is not None)
+    first = rep["rows"][0]
+    assert set(first) == {"agg", "tau", "u", "recall_fall", "false_path_baseline", "false_path_reference"}
+
+
+def test_p15_flags_for_uncertainty_stop():
+    import p15_train
+    a = p15_train.parse_args(["paper", "1801", "--seed", "1", "--termination-threshold", "none",
+                              "--termination-uncertainty", "2.5"])
+    assert a.termination_threshold is None and a.termination_uncertainty == 2.5

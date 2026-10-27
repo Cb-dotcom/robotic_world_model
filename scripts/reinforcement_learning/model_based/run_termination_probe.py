@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calibrate the imagined termination rule, train ONE ANYmal seed with it, evaluate.
+"""Calibrate the imagined stop rule, train ONE ANYmal seed with it, evaluate.
 
 Evidence (27 Oct, logs/p2/transition_fidelity.*): on real falls of the offline policy,
 ETH's termination rule (selected head p > 0.5) fires in 6-56% of cases per head, while
@@ -7,10 +7,12 @@ the head probabilities separate falls from survival by ~100x. Imagination theref
 almost never ends in a fall (P1.5 log: 2007/2498 iterations at the 256-step cap).
 
 Steps (stop on any error; fresh output folder; one simulator/training job at a time):
- 1. analysis/calibrate_termination.py on the diagnostic's baseline.npz / reference.npz
-    (selection rule fixed in that file; infeasible -> stop, no training).
+ 1. analysis/calibrate_imagined_stops.py on the diagnostic's baseline.npz / reference.npz:
+    imagined 25-step paths; head rule and/or disagreement stop (revised 27 Oct after the
+    paired fall replay showed the fall signal fades inside imagination; selection rule
+    fixed in that file; infeasible -> stop, no training).
  2. Train run 1801: paper recipe, cold, training seed 1, current env (acceleration fix
-    d9d2a66 included, as in run 1701), ONLY the termination rule changed.
+    d9d2a66 included, as in run 1701), ONLY the imagined stop rule changed.
  3. Evaluate seeds 42/43, 32 envs x 10000 steps, std .5, commands 10 s, pushes on.
  4. Pool and apply the rules fixed below.
 
@@ -62,8 +64,8 @@ def run(args, status):
             raise RuntimeError(f"Missing {diag / name}")
     wm = repo / "assets/models/pretrain_rnn_ens.pt"
     status("calibrating")
-    calib = out / "termination_calibration.json"
-    proc = subprocess.run([args.python, str(MB / "analysis/calibrate_termination.py"),
+    calib = out / "stop_calibration.json"
+    proc = subprocess.run([args.python, str(MB / "analysis/calibrate_imagined_stops.py"),
                            "--baseline", str(diag / "baseline.npz"), "--reference", str(diag / "reference.npz"),
                            "--wm", str(wm), "--out", str(calib), "--device", args.calib_device],
                           cwd=repo, stdout=(out / "calibration.log").open("x"), stderr=subprocess.STDOUT)
@@ -72,25 +74,29 @@ def run(args, status):
     if proc.returncode != 0:
         raise RuntimeError(f"Calibration failed (rc={proc.returncode}); see calibration.log")
     chosen = json.loads(calib.read_text())["chosen"]
-    rule, threshold = chosen["rule"], float(chosen["threshold"])
+    rule = chosen["agg"]
+    threshold = None if chosen["tau"] is None else float(chosen["tau"])
+    uncertainty = None if chosen["u"] is None else float(chosen["u"])
     pair.write_json(out / "manifest.json", {
         "run": RUN, "training_seed": 1, "commit": commit, "termination_rule": rule,
-        "termination_threshold": threshold, "calibration_row": chosen,
+        "termination_threshold": threshold, "termination_uncertainty": uncertainty, "calibration_row": chosen,
         "control": CONTROL, "ceiling": CEILING, "screen_rule": SCREEN, "walker_rule": WALKER,
         "world_model_sha256": pair.sha256(wm), "diagnostic": str(diag),
         "data_sha256": pair.sha256(repo / "assets/data/state_action_data_0.csv"),
     })
     if pair_gpu_free() < 12:
         raise RuntimeError("Less than 12 GiB free on GPU 0; calibration saved, no training started")
-    status("training", run=RUN, rule=rule, threshold=threshold)
+    status("training", run=RUN, rule=rule, threshold=threshold, uncertainty=uncertainty)
     train_log = out / "train.log"
-    pair.execute([args.python, str(Path(__file__).resolve()), "--training-child", rule, str(threshold)],
-                 train_log, repo)
+    pair.execute([args.python, str(Path(__file__).resolve()), "--training-child", rule, str(threshold),
+                  str(uncertainty)], train_log, repo)
     new_dir = pair.run_directory(repo, RUN)
     checkpoint = pair.completed(new_dir, train_log)
     record = pair.provenance(new_dir, RUN, "paper", 1)
-    if record["args"].get("termination_rule") != rule or float(record["args"].get("termination_threshold")) != threshold:
-        raise RuntimeError("Saved run_args do not record the intended termination rule")
+    saved = record["args"]
+    if (saved.get("termination_rule") != rule or saved.get("termination_threshold") != threshold
+            or saved.get("termination_uncertainty") != uncertainty):
+        raise RuntimeError("Saved run_args do not record the intended stop rule")
     records = []
     for seed in (42, 43):
         if pair_gpu_free() < 12:
@@ -107,13 +113,13 @@ def run(args, status):
         validate_episode_csv(d / "episodes.csv", rec["summary"])
         records.append(rec)
     pooled = pair.pool(records)
-    report = {"run": RUN, "rule": rule, "threshold": threshold, "pooled": pooled,
+    report = {"run": RUN, "rule": rule, "threshold": threshold, "uncertainty": uncertainty, "pooled": pooled,
               "per_seed": [{k: r["summary"][k] for k in ("track_per_step", "falls", "episodes_completed", "speed_ratio")}
                            for r in records],
               "control": CONTROL, "ceiling": CEILING, **verdicts(pooled, records),
               "scope": "One training seed. Screen selects replication (seeds 2, 3); not a causal proof."}
     pair.write_json(out / "comparison.json", report)
-    text = (f"run {RUN} ({rule} > {threshold}): tracking={pooled['track_per_step']:.6f}, "
+    text = (f"run {RUN} (head {rule} > {threshold}, uncertainty > {uncertainty}): tracking={pooled['track_per_step']:.6f}, "
             f"falls={pooled['falls']}/{pooled['episodes_completed']}, speed_ratio={pooled['speed_ratio']:.6f}\n"
             f"control 1701: tracking={CONTROL['track_per_step']}, falls={CONTROL['falls']}/{CONTROL['episodes_completed']}\n"
             f"screen_pass={report['screen_pass']} (falls<=89, tracking>=.874513, speeds>=.8)\n"
@@ -128,7 +134,7 @@ def pair_gpu_free():
     return gpu_free_gib()
 
 
-def training_child(rule, threshold):
+def training_child(rule, threshold, uncertainty):
     import runpy
     import torch
     total = torch.cuda.get_device_properties(0).total_memory
@@ -137,18 +143,20 @@ def training_child(rule, threshold):
     sys.path.insert(0, str(MB.resolve()))
     sys.argv = [script, "paper", str(RUN), "anymal_d_flat", "--seed", "1",
                 "--termination-rule", rule, "--termination-threshold", threshold]
+    if uncertainty != "None":
+        sys.argv += ["--termination-uncertainty", uncertainty]
     runpy.run_path(script, run_name="__main__")
 
 
 def main():
     if sys.argv[1:2] == ["--training-child"]:
-        training_child(sys.argv[2], sys.argv[3])
+        training_child(sys.argv[2], sys.argv[3], sys.argv[4])
         return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--diagnostic", type=Path, required=True, help="transition_fidelity.* folder")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--python", default="/isaac-sim/python.sh")
-    parser.add_argument("--calib-device", default="cuda:0")
+    parser.add_argument("--calib-device", default="cpu")
     args = parser.parse_args()
     args.out, args.diagnostic = args.out.resolve(), args.diagnostic.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
