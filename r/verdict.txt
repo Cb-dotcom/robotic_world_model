@@ -1,0 +1,17 @@
+References (std protocol): ceiling (ETH online policy) 3/641; our paper-mode run 1601 156/689
+
+== R1  (lambda=1.0)
+  std  : falls 165/704 (23.4%/ep), tracking 0.785, speed 0.780
+  cmd30: 0/2 evaluations finished
+  play : falls 99/364, tracking 0.786, speed 0.780  (reported only)
+  CLASS (locked rule, repro runs only): SAME (SLOW)
+
+== R2  (lambda=1.0)
+  std  : falls 99/670 (14.8%/ep), tracking 0.691, speed 0.640
+  cmd30: 0/2 evaluations finished
+  play : falls 45/335, tracking 0.724, speed 0.681  (reported only)
+  CLASS (locked rule, repro runs only): SAME (SLOW)
+
+ceiling play: falls 2/320, tracking 0.963
+
+REPRO VERDICT: SAME

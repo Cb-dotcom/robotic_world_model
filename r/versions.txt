@@ -1,0 +1,26 @@
+date_utc: 2026-11-03T15:19:57Z
+isaac_sim_VERSION: 5.0.0-rc.45+release.23960.184afb15.gl
+Name: isaaclab
+Version: 0.47.2
+Location: /isaac-sim/kit/python/lib/python3.11/site-packages
+Editable project location: /workspace/Uncertainty-Aware-Robotic-World-Model-Go2/upstream/IsaacLab/source/isaaclab
+Name: isaaclab_rl
+Version: 0.4.4
+Location: /isaac-sim/kit/python/lib/python3.11/site-packages
+Editable project location: /workspace/Uncertainty-Aware-Robotic-World-Model-Go2/upstream/IsaacLab/source/isaaclab_rl
+Name: isaaclab_tasks
+Version: 0.11.6
+Location: /isaac-sim/kit/python/lib/python3.11/site-packages
+Editable project location: /workspace/Uncertainty-Aware-Robotic-World-Model-Go2/upstream/IsaacLab/source/isaaclab_tasks
+Name: rsl-rl-lib
+Version: 3.1.0
+Location: /isaac-sim/kit/python/lib/python3.11/site-packages
+Editable project location: /workspace/Uncertainty-Aware-Robotic-World-Model-Go2/upstream/rsl_rl_rwm
+Name: torch
+Version: 2.7.0+cu128
+Location: /isaac-sim/exts/omni.isaac.ml_archive/pip_prebundle
+isaaclab: file=/workspace/Uncertainty-Aware-Robotic-World-Model-Go2/upstream/IsaacLab/source/isaaclab/isaaclab/__init__.py version=0.47.2 git=v2.3.0-dirty
+isaaclab_tasks: import failed: No module named 'omni.physics'
+rsl_rl: file=/workspace/Uncertainty-Aware-Robotic-World-Model-Go2/upstream/rsl_rl_rwm/rsl_rl/__init__.py version=n/a git=6b4eaf6
+torch: 2.7.0+cu128 cuda: 12.8 gpu: NVIDIA RTX 6000 Ada Generation
+NVIDIA RTX 6000 Ada Generation, 31039 MiB, 49140 MiB, 0 %

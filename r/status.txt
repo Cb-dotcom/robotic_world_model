@@ -1,0 +1,20 @@
+2026-11-03T15:19:53Z start OUT=/workspace/clean_repro/1103_1519
+2026-11-03T15:20:00Z phase 0 done: isaac_sim_VERSION: 5.0.0-rc.45+release.23960.184afb15.gl
+2026-11-03T15:20:03Z waiting for GPU: 8983 MiB free, need 12288
+2026-11-03T15:25:07Z training R1 (run_num 2001, lambda repo default)
+2026-11-03T15:27:56Z trained R1 -> 2026-11-03_15-25-13_2001/policy_499.pt
+2026-11-03T15:28:00Z evaluating R1 std seed 42
+2026-11-03T15:30:20Z evaluating R1 std seed 43
+2026-11-03T15:34:37Z verdict updated: REPRO VERDICT: pending (1/2 clean policies scored)
+2026-11-03T15:34:41Z waiting for GPU: 9055 MiB free, need 12288
+2026-11-03T15:44:44Z training R2 (run_num 2002, lambda repo default)
+2026-11-03T15:47:36Z trained R2 -> 2026-11-03_15-44-50_2002/policy_499.pt
+2026-11-03T15:47:40Z evaluating R2 std seed 42
+2026-11-03T15:50:24Z evaluating R2 std seed 43
+2026-11-03T15:54:18Z verdict updated: REPRO VERDICT: SAME
+2026-11-03T15:54:21Z evaluating R1 play seed 42
+2026-11-03T15:58:19Z evaluating R2 play seed 42
+2026-11-03T16:02:14Z evaluating ceiling play seed 42
+2026-11-03T16:06:05Z verdict updated: REPRO VERDICT: SAME
+2026-11-03T16:06:08Z PHASE 1 DONE
+2026-11-03T16:06:12Z lambda sweep skipped

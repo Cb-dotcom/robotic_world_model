@@ -1,0 +1,80 @@
+[eval_ep] 2800/10000 steps, episodes=81
+[eval_ep] 3000/10000 steps, episodes=101
+[eval_ep] 3200/10000 steps, episodes=103
+[eval_ep] 3400/10000 steps, episodes=106
+[eval_ep] 3600/10000 steps, episodes=113
+[eval_ep] 3800/10000 steps, episodes=118
+[eval_ep] 4000/10000 steps, episodes=135
+[eval_ep] 4200/10000 steps, episodes=140
+[eval_ep] 4400/10000 steps, episodes=142
+[eval_ep] 4600/10000 steps, episodes=149
+[eval_ep] 4800/10000 steps, episodes=156
+[eval_ep] 5000/10000 steps, episodes=171
+[eval_ep] 5200/10000 steps, episodes=174
+[eval_ep] 5400/10000 steps, episodes=176
+[eval_ep] 5600/10000 steps, episodes=184
+[eval_ep] 5800/10000 steps, episodes=190
+[eval_ep] 6000/10000 steps, episodes=204
+[eval_ep] 6200/10000 steps, episodes=207
+[eval_ep] 6400/10000 steps, episodes=209
+[eval_ep] 6600/10000 steps, episodes=219
+[eval_ep] 6800/10000 steps, episodes=225
+[eval_ep] 7000/10000 steps, episodes=238
+[eval_ep] 7200/10000 steps, episodes=242
+[eval_ep] 7400/10000 steps, episodes=244
+[eval_ep] 7600/10000 steps, episodes=253
+[eval_ep] 7800/10000 steps, episodes=258
+[eval_ep] 8000/10000 steps, episodes=270
+[eval_ep] 8200/10000 steps, episodes=275
+[eval_ep] 8400/10000 steps, episodes=278
+[eval_ep] 8600/10000 steps, episodes=287
+[eval_ep] 8800/10000 steps, episodes=293
+[eval_ep] 9000/10000 steps, episodes=305
+[eval_ep] 9200/10000 steps, episodes=309
+[eval_ep] 9400/10000 steps, episodes=313
+[eval_ep] 9600/10000 steps, episodes=322
+[eval_ep] 9800/10000 steps, episodes=329
+[eval_ep] 10000/10000 steps, episodes=341
+
+================ EPISODE STATS ================
+  episodes_completed: 341
+  episodes_censored: 23
+  falls: 65
+  time_outs: 276
+  fall_rate_completed: 0.1906
+  fall_rate_all: 0.1786
+  track_per_step: 0.7957
+  counted_steps: 319659
+  speed_cmd_per_step: 0.7449
+  speed_act_per_step: 0.5899
+  speed_ratio: 0.7920
+  track_per_episode: 0.7760
+  track_per_episode_no_fall: 0.8076
+  track_per_episode_fall: 0.6308
+  track_last50_before_fall: 0.3186
+  isaac_track_per_episode: 0.7186
+  emulated_logged_track: 0.6389
+  emulated_logged_base_contact: 0.1711
+  emulated_logged_time_out: 0.7773
+  emulated_reset_steps_track: 0.6527
+  emulated_reset_steps_base_contact: 0.1683
+  emulated_reset_steps_time_out: 0.8063
+  emulated_logged_track_from_step0: 0.6115
+  emulated_logged_base_contact_from_step0: 0.1637
+  emulated_logged_time_out_from_step0: 0.7439
+  falls_within_100_steps_of_cmd_change: 10
+  median_steps_since_cmd_change_at_fall: 182.0000
+  speed_cmd_fall: 0.8350
+  speed_cmd_no_fall: 0.7366
+  time_to_fall_median: 566.0000
+  time_to_fall (steps): 0-49=0, 50-99=1, 100-249=14, 250-499=15, 500-749=23, 750-1000=12
+===============================================
+---------------- C7 CHECK (old summary vs emulation) ----------------
+  logged track_lin_vel_xy_exp (old method): 0.6127   emulated: 0.6389
+  logged base_contact          (old method): 0.1637   emulated: 0.1711
+  logged time_out              (old method): 0.7439   emulated: 0.7773
+  (variant 'log cleared every step': track 0.6527, base_contact 0.1683, time_out 0.8063)
+  (variant 'zero log from step 0': track 0.6115, base_contact 0.1637, time_out 0.7439)
+  old falls ratio base_contact/(base_contact+time_out): 0.1804   per-episode fall rate: 0.1906
+----------------------------------------------------------------------
+[eval_ep] wrote /workspace/clean_repro/1103_1519/R1/eval_std_43/episodes.csv

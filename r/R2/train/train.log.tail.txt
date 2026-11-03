@@ -1,0 +1,80 @@
+          Mean value_function loss: 0.0273
+               Mean surrogate loss: -0.0015
+                 Mean entropy loss: -11.8333
+                       Mean reward: 1.83
+               Mean episode length: 256.00
+--------------------------------------------------------------------------------
+                   Total timesteps: 97517568
+                    Iteration time: 0.23s
+                      Time elapsed: 00:02:39
+                               ETA: 00:00:01
+
+################################################################################
+                      [1m Learning iteration 496/500 [0m                      
+
+                       Computation: 271863 steps/s (collection: 0.558s, learning 0.165s)
+             Mean action noise std: 0.09
+          Mean value_function loss: 0.0024
+               Mean surrogate loss: -0.0001
+                 Mean entropy loss: -11.8462
+                       Mean reward: 1.75
+               Mean episode length: 256.00
+--------------------------------------------------------------------------------
+                   Total timesteps: 97714176
+                    Iteration time: 0.72s
+                      Time elapsed: 00:02:40
+                               ETA: 00:00:01
+
+################################################################################
+                      [1m Learning iteration 497/500 [0m                      
+
+                       Computation: 605905 steps/s (collection: 0.249s, learning 0.076s)
+             Mean action noise std: 0.09
+          Mean value_function loss: 0.0042
+               Mean surrogate loss: -0.0023
+                 Mean entropy loss: -11.8875
+                       Mean reward: 1.76
+               Mean episode length: 256.00
+--------------------------------------------------------------------------------
+                   Total timesteps: 97910784
+                    Iteration time: 0.32s
+                      Time elapsed: 00:02:40
+                               ETA: 00:00:00
+
+################################################################################
+                      [1m Learning iteration 498/500 [0m                      
+
+                       Computation: 1002964 steps/s (collection: 0.089s, learning 0.107s)
+             Mean action noise std: 0.09
+          Mean value_function loss: 0.0048
+               Mean surrogate loss: -0.0006
+                 Mean entropy loss: -11.9083
+                       Mean reward: 1.55
+               Mean episode length: 256.00
+--------------------------------------------------------------------------------
+                   Total timesteps: 98107392
+                    Iteration time: 0.20s
+                      Time elapsed: 00:02:41
+                               ETA: 00:00:00
+
+################################################################################
+                      [1m Learning iteration 499/500 [0m                      
+
+                       Computation: 306323 steps/s (collection: 0.285s, learning 0.357s)
+             Mean action noise std: 0.09
+          Mean value_function loss: 0.0299
+               Mean surrogate loss: 0.0004
+                 Mean entropy loss: -11.9195
+                       Mean reward: 1.57
+               Mean episode length: 256.00
+--------------------------------------------------------------------------------
+                   Total timesteps: 98304000
+                    Iteration time: 0.64s
+                      Time elapsed: 00:02:41
+                               ETA: 00:00:00
+
+Training completed. Policy saved to logs/offline/anymal_d_flat/2026-11-03_15-44-50_2002.
+[1;34mwandb[0m: 
+[1;34mwandb[0m: You can sync this run to the cloud by running:
+[1;34mwandb[0m: [1mwandb sync /workspace/rwm_clean/wandb/offline-run-20261103_154449-vs9qc5kt[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/offline-run-20261103_154449-vs9qc5kt/logs[0m

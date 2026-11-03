@@ -1,0 +1,100 @@
+{
+ "checkpoint": "/workspace/rwm_clean/logs/offline/anymal_d_flat/2026-11-03_15-25-13_2001/policy_499.pt",
+ "task": "Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0",
+ "num_envs": 32,
+ "num_steps": 10000,
+ "no_push": false,
+ "cmd_resample_s": 10.0,
+ "seed": 43,
+ "std": 0.5,
+ "step_dt": 0.02,
+ "episode_length_s": 20.0,
+ "command_resampling_time_range_s": [
+  10.0,
+  10.0
+ ],
+ "push_robot": {
+  "enabled": true,
+  "mode": "interval",
+  "interval_range_s": [
+   10.0,
+   15.0
+  ],
+  "velocity_range": {
+   "x": [
+    -0.5,
+    0.5
+   ],
+   "y": [
+    -0.5,
+    0.5
+   ]
+  }
+ },
+ "summary": {
+  "episodes_completed": 341,
+  "episodes_censored": 23,
+  "falls": 65,
+  "time_outs": 276,
+  "fall_rate_completed": 0.1906158357771261,
+  "fall_rate_all": 0.17857142857142858,
+  "track_per_step": 0.7957220650072572,
+  "counted_steps": 319659,
+  "speed_cmd_per_step": 0.7448946346125223,
+  "speed_act_per_step": 0.5899336923417607,
+  "speed_ratio": 0.7919693134165627,
+  "track_per_episode": 0.7760408454691032,
+  "track_per_episode_no_fall": 0.807618014899687,
+  "track_per_episode_fall": 0.6307858660884187,
+  "track_last50_before_fall": 0.31858303630584406,
+  "isaac_track_per_episode": 0.7185997079225697,
+  "emulated_logged_track": 0.6389265821004532,
+  "emulated_logged_base_contact": 0.17105538140020898,
+  "emulated_logged_time_out": 0.7773119122257053,
+  "emulated_reset_steps_track": 0.6526843695265186,
+  "emulated_reset_steps_base_contact": 0.16830357142857144,
+  "emulated_reset_steps_time_out": 0.80625,
+  "emulated_logged_track_from_step0": 0.6114527390701338,
+  "emulated_logged_base_contact_from_step0": 0.1637,
+  "emulated_logged_time_out_from_step0": 0.7438875,
+  "falls_within_100_steps_of_cmd_change": 10,
+  "median_steps_since_cmd_change_at_fall": 182.0,
+  "speed_cmd_fall": 0.8349990821377687,
+  "speed_cmd_no_fall": 0.7365678362545485,
+  "time_to_fall_bins": [
+   "0-49",
+   "50-99",
+   "100-249",
+   "250-499",
+   "500-749",
+   "750-1000"
+  ],
+  "time_to_fall_counts": [
+   0,
+   1,
+   14,
+   15,
+   23,
+   12
+  ],
+  "time_to_fall_median": 566.0
+ },
+ "old_logs": {
+  "Episode_Reward/action_rate_l2": -0.0022803083511127626,
+  "Episode_Reward/ang_vel_xy_l2": -0.01623547344778199,
+  "Episode_Reward/dof_acc_l2": -0.02353337938520126,
+  "Episode_Reward/dof_pos_limits": 0.0,
+  "Episode_Reward/dof_torques_l2": -0.06117504819445312,
+  "Episode_Reward/feet_air_time": -0.030992488304991274,
+  "Episode_Reward/flat_orientation_l2": -0.09037816422344186,
+  "Episode_Reward/lin_vel_z_l2": -0.022627719315327702,
+  "Episode_Reward/stand_still": -0.01965620026888646,
+  "Episode_Reward/track_ang_vel_z_exp": 0.34598376604244113,
+  "Episode_Reward/track_lin_vel_xy_exp": 0.6127132063973811,
+  "Episode_Reward/undesired_contacts": -0.1265773024244001,
+  "Episode_Termination/base_contact": 0.1637,
+  "Episode_Termination/time_out": 0.7438875,
+  "Metrics/base_velocity/error_vel_xy": 0.35545485031306745,
+  "Metrics/base_velocity/error_vel_yaw": 0.21559898718446494
+ }
+}

@@ -1,0 +1,317 @@
+{
+  "clone": "/workspace/rwm_clean",
+  "run_num": 2001,
+  "lambda_repo": 1.0,
+  "lambda_used": 1.0,
+  "config": {
+    "experiment_name": "offline",
+    "experiment_config": {
+      "environment": "anymal_d_flat",
+      "device": "cuda"
+    },
+    "environment_config": {
+      "num_envs": 8192,
+      "max_episode_length": 256,
+      "step_dt": 0.02,
+      "reward_term_weights": {
+        "track_lin_vel_xy_exp": 1.0,
+        "track_ang_vel_z_exp": 0.5,
+        "lin_vel_z_l2": -2.0,
+        "ang_vel_xy_l2": -0.05,
+        "dof_torques_l2": -2.5e-05,
+        "dof_acc_l2": -2.5e-07,
+        "action_rate_l2": -0.01,
+        "feet_air_time": 0.5,
+        "undesired_contacts": -1.0,
+        "stand_still": -1.0,
+        "flat_orientation_l2": -5.0,
+        "dof_pos_limits": 0.0
+      },
+      "uncertainty_penalty_weight": -1.0,
+      "observation_noise": true,
+      "command_resample_interval_range": [
+        100,
+        120
+      ],
+      "event_interval_range": [
+        48,
+        96
+      ]
+    },
+    "data_config": {
+      "dataset_root": "assets",
+      "dataset_folder": "data",
+      "file_data_size": 10000,
+      "batch_data_size": 10000,
+      "state_idx_dict": {
+        "$v$\\n$[m/s]$": [
+          0,
+          1,
+          2
+        ],
+        "$\\omega$\\n$[rad/s]$": [
+          3,
+          4,
+          5
+        ],
+        "$g$\\n$[1]$": [
+          6,
+          7,
+          8
+        ],
+        "$q$\\n$[rad]$": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "$\\dot{q}$\\n$[rad/s]$": [
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32
+        ],
+        "$\\tau$\\n$[Nm]$": [
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44
+        ]
+      },
+      "state_data_mean": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -2.0,
+        -2.0,
+        2.0,
+        2.0,
+        -6.0,
+        8.0,
+        -6.0,
+        8.0,
+        12.0,
+        -12.0,
+        12.0,
+        -12.0
+      ],
+      "state_data_std": [
+        0.5,
+        0.5,
+        0.1,
+        0.3,
+        0.3,
+        0.5,
+        0.02,
+        0.02,
+        0.04,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        0.15,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.5,
+        1.5,
+        1.5,
+        1.5,
+        2.5,
+        2.5,
+        2.5,
+        2.5,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0,
+        15.0
+      ],
+      "action_data_mean": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "action_data_std": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "init_data_ratio": 0.8,
+      "num_eval_trajectories": 10,
+      "len_eval_trajectory": 400,
+      "num_visualizations": 4
+    },
+    "model_architecture_config": {
+      "history_horizon": 32,
+      "forecast_horizon": 8,
+      "extension_dim": 0,
+      "contact_dim": 8,
+      "termination_dim": 1,
+      "ensemble_size": 5,
+      "architecture_config": {
+        "type": "rnn",
+        "rnn_type": "gru",
+        "rnn_num_layers": 2,
+        "rnn_hidden_size": 256,
+        "state_mean_shape": [
+          128
+        ],
+        "state_logstd_shape": [
+          128
+        ],
+        "extension_shape": [
+          128
+        ],
+        "contact_shape": [
+          128
+        ],
+        "termination_shape": [
+          128
+        ]
+      },
+      "freeze_auxiliary": false,
+      "resume_path": "assets/models/pretrain_rnn_ens.pt"
+    },
+    "policy_architecture_config": {
+      "observation_dim": 48,
+      "obs_groups": {
+        "policy": [
+          "policy"
+        ]
+      },
+      "action_dim": 12,
+      "actor_hidden_dims": [
+        128,
+        128,
+        128
+      ],
+      "critic_hidden_dims": [
+        128,
+        128,
+        128
+      ],
+      "activation": "elu",
+      "init_noise_std": 1.0,
+      "resume_path": null
+    },
+    "policy_algorithm_config": {
+      "value_loss_coef": 1.0,
+      "use_clipped_value_loss": true,
+      "clip_param": 0.2,
+      "entropy_coef": 0.0001,
+      "num_learning_epochs": 5,
+      "num_mini_batches": 4,
+      "learning_rate": 0.0001,
+      "schedule": "adaptive",
+      "gamma": 0.99,
+      "lam": 0.95,
+      "desired_kl": 0.01,
+      "max_grad_norm": 1.0
+    },
+    "policy_training_config": {
+      "num_steps_per_env": 24,
+      "save_interval": 50,
+      "max_iterations": 500,
+      "export_dir": null
+    }
+  },
+  "sha256:assets/models/pretrain_rnn_ens.pt": "2ac8686c8c7736287853c0fe1438c379320068adf97be71609b5f1afb52c6e5a",
+  "sha256:assets/data/state_action_data_0.csv": "1b2e00b8a2bc10dc9b5f62840de72410adb448a57a9a2f6adbcd735be9e78921",
+  "torch_version": "2.7.0+cu128",
+  "torch_load_weights_only_default_restored": true,
+  "imports": {
+    "train": "/workspace/rwm_clean/scripts/reinforcement_learning/model_based/train.py",
+    "configs": "/workspace/rwm_clean/scripts/reinforcement_learning/model_based/configs/__init__.py",
+    "envs": "/workspace/rwm_clean/scripts/reinforcement_learning/model_based/envs/__init__.py",
+    "policy_training": "/workspace/rwm_clean/scripts/reinforcement_learning/model_based/policy_training.py"
+  },
+  "rsl_rl_file": "/workspace/Uncertainty-Aware-Robotic-World-Model-Go2/upstream/rsl_rl_rwm/rsl_rl/__init__.py"
+}

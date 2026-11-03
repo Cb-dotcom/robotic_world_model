@@ -1,0 +1,5 @@
+clean HEAD: 82147f9170a4f50fc44bcc2351ea925da9561e23
+model is an LFS pointer here; copying the binary from the fork checkout
+model sha256 OK: 2ac8686c8c7736287853c0fe1438c379320068adf97be71609b5f1afb52c6e5a
+csv sha256: 1b2e00b8a2bc10dc9b5f62840de72410adb448a57a9a2f6adbcd735be9e78921
+SETUP OK
