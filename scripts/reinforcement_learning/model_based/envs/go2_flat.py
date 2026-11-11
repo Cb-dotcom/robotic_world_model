@@ -15,11 +15,16 @@ because Go2 and ANYmal share the same 12-DOF quadruped WM contract:
   action_dim=12, contact_dim=8 (4 thigh + 4 foot), termination_dim=1
 """
 from envs.base import BaseEnv
+from envs.go2_kinematics import feet_slide as go2_feet_slide
 import torch
 from tensordict import TensorDict
 
 
 class Go2FlatEnv(BaseEnv):
+    # Base COM offset from the root-link origin, base frame. URDF value until
+    # rsl_rl/validate_go2_feet_slide.py selects the one that matches the simulator asset.
+    feet_slide_base_com_offset = (0.021112, 0.0, -0.005366)
+
     def _init_additional_imagination_attributes(self):
         self.last_air_time = torch.zeros(self.num_envs, 4, device=self.device)
         self.current_air_time = torch.zeros(self.num_envs, 4, device=self.device)
@@ -162,6 +167,13 @@ class Go2FlatEnv(BaseEnv):
         stand_still = torch.sum(torch.abs(joint_pos), dim=1) * (torch.norm(self.base_velocity, dim=1) < 0.05)
         flat_orientation_l2 = torch.sum(torch.square(projected_gravity[:, :2]), dim=1)
         dof_pos_limits = torch.zeros(self.num_envs, device=self.device)
+        # Isaac Lab feet_slide reconstructed by leg kinematics from the imagined state and the
+        # predicted foot contact (same gate as the sensor). Weight is set in go2_flat_cfg.
+        if foot_contact is not None:
+            feet_slide = go2_feet_slide(base_lin_vel, base_ang_vel, projected_gravity, joint_pos, joint_vel,
+                                        foot_contact, base_com_offset=self.feet_slide_base_com_offset)
+        else:
+            feet_slide = torch.zeros(self.num_envs, device=self.device)
         self.imagination_reward_per_step = {
             "track_lin_vel_xy_exp": track_lin_vel_xy_exp,
             "track_ang_vel_z_exp": track_ang_vel_z_exp,
@@ -174,6 +186,7 @@ class Go2FlatEnv(BaseEnv):
             "stand_still": stand_still,
             "flat_orientation_l2": flat_orientation_l2,
             "dof_pos_limits": dof_pos_limits,
+            "feet_slide": feet_slide,
         }
         last_obs = torch.cat([base_lin_vel, base_ang_vel, projected_gravity, self.base_velocity, joint_pos, joint_vel, rollout_action], dim=1)
         self.last_obs = TensorDict({"policy": last_obs}, batch_size=[self.num_envs], device=self.device)
