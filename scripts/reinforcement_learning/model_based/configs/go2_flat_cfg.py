@@ -9,8 +9,8 @@ Values verified against:
 reward_term_weights mirrors EXACTLY the 11 keys emitted by the online env's
 imagination_reward_per_step, with Go2 PRETRAIN/FINETUNE weights.
   - feet_slide (-0.25 in the real env) is computed in imagination by leg kinematics
-    (envs/go2_kinematics.py) from the state and the predicted foot contact. Its weight
-    stays 0.0 until rsl_rl/validate_go2_feet_slide.py passes against the simulator.
+    (envs/go2_kinematics.py) from the state and the predicted foot contact, weight -0.25.
+    rsl_rl/validate_go2_feet_slide.py matched the simulator exactly on 11 Nov 2026.
   - undesired_contacts is computed in the env but NOT emitted on the Go2 path
     (Go2 uses stand_still as its collision proxy). Omitted.
   - dof_pos_limits is emitted but is a zero tensor in imagination -> weight 0.0,
@@ -48,8 +48,9 @@ class Go2FlatConfig(BaseConfig):
             "stand_still":          -1.0,     # Go2 collision proxy (paper w_c)
             "flat_orientation_l2":  -2.5,     # _PRETRAIN override
             "dof_pos_limits":        0.0,     # off; zero tensor in imagination
-            "feet_slide":            0.0,     # kinematic, envs/go2_kinematics.py; set to -0.25 (real env value)
-                                              # only after rsl_rl/validate_go2_feet_slide.py passes
+            "feet_slide":           -0.25,    # kinematic (envs/go2_kinematics.py), = real env weight; check
+                                              # passed 11 Nov 2026: 31,968 env-steps, URDF COM offset,
+                                              # speed RMSE 0.0000 m/s, term error 0.0%, gate agreement 1.0
         })
         # MOPO penalty: paper-2 default. Online calibration (pen0 exploits,
         # pen1 over-regularizes, pen0.25 best) informs tuning if we sweep.
