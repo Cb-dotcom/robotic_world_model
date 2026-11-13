@@ -135,7 +135,8 @@ def test_replay_action_target_alignment(horizon):
         np.testing.assert_array_equal(head, targets)
 
 
-def test_recorder_adapter_captures_fall_and_timeout_before_mutation():
+@pytest.mark.parametrize("foot", [".*FOOT", ".*_foot"])  # ANYmal-D, Go2
+def test_recorder_adapter_captures_fall_and_timeout_before_mutation(foot):
     """Exercise actual callback bodies without importing Isaac Sim on CPU."""
     script = MB.parent / "rsl_rl/record_pre_reset_transitions.py"
     nodes = [node for node in ast.parse(script.read_text()).body
@@ -144,12 +145,14 @@ def test_recorder_adapter_captures_fall_and_timeout_before_mutation():
     class Term:
         def __init__(self, env):
             self._env = env
-    scope = {"RecorderTerm": Term, "buffer": store, "policy_observation": torch.zeros(2, 48), "torch": torch}
+    scope = {"RecorderTerm": Term, "buffer": store, "policy_observation": torch.zeros(2, 48), "torch": torch,
+             "ROBOT": {"foot": foot}}
+    patterns = []
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(script), "exec"), scope)
     state, action = torch.zeros(2, 45), torch.ones(2, 12)
     contact_data = SimpleNamespace(**{k: torch.zeros(2, 4) for k in
         ("current_air_time", "last_air_time", "current_contact_time", "last_contact_time")})
-    sensor = SimpleNamespace(data=contact_data, find_bodies=lambda pattern: ([0, 1, 2, 3], []))
+    sensor = SimpleNamespace(data=contact_data, find_bodies=lambda pattern: (patterns.append(pattern), ([0, 1, 2, 3], []))[1])
     env = SimpleNamespace(num_envs=2, step_dt=.02,
         observation_manager=SimpleNamespace(compute_group=lambda name: state),
         action_manager=SimpleNamespace(action=action, prev_action=torch.zeros(2, 12)),
@@ -175,6 +178,7 @@ def test_recorder_adapter_captures_fall_and_timeout_before_mutation():
     np.testing.assert_allclose(store.data["next_state"][0, :, 8], .7)
     assert store.data["terminated"][0].tolist() == [True, False]
     assert store.data["time_out"][0].tolist() == [False, True]
+    assert patterns and set(patterns) == {foot}
 
 
 def test_real_state_reward_reconstruction_uses_velocity_and_previous_action():
@@ -265,3 +269,20 @@ def test_queue_main_accepts_own_launch_files_and_records_failure(tmp_path, monke
     with pytest.raises(SystemExit):
         queue.main()
     assert (out / "old.npz").read_bytes() == b"earlier evidence"
+
+
+def test_recorder_task_table_matches_registered_pretrain_tasks():
+    """The recorder accepts exactly the ANYmal-D and Go2 Pretrain ids registered in mbrl.tasks."""
+    script = MB.parent / "rsl_rl/record_pre_reset_transitions.py"
+    node = next(n for n in ast.parse(script.read_text()).body
+                if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == "ROBOTS")
+    robots = ast.literal_eval(node.value)
+    cfg = MB.parents[2] / "source/mbrl/mbrl/tasks/manager_based/locomotion/velocity/config"
+    registered = (cfg / "anymal_d/__init__.py").read_text() + (cfg / "go2/__init__.py").read_text()
+    assert set(robots) == {"Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0",
+                           "Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0"}
+    for task, spec in robots.items():
+        assert f'id="{task}"' in registered
+    assert robots["Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0"]["foot"] == ".*_foot"
+    go2_cfg = (cfg / "go2/flat_env_cfg.py").read_text()
+    assert 'body_names=".*_foot"' in go2_cfg and 'body_names=".*_thigh"' in go2_cfg

@@ -52,6 +52,8 @@ status "model check"
 CUDA_VISIBLE_DEVICES="" $PY $MB/e1_model_check.py --eth "$ETH" --finetuned "$OUT/wm/e1_wm.pt" \
   --baseline-test "$OUT/data/test_baseline1601.npz" --reference-test "$OUT/data/test_reference.npz" \
   --out "$OUT/model_check" > "$OUT/model_check.log" 2>&1 || fail "model check"
+# e1_model_check.py exits 0 even when a bar fails; the queue must read the verdict
+grep -q "MODEL CHECK PASS: True" "$OUT/model_check/report.txt" || fail "model check bars not met (see model_check/report.txt)"
 
 # 4. policy training in the fine-tuned model (GPU); 1601 is the frozen-model control
 ls -d logs/offline/anymal_d_flat/*_$RUN >/dev/null 2>&1 && fail "run $RUN already exists"

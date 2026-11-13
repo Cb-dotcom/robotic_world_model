@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Record true pre-reset ANYmal transitions through IsaacLab recorder hooks.
+"""Record true pre-reset transitions (ANYmal-D or Go2 Pretrain) through IsaacLab recorder hooks.
 
 This is a diagnostic protocol. An active recorder causes IsaacLab to compute
 observations once more before reset, including policy-noise RNG draws. Both
 policies use this protocol; counts need not reproduce the earlier evaluator.
+
+Supported tasks are listed in ROBOTS. Both have the same world-model groups
+(system_state 45, system_action 12, system_contact 8, system_termination 1);
+only the foot body pattern differs. Every runtime check below applies to both.
 """
 import argparse
 from pathlib import Path
@@ -18,13 +22,22 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--num_steps", type=int, default=5000)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out", type=Path, required=True)
+parser.add_argument("--cmd_resample_s", type=float, default=10.0,
+                    help="fixed command resampling time in seconds (E1 used 10)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
 if args.out.exists() or args.num_envs < 1 or args.num_steps < 1 or not args.checkpoint:
     parser.error("Require a fresh output path, positive steps/envs and --checkpoint")
-if args.task != "Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0":
-    parser.error("This diagnostic is validated for ANYmal-D Pretrain only")
+ROBOTS = {
+    "Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0": {"robot": "anymal_d", "foot": ".*FOOT"},
+    "Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0": {"robot": "go2", "foot": ".*_foot"},
+}
+if args.task not in ROBOTS:
+    parser.error(f"Supported tasks: {sorted(ROBOTS)}")
+if args.cmd_resample_s <= 0:
+    parser.error("--cmd_resample_s must be positive")
+ROBOT = ROBOTS[args.task]
 sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
@@ -56,7 +69,9 @@ policy_observation = None
 def timer_fields(env):
     data = env.scene["contact_forces"].data
     # Full sensor order is saved in metadata. Offline reward timers use feet only.
-    ids, _ = env.scene["contact_forces"].find_bodies(".*FOOT")
+    ids, _ = env.scene["contact_forces"].find_bodies(ROBOT["foot"])
+    if len(ids) != 4:
+        raise RuntimeError(f"Expected 4 feet for {ROBOT['foot']}, found {len(ids)}")
     return {"current_air_time": data.current_air_time[:, ids],
             "last_air_time": data.last_air_time[:, ids],
             "current_contact_time": data.current_contact_time[:, ids],
@@ -123,7 +138,7 @@ def main(env_cfg, agent_cfg):
     if args.device is not None:
         env_cfg.sim.device = args.device
     env_cfg.events.push_robot = None
-    env_cfg.commands.base_velocity.resampling_time_range = (10.0, 10.0)
+    env_cfg.commands.base_velocity.resampling_time_range = (args.cmd_resample_s, args.cmd_resample_s)
     recorder_cfg = RecorderManagerBaseCfg(dataset_export_mode=DatasetExportMode.EXPORT_NONE,
                                           export_in_record_pre_reset=False)
     recorder_cfg.transitions = RecorderTermCfg(class_type=PreResetRecorder)
@@ -132,7 +147,11 @@ def main(env_cfg, agent_cfg):
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     base = env.unwrapped
     try:
-        for name in ("system_state", "system_action", "system_contact", "system_termination"):
+        shapes = {"system_state": 45, "system_action": 12, "system_contact": 8, "system_termination": 1}
+        for name, width in shapes.items():
+            if tuple(base.obs_buf[name].shape) != (args.num_envs, width):
+                raise RuntimeError(f"{name} shape {tuple(base.obs_buf[name].shape)}, expected ({args.num_envs}, {width})")
+        for name in shapes:
             group_cfg = getattr(env_cfg.observations, name)
             if group_cfg.enable_corruption:
                 raise RuntimeError(f"Diagnostic group is noisy: {name}")
@@ -155,9 +174,9 @@ def main(env_cfg, agent_cfg):
                 print(f"[pre-reset] {t + 1}/{args.num_steps}; resets={int(buffer.data['done'][:t+1].sum())}", flush=True)
         reward_names = list(base.reward_manager.active_terms)
         git = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        meta = dict(task=args.task, seed=agent_cfg.seed, num_envs=args.num_envs,
+        meta = dict(task=args.task, robot=ROBOT["robot"], seed=agent_cfg.seed, num_envs=args.num_envs,
                     num_steps=args.num_steps, step_dt=float(base.step_dt), push_enabled=False,
-                    command_resampling_s=[10.0, 10.0], checkpoint=str(checkpoint),
+                    command_resampling_s=[args.cmd_resample_s, args.cmd_resample_s], checkpoint=str(checkpoint),
                     checkpoint_sha256=sha256(checkpoint), git_commit=git,
                     isaaclab_env_source_sha256=env_source_hash,
                     recorder_sha256=sha256(__file__), storage_sha256=sha256(MB / "analysis/pre_reset_transitions.py"),
@@ -169,7 +188,7 @@ def main(env_cfg, agent_cfg):
                     reward_weights={name: base.reward_manager.get_term_cfg(name).weight for name in reward_names},
                     reward_units="reward_terms are weighted per-second; reward=sum(terms)*step_dt",
                     sensor_body_names=list(base.scene["contact_forces"].body_names),
-                    timer_foot_body_names=base.scene["contact_forces"].find_bodies(".*FOOT")[1],
+                    timer_foot_body_names=base.scene["contact_forces"].find_bodies(ROBOT["foot"])[1],
                     terminal_semantics="Physical termination and timeout stored separately; terminal next_state captured before reset")
         buffer.save(args.out, meta)
         sidecar = args.out.with_suffix(".json")

@@ -49,7 +49,7 @@ class TransitionBuffer:
             raise RuntimeError("Post-step without pre-step")
         row = dict(self.pending, **{key: array(value) for key, value in fields.items()})
         if row["state"].shape != (self.envs, 45) or row["next_state"].shape != (self.envs, 45):
-            raise ValueError("Expected 45 clean ANYmal state components")
+            raise ValueError("Expected 45 clean state components")
         if row["action"].shape != (self.envs, 12):
             raise ValueError("Expected 12 applied policy-space actions")
         if not np.array_equal(row.pop("observed_action"), row["action"]):
