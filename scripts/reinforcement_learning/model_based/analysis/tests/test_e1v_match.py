@@ -65,3 +65,10 @@ def test_cli_exit_codes(tmp_path):
                    "--expect-penalty", "-1", "--repo", str(REPO)]) == 0
     assert M.main(["--control", str(a), "--candidate", str(b), "--expect-wm-sha", "eth",
                    "--expect-penalty", "0", "--repo", str(REPO)]) == 1
+
+
+def test_replication_seed():
+    control, cand = run_args(seed=1), run_args(seed=2)
+    assert M.compare(control, cand, "eth", -1.0, REPO)[0]  # plain mode: seeds must match
+    assert M.compare(control, cand, "eth", -1.0, REPO, expect_seed=2)[0] == []
+    assert any("expected 3" in p for p in M.compare(control, cand, "eth", -1.0, REPO, expect_seed=3)[0])

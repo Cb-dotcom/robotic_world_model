@@ -4,7 +4,8 @@
 Compares two run_args.json files written by train.py (write_run_args): the control (1701, arm B)
 and a candidate arm. It compares the effective configuration, not recipe names.
 
-Must be equal: seed; the complete resolved_config except the two allowed keys; the normalizer hash;
+Must be equal: seed (or, with --expect-seed, the candidate seed must equal that value: replication
+seeds); the complete resolved_config except the two allowed keys; the normalizer hash;
 the training flags in args (mode, termination rule/threshold/uncertainty stop, reward clip, alive
 bonus, initial policy), missing older flags read as their defaults.
 Allowed to differ: model_architecture_config.resume_path, environment_config.uncertainty_penalty_weight.
@@ -48,10 +49,15 @@ def has_fix(commit, repo):
                           capture_output=True).returncode == 0
 
 
-def compare(control, candidate, expect_wm_sha, expect_penalty, repo, control_fix_note=None):
+def compare(control, candidate, expect_wm_sha, expect_penalty, repo, control_fix_note=None, expect_seed=None):
     problems, notes = [], []
-    if control.get("seed") != candidate.get("seed"):
-        problems.append(f"seed {control.get('seed')} != {candidate.get('seed')}")
+    if expect_seed is None:
+        if control.get("seed") != candidate.get("seed"):
+            problems.append(f"seed {control.get('seed')} != {candidate.get('seed')}")
+    elif candidate.get("seed") != expect_seed:
+        problems.append(f"candidate seed {candidate.get('seed')} != expected {expect_seed}")
+    else:
+        notes.append(f"replication seed {expect_seed} (control seed {control.get('seed')})")
     a, b = flatten(control.get("resolved_config", {})), flatten(candidate.get("resolved_config", {}))
     if not a or not b:
         problems.append("resolved_config missing")
@@ -99,12 +105,13 @@ def main(argv=None):
     p.add_argument("--expect-wm-sha", required=True)
     p.add_argument("--expect-penalty", type=float, required=True)
     p.add_argument("--repo", type=Path, default=Path("."))
+    p.add_argument("--expect-seed", type=int, default=None, help="replication: required candidate seed")
     p.add_argument("--control-fix-note", default=None,
                    help="accepted record if the control commit is absent from this clone")
     args = p.parse_args(argv)
     control, candidate = (json.loads(path.read_text()) for path in (args.control, args.candidate))
     problems, notes = compare(control, candidate, args.expect_wm_sha, args.expect_penalty, args.repo,
-                              args.control_fix_note)
+                              args.control_fix_note, args.expect_seed)
     for line in notes:
         print("note:", line)
     for line in problems:
