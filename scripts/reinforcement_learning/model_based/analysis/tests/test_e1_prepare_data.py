@@ -87,3 +87,14 @@ def test_refuses_existing_output(tmp_path, monkeypatch):
         assert e.code == 2
     else:
         raise AssertionError("existing --out accepted")
+
+
+def test_baseline_tag(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep, "seq_len_from_config", lambda: 40)
+    make_trace(tmp_path / "b.npz")
+    make_trace(tmp_path / "r.npz", seed=1)
+    out = tmp_path / "out"
+    assert prep.main(["--baseline", str(tmp_path / "b.npz"), "--reference", str(tmp_path / "r.npz"),
+                      "--out", str(out), "--test-fraction", "0.25", "--baseline-tag", "baseline1701"]) == 0
+    assert (out / "test_baseline1701.npz").is_file() and not (out / "test_baseline1601.npz").exists()
+    assert "baseline1701" in json.loads((out / "summary.json").read_text())["inputs"]

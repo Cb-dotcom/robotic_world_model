@@ -8,6 +8,7 @@ Pre-registered bars (plan v5.1, E1):
   A  8-step velocity RMSE, pre_fall_1_25 windows of the falling policy: after <= 0.70 x before
   B  8-step velocity RMSE, surviving_25 windows of the reference policy: after <= 1.50 x before
 One velocity bar does not clear the whole model; all components are reported.
+Plan v5.2 adds (reported, no bar): horizon 24 and per-head termination recall on fall_now.
 """
 from __future__ import annotations
 
@@ -38,18 +39,24 @@ def main(argv=None):
     p.add_argument("--baseline-test", type=Path, required=True)
     p.add_argument("--reference-test", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--baseline-tag", default="baseline1601")
+    p.add_argument("--horizons", default="1,8", help="comma list; must include 8 (E1-V: 1,8,24)")
     args = p.parse_args(argv)
     torch.set_num_threads(2)
+    horizons = tuple(int(h) for h in args.horizons.split(","))
+    if 8 not in horizons:
+        raise SystemExit("--horizons must include 8 (the bars use 8 steps)")
+    tag = args.baseline_tag
     reports, contracts = {}, {}
     for name, wm in (("before", args.eth), ("after", args.finetuned)):
         model, contract = load_model(wm)
         contracts[name] = contract.metadata()
-        reports[name] = {arm: analyse(path, model, contract)
-                         for arm, path in (("baseline1601", args.baseline_test), ("reference", args.reference_test))}
+        reports[name] = {arm: analyse(path, model, contract, horizons)
+                         for arm, path in ((tag, args.baseline_test), ("reference", args.reference_test))}
     if contracts["before"]["norm_stats_sha256"] != contracts["after"]["norm_stats_sha256"]:
         raise SystemExit("Normalizer differs between ETH and fine-tuned model: the comparison is invalid")
 
-    a0, a1 = vel(reports["before"], "baseline1601", "pre_fall_1_25"), vel(reports["after"], "baseline1601", "pre_fall_1_25")
+    a0, a1 = vel(reports["before"], tag, "pre_fall_1_25"), vel(reports["after"], tag, "pre_fall_1_25")
     b0, b1 = vel(reports["before"], "reference", "surviving_25"), vel(reports["after"], "reference", "surviving_25")
     verdict = {
         "A_prefall_velocity_8step": {"before": a0, "after": a1, "ratio": (a1 / a0) if a0 and a1 is not None else None,
@@ -66,8 +73,8 @@ def main(argv=None):
         lines.append(f"{key}: before={v['before']} after={v['after']} ratio={v['ratio']} bar={v['bar']} pass={v['pass']}")
     lines.append(f"MODEL CHECK PASS: {verdict['model_check_pass']}")
     lines.append("\nAll components, RMSE in physical units (before -> after):")
-    for arm in ("baseline1601", "reference"):
-        for horizon in ("1", "8"):
+    for arm in (tag, "reference"):
+        for horizon in (str(h) for h in horizons):
             for group in ("pre_fall_1_25", "fall_now", "surviving_25"):
                 g0 = reports["before"][arm]["horizons"][horizon]["groups"][group]
                 g1 = reports["after"][arm]["horizons"][horizon]["groups"][group]
@@ -78,6 +85,9 @@ def main(argv=None):
                 lines.append(f"  {arm} h{horizon} {group} (n={g0['windows']}): " + "; ".join(parts)
                              + f"; term {g0['term_probability_mean']:.3f}->{g1['term_probability_mean']:.3f}"
                              + f"; epi {g0['epistemic_sum_std_normalized_mean']:.3f}->{g1['epistemic_sum_std_normalized_mean']:.3f}")
+                if group == "fall_now":
+                    lines.append(f"    term recall per head: {g0['term_recall_at_deployment_threshold_per_head']} -> "
+                                 f"{g1['term_recall_at_deployment_threshold_per_head']}")
     args.out.mkdir(parents=True, exist_ok=False)
     with (args.out / "report.json").open("x") as f:
         json.dump({"verdict": verdict, "contracts": contracts, "eth_sha256": sha256(args.eth),

@@ -113,6 +113,7 @@ def main(argv=None):
     p.add_argument("--reference", type=Path, required=True, help="recording of the reference policy")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--test-fraction", type=float, default=0.1875, help="last envs held out (12 of 64)")
+    p.add_argument("--baseline-tag", default="baseline1601", help="file label of the falling policy (E1-V: baseline1701)")
     args = p.parse_args(argv)
     if args.out.exists():
         p.error("--out must not exist")
@@ -120,7 +121,7 @@ def main(argv=None):
     seg_dir = args.out / "segments"
     seg_dir.mkdir(parents=True)
     manifest_rows, summary = [], {"seq_len": seq_len, "inputs": {}}
-    for tag, path in (("baseline1601", args.baseline), ("reference", args.reference)):
+    for tag, path in ((args.baseline_tag, args.baseline), ("reference", args.reference)):
         with np.load(path, allow_pickle=False) as trace:
             meta = validate_trace(trace)
             N = trace["done"].shape[1]

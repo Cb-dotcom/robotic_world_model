@@ -127,14 +127,15 @@ def grouped_metrics(trace, origins, labels, horizon, predictions):
     return output
 
 
-def analyse(path, model, contract):
+def analyse(path, model, contract, horizons=(1, 8)):
+    """Frozen default horizons 1/8. Callers may add longer horizons (E1 validation: 24)."""
     with np.load(path, allow_pickle=False) as trace:
         meta = validate_trace(trace)
         report = {"metadata": meta, "trace_sha256": sha256(path),
                   "fall_events": int((trace["done"] & ~trace["time_out"]).sum()),
                   "physical_terminations": int(trace["terminated"].sum()),
                   "timeouts": int(trace["time_out"].sum()), "horizons": {}}
-        for horizon in (1, 8):
+        for horizon in horizons:
             origins, labels, counts = windows(trace, 32, horizon)
             if not len(origins):
                 raise ValueError("No valid replay windows")
