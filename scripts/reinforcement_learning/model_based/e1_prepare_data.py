@@ -110,7 +110,8 @@ def write_test_slice(trace, test_envs, path, source_sha):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--baseline", type=Path, required=True, help="recording of the policy that falls (1601)")
-    p.add_argument("--reference", type=Path, required=True, help="recording of the reference policy")
+    p.add_argument("--reference", type=Path, default=None,
+                   help="recording of the reference policy (optional: the E1-V feedback batch has none)")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--test-fraction", type=float, default=0.1875, help="last envs held out (12 of 64)")
     p.add_argument("--baseline-tag", default="baseline1601", help="file label of the falling policy (E1-V: baseline1701)")
@@ -121,7 +122,8 @@ def main(argv=None):
     seg_dir = args.out / "segments"
     seg_dir.mkdir(parents=True)
     manifest_rows, summary = [], {"seq_len": seq_len, "inputs": {}}
-    for tag, path in ((args.baseline_tag, args.baseline), ("reference", args.reference)):
+    inputs = [(args.baseline_tag, args.baseline)] + ([("reference", args.reference)] if args.reference else [])
+    for tag, path in inputs:
         with np.load(path, allow_pickle=False) as trace:
             meta = validate_trace(trace)
             N = trace["done"].shape[1]

@@ -98,3 +98,13 @@ def test_baseline_tag(tmp_path, monkeypatch):
                       "--out", str(out), "--test-fraction", "0.25", "--baseline-tag", "baseline1701"]) == 0
     assert (out / "test_baseline1701.npz").is_file() and not (out / "test_baseline1601.npz").exists()
     assert "baseline1701" in json.loads((out / "summary.json").read_text())["inputs"]
+
+
+def test_reference_is_optional(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep, "seq_len_from_config", lambda: 40)
+    make_trace(tmp_path / "b.npz")
+    out = tmp_path / "out"
+    assert prep.main(["--baseline", str(tmp_path / "b.npz"), "--baseline-tag", "batchC",
+                      "--test-fraction", "0.25", "--out", str(out)]) == 0
+    s = json.loads((out / "summary.json").read_text())
+    assert list(s["inputs"]) == ["batchC"] and (out / "test_batchC.npz").is_file()
