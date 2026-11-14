@@ -28,7 +28,8 @@ def load_model(path):
     cfg = AnymalDFlatConfig()
     mac = cfg.model_architecture_config
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = SystemDynamicsEnsemble(45, 12, 0, 8, 1, "cpu", ensemble_size=mac.ensemble_size,
+    heads = int((ckpt.get("provenance") or {}).get("ensemble_size", mac.ensemble_size))  # C8/C1c fits differ
+    model = SystemDynamicsEnsemble(45, 12, 0, 8, 1, "cpu", ensemble_size=heads,
                                   history_horizon=mac.history_horizon,
                                   architecture_config=mac.architecture_config).eval()
     model.load_state_dict(ckpt["system_dynamics_state_dict"], strict=True)

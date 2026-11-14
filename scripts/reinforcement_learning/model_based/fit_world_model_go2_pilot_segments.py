@@ -243,6 +243,40 @@ def git_info(path):
         return {"commit": None, "dirty": None, "dirty_files": []}
 
 
+BASE_PREFIXES = ("state_base.", "auxiliary_base.")
+HEAD_PREFIXES = ("state_heads.", "auxiliary_heads.")
+
+
+def partial_warm_start(model, ref, member=None):
+    """Load only the two trunks (and, with member=i, head i of the reference into head 0).
+
+    Plan v6 C8 (more heads on ETH's trunks, fresh heads) and C1(c) (one model per ETH member, each with
+    its own trunk copy). Every trunk key of the model must exist in ref with the same shape; head keys
+    stay at their (seeded) fresh initialization unless member is given. Returns the loaded key names.
+    """
+    own = model.state_dict()
+    load = {k: v for k, v in ref.items() if k.startswith(BASE_PREFIXES)}
+    if member is not None:
+        if getattr(model, "ensemble_size", None) != 1:
+            raise ValueError("--warm_start_member needs --ensemble_size 1")
+        for prefix in HEAD_PREFIXES:
+            src = f"{prefix}{member}."
+            found = {prefix + "0." + k[len(src):]: v for k, v in ref.items() if k.startswith(src)}
+            if not found:
+                raise ValueError(f"reference has no {src}* keys")
+            load.update(found)
+    trunk_own = [k for k in own if k.startswith(BASE_PREFIXES)]
+    missing = [k for k in trunk_own if k not in load]
+    if missing:
+        raise ValueError(f"reference lacks trunk keys: {missing[:5]}")
+    for k, v in load.items():
+        if k not in own or tuple(own[k].shape) != tuple(v.shape):
+            raise ValueError(f"shape/key mismatch for {k}")
+    own.update({k: v.to(own[k].device, own[k].dtype) for k, v in load.items()})
+    model.load_state_dict(own, strict=True)
+    return sorted(load)
+
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -264,7 +298,8 @@ def main():
     p.add_argument("--forecast_horizon", type=int, default=None)
     p.add_argument("--termination_loss_weight", type=float, default=1.0)
     p.add_argument("--termination_pos_weight", type=float, default=0.0)
-    p.add_argument("--ensemble_size", type=int, default=5)
+    p.add_argument("--ensemble_size", type=int, default=None,
+                   help="number of heads; default: the config value (before 14 Nov the config always won, also over this flag)")
     p.add_argument("--config", type=str, default="go2_flat", choices=["go2_flat", "anymal_d_flat"])
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--no_normalize", action="store_true")
@@ -272,6 +307,10 @@ def main():
     p.add_argument("--save_interval", type=int, default=500)
     p.add_argument("--reference_wm", type=str, default=None)
     p.add_argument("--warm_start", action="store_true")
+    p.add_argument("--warm_start_trunk", action="store_true", help="load only the two trunks from --reference_wm; heads fresh (C8)")
+    p.add_argument("--warm_start_member", type=int, default=None, help="with --ensemble_size 1: trunks + reference head i (C1c)")
+    p.add_argument("--head_lr", type=float, default=None, help="learning rate for the heads (default: --lr)")
+    p.add_argument("--grad_accum_chunks", type=int, default=1, help="split each minibatch into k chunks, one optimizer step (memory only)")
     p.add_argument("--seed", type=int, default=None, help="seed python/numpy/torch(+cuda) before model construction; default: unseeded")
     p.add_argument("--norm_stats", type=str, default=None, help=".npz with state_mean/state_std/action_mean/action_std (std incl. eps); default: compute from --data")
     p.add_argument("--lazy_windows", action="store_true", help="gather windows on the fly (identical batches, far less memory)")
@@ -303,7 +342,16 @@ def main():
     ncols = len(first.columns)
     state_dim = ncols - action_dim - ext_dim - contact_dim - term_dim
 
-    ensemble_size = getattr(mac, "ensemble_size", None) or getattr(mac, "num_models", None) or args.ensemble_size
+    if args.ensemble_size is not None:
+        ensemble_size = args.ensemble_size
+    else:
+        ensemble_size = getattr(mac, "ensemble_size", None) or getattr(mac, "num_models", None) or 5
+    if sum([args.warm_start, args.warm_start_trunk, args.warm_start_member is not None]) > 1:
+        raise SystemExit("--warm_start, --warm_start_trunk and --warm_start_member exclude each other")
+    if (args.warm_start_trunk or args.warm_start_member is not None) and args.reference_wm is None:
+        raise SystemExit("partial warm start needs --reference_wm")
+    if args.mini_batch_size % max(args.grad_accum_chunks, 1):
+        raise SystemExit("--mini_batch_size must be divisible by --grad_accum_chunks")
 
     print(f"[fit] state={state_dim} action={action_dim} ext={ext_dim} contact={contact_dim} term={term_dim}")
     print(f"[fit] ensemble={ensemble_size} hist={history_horizon} forecast={forecast_horizon}")
@@ -330,6 +378,10 @@ def main():
         if args.warm_start:
             sd.load_state_dict(ref, strict=True)
             print("[fit] warm-started from reference WM.")
+        elif args.warm_start_trunk or args.warm_start_member is not None:
+            loaded = partial_warm_start(sd, ref, args.warm_start_member)
+            print(f"[fit] partial warm start: {len(loaded)} tensors (trunks"
+                  + (f" + reference head {args.warm_start_member}" if args.warm_start_member is not None else "; heads fresh") + ")")
         else:
             tmp = build()
             try:
@@ -339,7 +391,14 @@ def main():
                 print(f"[fit] WARNING: reference WM strict load failed: {e}")
             del tmp
 
-    optimizer = torch.optim.Adam(sd.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.head_lr is None:
+        optimizer = torch.optim.Adam(sd.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        head_params = [p_ for n_, p_ in sd.named_parameters() if n_.startswith(HEAD_PREFIXES)]
+        other_params = [p_ for n_, p_ in sd.named_parameters() if not n_.startswith(HEAD_PREFIXES)]
+        optimizer = torch.optim.Adam([{"params": other_params, "lr": args.lr},
+                                      {"params": head_params, "lr": args.head_lr}], weight_decay=args.weight_decay)
+        print(f"[fit] lr trunks {args.lr}, heads {args.head_lr}")
     loss_weights = {
         "state": 1.0,
         "sequence": 1.0,
@@ -421,6 +480,10 @@ def main():
         "seq_len": int(seq_len),
         "termination_pos_weight_used": float(pos_w_val),
         "ensemble_size": int(ensemble_size),
+        "forecast_horizon": int(forecast_horizon),
+        "init_mode": ("warm_start" if args.warm_start else "warm_start_trunk" if args.warm_start_trunk
+                      else f"warm_start_member_{args.warm_start_member}" if args.warm_start_member is not None
+                      else "scratch"),
         "normalizer_source": args.norm_stats if args.norm_stats is not None else "computed_from_data",
         "seed": args.seed,
         "versions": {"python": platform.python_version(), "torch": str(torch.__version__), "numpy": str(np.__version__), "pandas": str(pd.__version__)},
@@ -452,40 +515,41 @@ def main():
 
         for _ in range(args.num_mini_batches):
             ids = torch.randint(0, Nw, (args.mini_batch_size,), device=device)
-            batch = all_windows[ids]
-
-            s_b = batch[:, :, s0:a0]
-            a_b = batch[:, :, a0:e0]
-            ext_b = None
-            c_b = batch[:, :, c0:t0]
-            term_b = batch[:, :, t0:t0 + term_dim]
-
-            sd.reset()
-            (
-                state_loss,
-                sequence_loss,
-                bound_loss,
-                kl_loss,
-                extension_loss,
-                contact_loss,
-                termination_loss,
-            ) = sd.compute_loss(s_b, a_b, ext_b, c_b, term_b, bootstrap=True)
-
-            def w(weight, loss):
-                return weight * loss if loss is not None else 0.0
-
-            loss = (
-                w(loss_weights["state"], state_loss)
-                + w(loss_weights["sequence"], sequence_loss)
-                + w(loss_weights["bound"], bound_loss)
-                + w(loss_weights["kl"], kl_loss)
-                + w(loss_weights["extension"], extension_loss)
-                + w(loss_weights["contact"], contact_loss)
-                + w(loss_weights["termination"], termination_loss)
-            )
-
+            chunks = max(args.grad_accum_chunks, 1)
             optimizer.zero_grad()
-            loss.backward()
+            for chunk_ids in ids.chunk(chunks):
+                batch = all_windows[chunk_ids]
+
+                s_b = batch[:, :, s0:a0]
+                a_b = batch[:, :, a0:e0]
+                ext_b = None
+                c_b = batch[:, :, c0:t0]
+                term_b = batch[:, :, t0:t0 + term_dim]
+
+                sd.reset()
+                (
+                    state_loss,
+                    sequence_loss,
+                    bound_loss,
+                    kl_loss,
+                    extension_loss,
+                    contact_loss,
+                    termination_loss,
+                ) = sd.compute_loss(s_b, a_b, ext_b, c_b, term_b, bootstrap=True)
+
+                def w(weight, loss):
+                    return weight * loss if loss is not None else 0.0
+
+                loss = (
+                    w(loss_weights["state"], state_loss)
+                    + w(loss_weights["sequence"], sequence_loss)
+                    + w(loss_weights["bound"], bound_loss)
+                    + w(loss_weights["kl"], kl_loss)
+                    + w(loss_weights["extension"], extension_loss)
+                    + w(loss_weights["contact"], contact_loss)
+                    + w(loss_weights["termination"], termination_loss)
+                )
+                (loss / chunks).backward()
             nn.utils.clip_grad_norm_(sd.parameters(), args.max_grad_norm)
             optimizer.step()
 
