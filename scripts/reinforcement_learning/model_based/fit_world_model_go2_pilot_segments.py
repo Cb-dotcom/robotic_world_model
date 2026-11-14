@@ -160,7 +160,10 @@ def build_segment_windows(
     a_std,
     normalize=True,
     lazy=False,
+    skip_short=None,
 ):
+    """skip_short: None = a segment shorter than seq_len is an error (default, as before);
+    a list = such segments are skipped (they hold no window) and their names appended to it."""
     seq_len = history_horizon + forecast_horizon
     windows = []
     flats = []
@@ -186,7 +189,11 @@ def build_segment_windows(
         # Window view: [num_envs, W, seq_len, cols]
         W = steps - seq_len + 1
         if W <= 0:
-            raise RuntimeError(f"{name}: steps {steps} <= seq_len {seq_len}")
+            if skip_short is None:
+                raise RuntimeError(f"{name}: steps {steps} < seq_len {seq_len}")
+            skip_short.append(name)
+            print(f"[windows] {name}: steps {steps} < seq_len {seq_len}: no window, skipped")
+            continue
 
         term = x[:, :, -1]
         # A window starting at i is invalid if a real termination appears before
@@ -310,6 +317,8 @@ def main():
     p.add_argument("--warm_start_trunk", action="store_true", help="load only the two trunks from --reference_wm; heads fresh (C8)")
     p.add_argument("--warm_start_member", type=int, default=None, help="with --ensemble_size 1: trunks + reference head i (C1c)")
     p.add_argument("--head_lr", type=float, default=None, help="learning rate for the heads (default: --lr)")
+    p.add_argument("--skip_short_segments", action="store_true",
+                   help="skip segments shorter than history+forecast (they hold no window) instead of failing; C4, N = 24")
     p.add_argument("--grad_accum_chunks", type=int, default=1, help="split each minibatch into k chunks, one optimizer step (memory only)")
     p.add_argument("--seed", type=int, default=None, help="seed python/numpy/torch(+cuda) before model construction; default: unseeded")
     p.add_argument("--norm_stats", type=str, default=None, help=".npz with state_mean/state_std/action_mean/action_std (std incl. eps); default: compute from --data")
@@ -422,6 +431,7 @@ def main():
     else:
         print(f"[fit] z-score stats: s_std[:3]={s_std.flatten()[:3].tolist()} a_std[:3]={a_std.flatten()[:3].tolist()}")
 
+    short_segments = [] if args.skip_short_segments else None
     all_windows = build_segment_windows(
         segs,
         state_dim,
@@ -437,7 +447,10 @@ def main():
         a_std,
         normalize=(not args.no_normalize),
         lazy=args.lazy_windows,
+        skip_short=short_segments,
     )
+    if short_segments:
+        print(f"[fit] skipped {len(short_segments)} segment(s) shorter than {history_horizon + forecast_horizon} steps")
 
     Nw = all_windows.shape[0]
     seq_len = history_horizon + forecast_horizon
@@ -477,6 +490,7 @@ def main():
         "total_rows": int(total_rows),
         "total_real_terms": int(total_terms),
         "num_windows": int(Nw),
+        "skipped_short_segments": list(short_segments or []),
         "seq_len": int(seq_len),
         "termination_pos_weight_used": float(pos_w_val),
         "ensemble_size": int(ensemble_size),
