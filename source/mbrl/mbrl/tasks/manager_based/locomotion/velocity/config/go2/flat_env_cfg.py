@@ -348,3 +348,35 @@ class UnitreeGo2FlatEnvCfg_START_NOVEL(UnitreeGo2FlatEnvCfg_START):
         self.observations.policy.base_lin_vel = None
         self.observations.critic.height_scan = None
         self.observations.critic.enable_corruption = False
+
+
+# ---------------------------------------------------------------------------
+# Start-policy iteration 2 (14 Nov 2026 evening): Start-v0 + gait-quality terms.
+# Start-v0 fixed the low-speed falls but shuffled (clearance 0.9-2.8 cm at 0.2-0.6 m/s, trot index
+# 0.56-0.79 at 0.2-0.45 m/s). Added terms come from Isaac Lab's Spot flat task (Unitree's own Go2
+# recipe already uses air_time_variance from it):
+#   foot_clearance  spot foot_clearance_reward, target foot z 0.08 m, std 0.05, tanh_mult 2.0, w 0.5
+#   gait            spot GaitReward, diagonal pairs FL+RR / FR+RL, std 0.1, max_err 0.2, w 1.0
+#   air_time_var    spot air_time_variance_penalty, w -1.0
+# Everything else = Start-v0 (fall termination and label, Pretrain rewards and contract).
+# ---------------------------------------------------------------------------
+from isaaclab.managers import RewardTermCfg  # noqa: E402
+from isaaclab_tasks.manager_based.locomotion.velocity.config.spot import mdp as spot_mdp  # noqa: E402
+
+
+@configclass
+class UnitreeGo2FlatEnvCfg_START_GAIT(UnitreeGo2FlatEnvCfg_START):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.foot_clearance = RewardTermCfg(
+            func=spot_mdp.foot_clearance_reward, weight=0.5,
+            params={"std": 0.05, "tanh_mult": 2.0, "target_height": 0.08,
+                    "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot")})
+        self.rewards.gait = RewardTermCfg(
+            func=spot_mdp.GaitReward, weight=1.0,
+            params={"std": 0.1, "max_err": 0.2, "velocity_threshold": 0.5,
+                    "synced_feet_pair_names": (("FL_foot", "RR_foot"), ("FR_foot", "RL_foot")),
+                    "asset_cfg": SceneEntityCfg("robot"), "sensor_cfg": SceneEntityCfg("contact_forces")})
+        self.rewards.air_time_variance = RewardTermCfg(
+            func=spot_mdp.air_time_variance_penalty, weight=-1.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot")})

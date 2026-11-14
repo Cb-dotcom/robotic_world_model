@@ -200,3 +200,8 @@ class UnitreeGo2FlatPPOStartRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
 class UnitreeGo2FlatPPOStartNoVelRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
     run_name = "start_novel"
     obs_groups = {"policy": ["policy"], "critic": ["critic"]}
+
+
+@configclass
+class UnitreeGo2FlatPPOStartGaitRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
+    run_name = "start_gait"

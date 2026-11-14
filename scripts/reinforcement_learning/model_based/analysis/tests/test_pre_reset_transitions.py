@@ -282,7 +282,8 @@ def test_recorder_task_table_matches_registered_pretrain_tasks():
     assert set(robots) == {"Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0",
                            "Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0",
                            "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-v0",
-                           "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-NoVel-v0"}
+                           "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-NoVel-v0",
+                           "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-Gait-v0"}
     for task, spec in robots.items():
         assert f'id="{task}"' in registered
     assert robots["Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0"]["foot"] == ".*_foot"
