@@ -147,7 +147,8 @@ def main():
         obs = env.get_observations()
         in_dim = actor[0].in_features
         rec = {k: [] for k in ("contact", "foot_z", "foot_vxy", "pitch", "roll", "height", "vx", "vy", "wz",
-                                "tau_abs", "power", "done", "time_out")}
+                                "tau_abs", "power", "done", "time_out", "rew")}
+        reward_names = list(base.reward_manager.active_terms)
         for t in range(T):
             with torch.inference_mode():
                 x = policy_obs(obs)
@@ -176,14 +177,18 @@ def main():
                 rec["power"].append((d.applied_torque * d.joint_vel).abs().sum(dim=-1).cpu().numpy())
                 rec["done"].append(dones.bool().cpu().numpy())
                 rec["time_out"].append(timeouts.cpu().numpy())
+                rec["rew"].append(base.reward_manager._step_reward.cpu().numpy())
             if (t + 1) % 250 == 0:
                 print(f"[gait] {t + 1}/{T}", flush=True)
         arrays = {k: np.stack(v) for k, v in rec.items()}
-        summary = G.summarize(arrays, np.repeat(speeds_list, args.envs_per_speed), dt, int(round(args.warmup_s / dt)))
+        summary = G.summarize(arrays, np.repeat(speeds_list, args.envs_per_speed), dt, int(round(args.warmup_s / dt)),
+                              reward_names=reward_names)
         report = {"label": args.label, "task": args.task, "pkg": args.pkg, "checkpoint": str(args.checkpoint.resolve()),
                   "activation": activation, "obs_normalizer": norm is not None, "policy_obs_dim": in_dim,
                   "foot_names": list(foot_names), "dt": dt, "seconds": args.seconds, "warmup_s": args.warmup_s,
-                  "seed": args.seed, "conditions": "plane, no pushes/external forces, no obs noise, fixed forward commands",
+                  "seed": args.seed, "reward_names": reward_names,
+                  "reward_terms_note": "reward_manager._step_reward: weighted term per step (Isaac Lab divides by dt)",
+                  "conditions": "plane, no pushes/external forces, no obs noise, fixed forward commands",
                   "summary": {str(k): v for k, v in summary.items()}}
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2))

@@ -10,6 +10,20 @@ from __future__ import annotations
 import numpy as np
 
 FEET = ("FL", "FR", "RL", "RR")
+PLAN_FALL_HEIGHT_M = 0.15   # plan v6 §5: real fall = base height < 0.15 m or tilt > 60 deg
+PLAN_FALL_TILT_DEG = 60.0
+
+
+def plan_fall_state(height, roll, pitch):
+    """Boolean [T,N]: base below 0.15 m or roll/pitch beyond 60 degrees (plan v6 fall definition)."""
+    tilt = np.degrees(np.maximum(np.abs(roll), np.abs(pitch)))
+    return (height < PLAN_FALL_HEIGHT_M) | (tilt > PLAN_FALL_TILT_DEG)
+
+
+def plan_fall_events(state, mask):
+    """Number of entries into the fall state inside valid rows (one per env until it leaves the state)."""
+    prev = np.vstack([np.zeros((1, state.shape[1]), bool), state[:-1]])
+    return int((state & ~prev & mask).sum())
 
 
 def valid_mask(done, warmup):
@@ -51,9 +65,11 @@ def swing_clearances(contact, foot_z, mask, done):
     return out
 
 
-def summarize(a, speeds, dt, warmup):
-    """Summary per commanded speed: a dict speed -> metrics."""
+def summarize(a, speeds, dt, warmup, reward_names=None):
+    """Summary per commanded speed: a dict speed -> metrics. Optional a["rew"] [T,N,K] = weighted
+    reward terms per step (names in reward_names) -> mean per term."""
     mask = valid_mask(a["done"], warmup)
+    fall_state = plan_fall_state(a["height"], a["roll"], a["pitch"])
     swings = swing_clearances(a["contact"], a["foot_z"], mask, a["done"])
     result = {}
     for v in sorted(set(float(s) for s in speeds)):
@@ -71,8 +87,12 @@ def summarize(a, speeds, dt, warmup):
         valid_time = m.sum() * dt                        # env-seconds
         fl, fr, rl, rr = (c[:, i] for i in range(4))
         falls = int((a["done"][:, envs] & ~a["time_out"][:, envs]).sum())
+        fs = fall_state[:, envs]
         result[v] = {
             "env_seconds": float(valid_time),
+            "plan_fall_events": plan_fall_events(fs, m),
+            "plan_fall_time_fraction": float(fs[m].mean()),
+            "low_body_fraction_lt_0p25m": float((sel(a["height"]) < 0.25).mean()),
             "falls": falls,
             "falls_per_1000s": float(1000.0 * falls / max(valid_time, 1e-9)),
             "forward_speed_mps": float(sel(a["vx"]).mean()),
@@ -95,6 +115,9 @@ def summarize(a, speeds, dt, warmup):
             "torque_abs_mean_nm": float(sel(a["tau_abs"]).mean()),
             "power_w": float(sel(a["power"]).mean()),
         }
+        if reward_names is not None and "rew" in a:
+            rew = a["rew"][:, envs][m]                   # [K_valid, n_terms]
+            result[v]["reward_terms_mean"] = {name: float(rew[:, i].mean()) for i, name in enumerate(reward_names)}
     return result
 
 
@@ -104,7 +127,9 @@ ROWS = [
     ("foot_slip_mps_in_contact", "{:.4f}"), ("trot_index", "{:.3f}"), ("pitch_mean_deg", "{:.2f}"),
     ("pitch_std_deg", "{:.2f}"), ("roll_std_deg", "{:.2f}"), ("base_height_mean_m", "{:.3f}"),
     ("base_height_std_cm", "{:.2f}"), ("lateral_speed_rms_mps", "{:.3f}"), ("yaw_rate_rms_dps", "{:.2f}"),
-    ("torque_abs_mean_nm", "{:.2f}"), ("power_w", "{:.1f}"), ("falls", "{:d}"), ("env_seconds", "{:.0f}"),
+    ("torque_abs_mean_nm", "{:.2f}"), ("power_w", "{:.1f}"), ("falls", "{:d}"),
+    ("plan_fall_events", "{:d}"), ("plan_fall_time_fraction", "{:.3f}"), ("low_body_fraction_lt_0p25m", "{:.3f}"),
+    ("env_seconds", "{:.0f}"),
 ]
 
 
@@ -122,4 +147,8 @@ def table(named):
                 val = named[lab].get(v, {}).get(key)
                 cells.append(f"{(fmt.format(val) if val is not None else '-'):>22s}")
             lines.append(f"{key:28s}" + "".join(cells))
+        terms = sorted({t for lab in labels for t in named[lab].get(v, {}).get("reward_terms_mean", {})})
+        for t in terms:
+            cells = [named[lab].get(v, {}).get("reward_terms_mean", {}).get(t) for lab in labels]
+            lines.append(f"{'r:' + t:28s}" + "".join(f"{('{:.4f}'.format(c) if c is not None else '-'):>22s}" for c in cells))
     return "\n".join(lines)

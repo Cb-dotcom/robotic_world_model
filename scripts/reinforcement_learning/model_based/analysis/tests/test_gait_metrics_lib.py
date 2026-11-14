@@ -63,3 +63,15 @@ def test_speed_groups_and_table():
     assert set(out) == {0.45, 0.9} and abs(out[0.9]["forward_speed_mps"] - 0.9) < 1e-9
     txt = G.table({"x": out, "y": out})
     assert "== command 0.90 m/s" in txt and "foot_clearance_cm_mean" in txt
+
+
+def test_plan_fall_definition_and_reward_terms():
+    a = synthetic()
+    a["height"][100:150, 0] = 0.12          # body down for 50 steps in env 0
+    a["roll"][300:320, 1] = np.radians(70)  # tipped in env 1
+    a["rew"] = np.stack([np.ones((400, 4)), -np.ones((400, 4)) * 0.5], axis=-1)
+    s = G.summarize(a, np.full(4, 0.45), 0.02, warmup=40, reward_names=["track", "slide"])[0.45]
+    assert s["plan_fall_events"] == 2
+    assert abs(s["plan_fall_time_fraction"] - 70 / (4 * 360)) < 1e-9
+    assert s["reward_terms_mean"] == {"track": 1.0, "slide": -0.5}
+    assert "r:slide" in G.table({"x": {0.45: s}})
