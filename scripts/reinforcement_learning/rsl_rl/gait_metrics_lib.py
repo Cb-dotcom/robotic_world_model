@@ -15,8 +15,9 @@ PLAN_FALL_TILT_DEG = 60.0
 
 
 def plan_fall_state(height, roll, pitch):
-    """Boolean [T,N]: base below 0.15 m or roll/pitch beyond 60 degrees (plan v6 fall definition)."""
-    tilt = np.degrees(np.maximum(np.abs(roll), np.abs(pitch)))
+    """Boolean [T,N]: base below 0.15 m or body tilt beyond 60 degrees (plan v6 fall definition).
+    Tilt = angle between body z and world up = arccos(cos(roll) cos(pitch)), as mdp.plan_fall."""
+    tilt = np.degrees(np.arccos(np.clip(np.cos(roll) * np.cos(pitch), -1.0, 1.0)))
     return (height < PLAN_FALL_HEIGHT_M) | (tilt > PLAN_FALL_TILT_DEG)
 
 

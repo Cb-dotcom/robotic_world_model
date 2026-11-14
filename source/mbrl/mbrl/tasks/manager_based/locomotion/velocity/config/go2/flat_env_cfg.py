@@ -314,3 +314,37 @@ class UnitreeGo2FlatEnvCfg_PRETRAIN_BROAD(UnitreeGo2FlatEnvCfg_PRETRAIN):
             interval_range_s=(8.0, 12.0),
             params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
         )
+
+
+# ---------------------------------------------------------------------------
+# Start-policy envs (decision 14 Nov 2026, doubt E15): the Pretrain env (same 45-dim world-model
+# contract and rewards) plus the plan v6 fall definition as a termination, and the same rule OR-ed
+# into system_termination. The June walker fell at 0.2-0.3 m/s without any termination.
+#   START        : policy observes base velocity (48-dim, as the June walker)
+#   START_NOVEL  : no base velocity in the policy (45-dim); the critic keeps it (asymmetric)
+# ---------------------------------------------------------------------------
+from isaaclab.managers import TerminationTermCfg as DoneTerm  # noqa: E402
+
+
+@configclass
+class UnitreeGo2FlatEnvCfg_START(UnitreeGo2FlatEnvCfg_PRETRAIN):
+    def __post_init__(self):
+        super().__post_init__()
+        self.terminations.plan_fall = DoneTerm(func=mdp.plan_fall)
+        self.observations.system_termination.base_contact.func = mdp.base_contact_or_plan_fall
+
+
+@configclass
+class ObservationsCfg_START_NOVEL(ObservationsCfg_PRETRAIN):
+    critic: ObservationsCfg.PolicyCfg = ObservationsCfg.PolicyCfg()
+
+
+@configclass
+class UnitreeGo2FlatEnvCfg_START_NOVEL(UnitreeGo2FlatEnvCfg_START):
+    observations: ObservationsCfg_START_NOVEL = ObservationsCfg_START_NOVEL()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.base_lin_vel = None
+        self.observations.critic.height_scan = None
+        self.observations.critic.enable_corruption = False

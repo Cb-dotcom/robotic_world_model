@@ -32,6 +32,8 @@ if args.out.exists() or args.num_envs < 1 or args.num_steps < 1 or not args.chec
 ROBOTS = {
     "Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0": {"robot": "anymal_d", "foot": ".*FOOT"},
     "Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0": {"robot": "go2", "foot": ".*_foot"},
+    "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-v0": {"robot": "go2", "foot": ".*_foot"},
+    "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-NoVel-v0": {"robot": "go2", "foot": ".*_foot"},
 }
 if args.task not in ROBOTS:
     parser.error(f"Supported tasks: {sorted(ROBOTS)}")

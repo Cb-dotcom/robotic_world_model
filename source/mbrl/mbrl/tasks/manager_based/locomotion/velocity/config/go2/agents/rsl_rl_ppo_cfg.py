@@ -185,3 +185,18 @@ class UnitreeGo2FlatPPOVisualizeRunnerCfg(UnitreeGo2FlatPPOPretrainRunnerCfg):
     load_system_dynamics = True
     system_dynamics_load_path = "logs/rsl_rl/unitree_go2_flat/2026-06-11_12-35-49_pretrain/model_2000.pt"
     run_name = "visualize"
+
+
+# ---------------------------------------------------------------------------
+# Start-policy runners (decision 14 Nov 2026): the Baseline PPO runner (paper PPO settings,
+# [128,128,128], 2000 it), separate run names. NoVel: critic reads the "critic" group.
+# ---------------------------------------------------------------------------
+@configclass
+class UnitreeGo2FlatPPOStartRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
+    run_name = "start_vel"
+
+
+@configclass
+class UnitreeGo2FlatPPOStartNoVelRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
+    run_name = "start_novel"
+    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
