@@ -3,6 +3,8 @@
 # (mbrl.tasks.manager_based.locomotion.velocity.config.anymal_d.flat_env_cfg)
 # but extends the upstream Isaac Lab Go2 rough env.
 
+import math
+
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -401,3 +403,67 @@ class UnitreeGo2FlatEnvCfg_START_POSTURE(UnitreeGo2FlatEnvCfg_START):
                     "velocity_threshold": 0.3})
         self.rewards.dof_pos_limits.weight = -10.0
         self.rewards.action_rate_l2.weight = -0.1
+
+
+# ---------------------------------------------------------------------------
+# Start-policy iteration 4 (decision 16 Nov 2026): Unitree's FULL Go2 velocity recipe (unitree_rl_lab 4960b84,
+# robots/go2/velocity_env_cfg.py RewardsCfg + command curriculum), not a partial copy. Iteration 3 copied only
+# three penalties and stood still. Every reward term and weight below is Unitree's.
+# Kept from Start-v0 (deliberate, for the world-model contract and comparable evaluation): observations
+# (policy sees base velocity), robot asset and actuators, events, plan v6 fall termination (+ base contact,
+# instead of Unitree's 0.8 rad bad_orientation), heading-command mode, command LIMITS (= Start-v0 ranges, so
+# the Start-v0 evaluation distribution is reachable), PPO runner (Baseline, actor 128x3).
+# Deviation: undesired_contacts omits Unitree's "Head_.*" bodies (not confirmed in our Go2 asset).
+# Not Unitree's: stand_still (ANYmal-paper collision proxy) removed; Unitree's joint_pos x5 covers standing.
+# Evaluate and record this policy in the Start-v0 task (same observations; full command ranges).
+# ---------------------------------------------------------------------------
+from isaaclab.managers import CurriculumTermCfg as CurrTerm  # noqa: E402
+
+
+@configclass
+class UnitreeGo2FlatEnvCfg_START_UNITREE(UnitreeGo2FlatEnvCfg_START):
+    def __post_init__(self):
+        super().__post_init__()
+        r = self.rewards
+        # -- task
+        r.track_lin_vel_xy_exp.weight = 1.5
+        r.track_lin_vel_xy_exp.params["std"] = math.sqrt(0.25)
+        r.track_ang_vel_z_exp.weight = 0.75
+        r.track_ang_vel_z_exp.params["std"] = math.sqrt(0.25)
+        # -- base
+        r.lin_vel_z_l2.weight = -2.0
+        r.ang_vel_xy_l2.weight = -0.05
+        r.joint_vel = RewardTermCfg(func=mdp.joint_vel_l2, weight=-0.001)
+        r.dof_acc_l2.weight = -2.5e-7
+        r.dof_torques_l2.weight = -2e-4
+        r.action_rate_l2.weight = -0.1
+        r.dof_pos_limits.weight = -10.0
+        r.energy = RewardTermCfg(func=mdp.unitree_energy, weight=-2e-5)
+        # -- robot
+        r.flat_orientation_l2.weight = -2.5
+        r.joint_pos = RewardTermCfg(
+            func=mdp.joint_position_penalty, weight=-0.7,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*"), "stand_still_scale": 5.0,
+                    "velocity_threshold": 0.3})
+        # -- feet
+        r.feet_air_time.weight = 0.1
+        r.feet_air_time.params["threshold"] = 0.5
+        r.air_time_variance = RewardTermCfg(
+            func=mdp.unitree_air_time_variance_penalty, weight=-1.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot")})
+        r.feet_slide.weight = -0.1
+        # -- other
+        r.undesired_contacts = RewardTermCfg(
+            func=mdp.undesired_contacts, weight=-1.0,
+            params={"threshold": 1.0,
+                    "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_hip", ".*_thigh", ".*_calf"])})
+        r.stand_still = None
+        # -- commands: Unitree's start ranges, standing share and curriculum; limits = the Start-v0 ranges
+        cmd = self.commands.base_velocity
+        limit_x, limit_y = tuple(cmd.ranges.lin_vel_x), tuple(cmd.ranges.lin_vel_y)
+        cmd.rel_standing_envs = 0.1
+        cmd.ranges.lin_vel_x = (-0.1, 0.1)
+        cmd.ranges.lin_vel_y = (-0.1, 0.1)
+        self.curriculum.lin_vel_cmd_levels = CurrTerm(
+            func=mdp.unitree_lin_vel_cmd_levels,
+            params={"reward_term_name": "track_lin_vel_xy_exp", "limit_lin_vel_x": limit_x, "limit_lin_vel_y": limit_y})

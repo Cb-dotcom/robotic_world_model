@@ -210,3 +210,8 @@ class UnitreeGo2FlatPPOStartGaitRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
 @configclass
 class UnitreeGo2FlatPPOStartPostureRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
     run_name = "start_posture"
+
+
+@configclass
+class UnitreeGo2FlatPPOStartUnitreeRunnerCfg(UnitreeGo2FlatPPOBaselineRunnerCfg):
+    run_name = "start_unitree"
