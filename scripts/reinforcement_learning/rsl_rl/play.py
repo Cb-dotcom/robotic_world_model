@@ -89,9 +89,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.class_name == "MBPOOnPolicyRunner":
         agent_cfg.class_name = "OnPolicyRunner"
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    # LOCAL_PATCH_GO2_FORWARD_CAMERA
+    # LOCAL_PATCH_GO2_FORWARD_CAMERA (forward speed from env PLAY_SPEED, default 0.45 m/s)
     env_cfg.scene.num_envs = 1
-    env_cfg.commands.base_velocity.heading_command = False; env_cfg.commands.base_velocity.ranges.lin_vel_x = (0.45, 0.45); env_cfg.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0); env_cfg.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+    env_cfg.commands.base_velocity.heading_command = False; _spd = float(os.environ.get("PLAY_SPEED", "0.45")); env_cfg.commands.base_velocity.ranges.lin_vel_x = (_spd, _spd); env_cfg.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0); env_cfg.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
     env_cfg.viewer.origin_type = "asset_root"; env_cfg.viewer.asset_name = "robot"; env_cfg.viewer.env_index = 0; env_cfg.viewer.eye = (-1.35, 1.05, 0.65); env_cfg.viewer.lookat = (0.0, 0.0, 0.20)
 
     # set the environment seed
