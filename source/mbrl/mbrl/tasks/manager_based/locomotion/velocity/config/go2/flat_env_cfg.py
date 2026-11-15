@@ -380,3 +380,24 @@ class UnitreeGo2FlatEnvCfg_START_GAIT(UnitreeGo2FlatEnvCfg_START):
         self.rewards.air_time_variance = RewardTermCfg(
             func=spot_mdp.air_time_variance_penalty, weight=-1.0,
             params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot")})
+
+
+# ---------------------------------------------------------------------------
+# Start-policy iteration 3 (decision 15 Nov 2026, the last one): Start-v0 + three terms of Unitree's own Go2
+# velocity task (unitree_rl_lab 4960b84, robots/go2/velocity_env_cfg.py), copied unchanged:
+#   joint_pos       joint_position_penalty, w -0.7 (stand_still_scale 5.0, velocity_threshold 0.3)
+#   dof_pos_limits  w -10.0 (was 0.0)
+#   action_rate_l2  w -0.1  (was -0.01)
+# No Spot clearance/gait terms. Reason: Start-Gait-v0 stood tall on straight legs (video, 15 Nov); our
+# ANYmal-paper reward has no term that holds the leg posture. Everything else = Start-v0.
+# ---------------------------------------------------------------------------
+@configclass
+class UnitreeGo2FlatEnvCfg_START_POSTURE(UnitreeGo2FlatEnvCfg_START):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.joint_pos = RewardTermCfg(
+            func=mdp.joint_position_penalty, weight=-0.7,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*"), "stand_still_scale": 5.0,
+                    "velocity_threshold": 0.3})
+        self.rewards.dof_pos_limits.weight = -10.0
+        self.rewards.action_rate_l2.weight = -0.1

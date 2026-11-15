@@ -35,6 +35,7 @@ ROBOTS = {
     "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-v0": {"robot": "go2", "foot": ".*_foot"},
     "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-NoVel-v0": {"robot": "go2", "foot": ".*_foot"},
     "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-Gait-v0": {"robot": "go2", "foot": ".*_foot"},
+    "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-Posture-v0": {"robot": "go2", "foot": ".*_foot"},
 }
 if args.task not in ROBOTS:
     parser.error(f"Supported tasks: {sorted(ROBOTS)}")

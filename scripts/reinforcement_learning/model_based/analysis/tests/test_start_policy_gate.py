@@ -50,3 +50,46 @@ def test_missing_june_eval_fails_g6(tmp_path):
     summ = {str(v): good(v) for v in (0.2, 0.45)}
     txt = run(tmp_path, summ, {"vel": {10: 1, 30: 1}})
     assert "FAIL  G6" in txt
+
+
+def ref_json(tmp, heights=0.33, bounce=0.3, clearance=1.2):
+    r = tmp / "ref.json"
+    r.write_text(json.dumps({"label": "unitree", "summary": {
+        str(v): {"base_height_mean_m": heights, "base_height_std_cm": bounce, "foot_clearance_cm_mean": clearance}
+        for v in (0.3, 0.45, 0.9)}}))
+    return r
+
+
+def run_ref(tmp, gait_summary, falls, ref):
+    g = write(tmp, gait_summary, falls)
+    out = tmp / "gate.txt"
+    S.main(["--gait", str(g), "--eval-dir", str(tmp), "--tag", "vel", "--out", str(out), "--reference-gait", str(ref)])
+    return out.read_text()
+
+
+def posture(v, height=0.34, bounce=0.5, clearance=1.0):
+    d = good(v)
+    d.update(base_height_mean_m=height, base_height_std_cm=bounce, foot_clearance_cm_mean=clearance)
+    return d
+
+
+def test_reference_gate_pass_and_bars(tmp_path):
+    summ = {str(v): posture(v) for v in (0.2, 0.3, 0.45, 0.9, 1.0)}
+    txt = run_ref(tmp_path, summ, {"vel": {10: 5, 30: 2}, "june": {10: 50, 30: 10}}, ref_json(tmp_path))
+    assert "decision 15 Nov 2026" in txt and "(0.96 cm)" in txt and "GATE PASS: True" in txt
+    assert "PASS  G7" in txt and "PASS  G8" in txt
+
+
+def test_reference_gate_flags_tall_bouncy_and_low_feet(tmp_path):
+    summ = {str(v): posture(v) for v in (0.2, 0.3, 0.45, 0.9)}
+    summ["0.45"]["base_height_mean_m"] = 0.42      # straight legs: 9 cm above the reference
+    summ["0.9"]["base_height_std_cm"] = 0.7        # > 2 x 0.3
+    summ["0.2"]["foot_clearance_cm_mean"] = 0.9    # < 0.8 x 1.2
+    txt = run_ref(tmp_path, summ, {"vel": {10: 5, 30: 2}, "june": {10: 50, 30: 10}}, ref_json(tmp_path))
+    assert "FAIL  G4" in txt and "FAIL  G7" in txt and "FAIL  G8" in txt and "GATE PASS: False" in txt
+
+
+def test_reference_gate_without_common_speeds_fails(tmp_path):
+    summ = {str(v): posture(v) for v in (0.2, 1.0)}
+    txt = run_ref(tmp_path, summ, {"vel": {10: 5, 30: 2}, "june": {10: 50, 30: 10}}, ref_json(tmp_path))
+    assert "FAIL  G7" in txt and "FAIL  G8" in txt

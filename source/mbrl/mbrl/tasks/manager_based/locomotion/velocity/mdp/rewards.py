@@ -28,3 +28,16 @@ def foot_clearance(
     foot_z_target_error = torch.square(asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - target_height)
     foot_velocity_tanh = torch.tanh(tanh_mult * torch.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=2))
     return torch.exp(-torch.sum(foot_z_target_error * foot_velocity_tanh, dim=1) / std)
+
+
+def joint_position_penalty(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, stand_still_scale: float, velocity_threshold: float
+) -> torch.Tensor:
+    """L2 distance of the joints from the default pose; x stand_still_scale when there is no command and the
+    body is slow. Copied unchanged from unitree_rl_lab 4960b84 (Apache-2.0),
+    tasks/locomotion/mdp/rewards.py joint_position_penalty (start-policy iteration 3, decision 15 Nov 2026)."""
+    asset = env.scene[asset_cfg.name]
+    cmd = torch.linalg.norm(env.command_manager.get_command("base_velocity"), dim=1)
+    body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    reward = torch.linalg.norm((asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
+    return torch.where(torch.logical_or(cmd > 0.0, body_vel > velocity_threshold), reward, stand_still_scale * reward)
