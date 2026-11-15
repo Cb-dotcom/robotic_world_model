@@ -9,9 +9,12 @@ from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import hashlib
+import importlib.metadata
 import json
 from numbers import Integral
+import os
 from pathlib import Path
+import platform
 import random
 import subprocess
 
@@ -95,6 +98,47 @@ def _git_identity(repo_root):
     return {"commit": commit, "dirty": bool(status), "status": status.splitlines()}
 
 
+ISAAC_SIM_VERSION_FILES = ("/isaac-sim/VERSION",)
+
+
+def isaac_sim_version(version_files=ISAAC_SIM_VERSION_FILES):
+    """Isaac Sim version from the container's VERSION file, else the isaacsim package; None if neither."""
+    for name in version_files:
+        try:
+            text = Path(name).read_text().strip()
+        except OSError:
+            continue
+        if text:
+            return {"version": text.splitlines()[0].strip(), "source": name}
+    try:
+        return {"version": importlib.metadata.version("isaacsim"), "source": "package isaacsim"}
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def runtime_identity():
+    """Software identity of this process (plan v6 §10): rsl_rl(_rwm) commit, Isaac Sim, torch/CUDA, GPU.
+
+    Never fails: a missing piece is recorded as None.
+    """
+    record = {
+        "python": platform.python_version(),
+        "torch": str(torch.__version__),
+        "torch_cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "isaac_sim": isaac_sim_version(),
+        "rsl_rl": None,
+    }
+    try:
+        import rsl_rl
+        root = os.path.dirname(os.path.abspath(rsl_rl.__file__))
+        record["rsl_rl"] = {"path": root, "git": _git_identity(root)}
+    except Exception as exc:  # noqa: BLE001 - identity must not stop a run
+        record["rsl_rl"] = {"error": str(exc)}
+    return record
+
+
 def write_run_args(
     log_dir,
     args,
@@ -104,6 +148,7 @@ def write_run_args(
     world_model_checkpoint=None,
     policy_checkpoint=None,
     repo_root=None,
+    start_state_files=None,
 ):
     """Write ``run_args.json`` after deployment settings have been resolved.
 
@@ -111,7 +156,9 @@ def write_run_args(
     The complete resolved config is retained in addition to command-line values;
     checkpoint hashes identify the bytes actually used, even if paths are reused.
     Missing supplied checkpoint files fail loudly instead of yielding an
-    apparently complete provenance record.
+    apparently complete provenance record. ``start_state_files`` are the files
+    the imagination start states were loaded from; each is recorded with its
+    sha256 (a missing file fails loudly as well).
     """
     cli = _json_value(args)
     if cli.get("seed") is None:
@@ -137,6 +184,9 @@ def write_run_args(
         "initial_policy_checkpoint": _checkpoint_identity(policy_checkpoint),
         "resolved_config": resolved_config,
         "normalizer_contract": _json_value(normalizer_contract),
+        "runtime": runtime_identity(),
+        "start_state_files": None if start_state_files is None
+        else [_checkpoint_identity(path) for path in start_state_files],
     }
     directory = Path(log_dir)
     directory.mkdir(parents=True, exist_ok=True)

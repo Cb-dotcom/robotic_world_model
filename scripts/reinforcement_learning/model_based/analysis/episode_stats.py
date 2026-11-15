@@ -21,7 +21,13 @@ Conventions:
 """
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fall_rate import falls_per_1000s  # noqa: E402
 
 FALL_BINS = (0, 50, 100, 250, 500, 750, 1001)
 
@@ -200,6 +206,16 @@ class EpisodeStats:
             "speed_cmd_fall": _nanmean([e["mean_speed_cmd"] for e in falls]),
             "speed_cmd_no_fall": _nanmean([e["mean_speed_cmd"] for e in eps if not e["fall"]]),
         }
+        # plan v6 §10: falls per 1000 s of exposure (envs x steps x step_dt) with an exact Poisson 95 % CI
+        exposure_s = float(self.n * self._t * self.dt)
+        out["exposure_s"] = exposure_s
+        if exposure_s > 0:
+            rate, lo, hi = falls_per_1000s(len(falls), exposure_s)
+        else:
+            rate = lo = hi = float("nan")
+        out["falls_per_1000s"] = rate
+        out["falls_per_1000s_ci95_lo"] = lo
+        out["falls_per_1000s_ci95_hi"] = hi
         lens = np.array([e["length"] for e in falls], dtype=np.int64)
         hist, _ = np.histogram(lens, bins=FALL_BINS)
         out["time_to_fall_bins"] = [f"{a}-{b - 1}" for a, b in zip(FALL_BINS[:-1], FALL_BINS[1:])]

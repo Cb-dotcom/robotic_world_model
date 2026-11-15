@@ -314,9 +314,12 @@ def run_experiment(config: BaseConfig):
     model_experiment.prepare_policy(**policy_config)
     model_experiment.prepare_algorithm(**config.policy_algorithm_config.to_dict())
     model_experiment.prepare_data(**config.data_config.to_dict())
+    data_cfg = config.data_config
     write_run_args(
         log_dir, args_cli, config,
         normalizer_contract=model_experiment.normalization_contract.metadata(),
+        start_state_files=[os.path.join(data_cfg.dataset_root, data_cfg.dataset_folder, f"state_action_data_{i}.csv")
+                           for i in range(model_experiment.data_file_idx)],
     )
     model_experiment.train_policy(log_dir, **config.policy_training_config.to_dict())
     print(f"Training completed. Policy saved to {log_dir}.")

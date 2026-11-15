@@ -165,3 +165,27 @@ def test_p15_passes_seed_and_mode_to_training_and_resets_warm_flag(monkeypatch):
     assert records[0][1].environment_config.num_envs == 4096
     assert records[0][1].policy_training_config.max_iterations == 2500
     assert records[1][1].environment_config.num_envs == 64
+
+
+def test_run_args_records_runtime_and_start_state_hashes(tmp_path):
+    start = tmp_path / "state_action_data_0.csv"
+    start.write_text("1,2,3\n")
+    args = SimpleNamespace(seed=1, task="anymal_d_flat", run_num=7)
+    path = provenance.write_run_args(tmp_path / "run", args, {}, start_state_files=[start])
+    record = json.loads(path.read_text())
+    assert record["start_state_files"] == [{"path": str(start), "sha256": hashlib.sha256(start.read_bytes()).hexdigest()}]
+    runtime = record["runtime"]
+    assert runtime["torch"] == str(torch.__version__) and "torch_cuda" in runtime and "isaac_sim" in runtime
+    assert "git" in runtime["rsl_rl"] or "error" in runtime["rsl_rl"]
+    with pytest.raises(FileNotFoundError):
+        provenance.write_run_args(tmp_path / "run2", args, {}, start_state_files=[tmp_path / "missing.csv"])
+    assert provenance.write_run_args(tmp_path / "run3", args, {}).exists()
+    assert json.loads((tmp_path / "run3" / "run_args.json").read_text())["start_state_files"] is None
+
+
+def test_isaac_sim_version_reads_file_then_package(tmp_path):
+    version = tmp_path / "VERSION"
+    version.write_text("5.1.0-rc.19+release\nextra\n")
+    assert provenance.isaac_sim_version((str(version),)) == {"version": "5.1.0-rc.19+release", "source": str(version)}
+    got = provenance.isaac_sim_version((str(tmp_path / "none"),))
+    assert got is None or got["source"] == "package isaacsim"
