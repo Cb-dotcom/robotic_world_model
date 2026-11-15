@@ -16,6 +16,8 @@ Optional (all default to the original behaviour):
   --lazy_windows      gather training windows on the fly from the flat normalized data
                       instead of materializing a [num_windows, 40, 66] tensor (identical
                       batches; ~12 GB less GPU memory for 1.2M windows).
+  --state_loss KIND   mse (default, ETH's sampled MSE) or gaussian_nll (ETH's own NLL branch of
+                      compute_regression_loss; plan v6 C5).
   manifest.csv may carry a ``num_envs`` column (default 64 when absent): each file is
   env-major with rows == steps * num_envs.
 """
@@ -28,6 +30,7 @@ import random
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +42,7 @@ from rsl_rl.modules import SystemDynamicsEnsemble
 
 from configs.go2_flat_cfg import Go2FlatConfig
 from configs.anymal_d_flat_cfg import AnymalDFlatConfig
+from run_provenance import runtime_identity
 
 _CONFIGS = {"go2_flat": Go2FlatConfig, "anymal_d_flat": AnymalDFlatConfig}
 
@@ -292,6 +296,29 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+STATE_LOSSES = ("mse", "gaussian_nll")
+
+
+def set_state_loss(model, kind):
+    """Select the loss branch of SystemDynamicsEnsemble.compute_regression_loss for this model.
+
+    compute_state_loss always calls compute_regression_loss with the default loss_type "mse".
+    "gaussian_nll" binds an instance method that forces ETH's own NLL branch; nothing else changes
+    (sampled autoregressive feedback, bound loss and auxiliary losses stay as they are).
+    """
+    if kind not in STATE_LOSSES:
+        raise ValueError(f"state loss must be one of {STATE_LOSSES}, got {kind!r}")
+    if kind == "mse":
+        return model
+    original = type(model).compute_regression_loss
+
+    def compute_regression_loss(self, state_mean_pred, state_std_pred, state_target, loss_type=None):
+        return original(self, state_mean_pred, state_std_pred, state_target, loss_type=kind)
+
+    model.compute_regression_loss = types.MethodType(compute_regression_loss, model)
+    return model
+
+
 def main():
     p = argparse.ArgumentParser(description="Boundary-aware Go2 pilot world-model fit.")
     p.add_argument("--data", required=True, help="segments_clean_terms directory containing manifest.csv")
@@ -323,6 +350,8 @@ def main():
     p.add_argument("--seed", type=int, default=None, help="seed python/numpy/torch(+cuda) before model construction; default: unseeded")
     p.add_argument("--norm_stats", type=str, default=None, help=".npz with state_mean/state_std/action_mean/action_std (std incl. eps); default: compute from --data")
     p.add_argument("--lazy_windows", action="store_true", help="gather windows on the fly (identical batches, far less memory)")
+    p.add_argument("--state_loss", choices=STATE_LOSSES, default="mse",
+                   help="state regression loss: mse (default) or ETH's gaussian_nll branch (plan v6 C5)")
     args = p.parse_args()
     t_wall_start = time.time()
 
@@ -400,6 +429,9 @@ def main():
                 print(f"[fit] WARNING: reference WM strict load failed: {e}")
             del tmp
 
+    set_state_loss(sd, args.state_loss)
+    print(f"[fit] state loss = {args.state_loss}")
+
     if args.head_lr is None:
         optimizer = torch.optim.Adam(sd.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
@@ -459,8 +491,6 @@ def main():
     pos_w = torch.tensor([pos_w_val], device=device)
     print(f"[fit] transition-level termination pos_weight={pos_w_val:.1f}")
 
-    import types
-
     def _termination_loss_posweighted(self, termination_pred, termination_target):
         if termination_pred is None or termination_target is None:
             return torch.tensor(0.0, device=self.device)
@@ -499,6 +529,8 @@ def main():
                       else f"warm_start_member_{args.warm_start_member}" if args.warm_start_member is not None
                       else "scratch"),
         "normalizer_source": args.norm_stats if args.norm_stats is not None else "computed_from_data",
+        "state_loss": args.state_loss,
+        "runtime": runtime_identity(),
         "seed": args.seed,
         "versions": {"python": platform.python_version(), "torch": str(torch.__version__), "numpy": str(np.__version__), "pandas": str(pd.__version__)},
         "device": str(device),
