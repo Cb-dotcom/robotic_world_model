@@ -13,6 +13,9 @@ control model, on the same windows. CPU only, no model runs (reads c0_windows.np
   d = 1 and d = 25 (driving head's own path). Changes in % of the control.
 * C5: fall reach = share of imagined paths whose termination probability passes 0.5 anywhere (rule:
   sampled feedback reaches the fall in >= 2x more paths than mean feedback -> averaging is a cause).
+  Two probability rules: the head whose state is fed (ensemble mean in mean mode), and the ensemble mean in
+  every mode (like-for-like across modes). Older runs without stop_mean fall back to the first rule.
+* A zero summed head spread stops the comparison (undefined log ratio).
 * Paired cluster bootstrap: the same resampled episodes for control and treatment, stratified by source.
 * Noise floor: the same numbers for refits of the control recipe with other seeds (--noise).
 The cause rules of plan §2 are applied by reading this table; they are not automated here.
@@ -25,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from c0_battery import COMPONENTS, ci, cluster_bootstrap, json_safe
+from c0_battery import COMPONENTS, ZeroDisagreement, ci, cluster_bootstrap, json_safe
 
 D_ONE, D_LAST = 1, 25
 
@@ -51,6 +54,10 @@ def window_values(run, control_std, sources, kind):
     for s in sources:
         r = run[(s, kind)]
         ur, ui = r["u_real"][D_LAST] * scale, r["u_imag"][:, D_LAST] * scale       # [W,45], [heads,W,45]
+        for lo, hi in COMPONENTS.values():
+            if (ur[:, lo:hi].sum(-1) <= 0).any() or (ui[..., lo:hi].sum(-1) <= 0).any():
+                raise ZeroDisagreement(f"zero head spread in {s}/{kind} (dims {lo}-{hi}); log ratio undefined")
+        stop_mean = r.get("stop_mean", r["stop"])
         his = []
         for lo, hi in COMPONENTS.values():
             his.append(np.log(ui[..., lo:hi].sum(-1) / ur[None, :, lo:hi].sum(-1)).mean(0))
@@ -58,7 +65,8 @@ def window_values(run, control_std, sources, kind):
         cols.append(np.column_stack(his + [own, np.log(ur.sum(-1)), np.log(ui.sum(-1)).mean(0),
                                            r["se_real_vel"].mean(0), r["se_imag_vel"][:, D_ONE].mean(0),
                                            r["se_imag_vel"][:, D_LAST].mean(0),
-                                           (r["stop"] > 0.5).any(axis=1).mean(0)]))
+                                           (r["stop"] > 0.5).any(axis=1).mean(0),
+                                           (stop_mean > 0.5).any(axis=1).mean(0)]))
         clusters.append(r["clusters"])
         strata.append([s] * len(r["clusters"]))
     return np.concatenate(cols), np.concatenate(clusters), np.concatenate(strata)
@@ -66,7 +74,7 @@ def window_values(run, control_std, sources, kind):
 
 NC = len(COMPONENTS)
 COL = {"own": NC, "log_ur": NC + 1, "log_ui": NC + 2, "se_real": NC + 3, "se_d1": NC + 4, "se_d25": NC + 5,
-       "reach": NC + 6}
+       "reach": NC + 6, "reach_mean": NC + 7}
 
 
 def compare(control, treat, sources, n_boot, seed):
@@ -97,6 +105,7 @@ def compare(control, treat, sources, n_boot, seed):
             out[f"{name}_change_ci"] = ci(np.sqrt(bt[:, j] / bc[:, j]) - 1)
         j = COL["reach"]
         out["reach_control"], out["reach_treat"] = float(c[j]), float(t[j])
+        out["reach_mean_prob_control"], out["reach_mean_prob_treat"] = float(c[COL["reach_mean"]]), float(t[COL["reach_mean"]])
         out["reach_ratio"] = float(t[j] / c[j]) if c[j] > 0 else None
         if c[j] > 0:
             ok = bc[:, j] > 0
@@ -125,7 +134,8 @@ def table(results):
              f"[{first['nonfall']['H_control_ci'][0]:.3f}, {first['nonfall']['H_control_ci'][1]:.3f}]; "
              f"imagined vel RMSE d25 = {first['fall']['se_d25_rmse_control']:.3f} m/s"]
     lines += ["model           | falls H(25) [95% CI]     | closure [95% CI]        | dlog u_real | dlog u_imag | "
-             "1-step vel err | imag err d1 | imag err d25 | non-falls H(25) | gravity closure | fall reach (ctrl -> treat)"]
+             "1-step vel err | imag err d1 | imag err d25 | non-falls H(25) | gravity closure | fall reach (ctrl -> treat) | "
+             "reach, ensemble-mean prob"]
     for name, r in results.items():
         f, n = r["fall"], r["nonfall"]
         clo = (f"{f['closure']:+.2f} [{f['closure_ci'][0]:+.2f}, {f['closure_ci'][1]:+.2f}]"
@@ -135,7 +145,8 @@ def table(results):
         lines.append(f"{name:15s} | {f['H_treat']:.3f} [{f['H_treat_ci'][0]:.3f}, {f['H_treat_ci'][1]:.3f}] | {clo:23s} | "
                      f"{f['dlog_u_real']:+.3f}      | {f['dlog_u_imag']:+.3f}      | {f['se_real_change']:+.1%}         | "
                      f"{f['se_d1_change']:+.1%}      | {f['se_d25_change']:+.1%}       | {n['H_treat']:.3f}           | {gc:15s} | "
-                     f"{f['reach_control']:.3f} -> {f['reach_treat']:.3f}")
+                     f"{f['reach_control']:.3f} -> {f['reach_treat']:.3f}          | "
+                     f"{f['reach_mean_prob_control']:.3f} -> {f['reach_mean_prob_treat']:.3f}")
     return "\n".join(lines)
 
 

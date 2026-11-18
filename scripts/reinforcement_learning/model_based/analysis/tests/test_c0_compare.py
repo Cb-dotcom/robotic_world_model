@@ -111,3 +111,18 @@ def test_reach_ratio(tmp_path):
     r = cmp.compare(cmp.load(c, ["s"]), cmp.load(t, ["s"]), ["s"], 100, 0)["fall"]
     assert r["reach_control"] == pytest.approx(0.125) and r["reach_treat"] == pytest.approx(0.5)
     assert r["reach_ratio"] == pytest.approx(4.0)
+
+
+def test_reach_with_ensemble_mean_probability_and_zero_spread(tmp_path):
+    c = write_run(tmp_path / "c")
+    t = write_run(tmp_path / "t")
+    z = dict(np.load(t / "c0_windows.npz"))
+    z["s/fall/stop_mean"] = np.zeros_like(z["s/fall/stop"])
+    z["s/fall/stop_mean"][:, 3, :] = 0.8                   # ensemble-mean rule: every path reaches
+    z["s/nonfall/stop_mean"] = np.zeros_like(z["s/nonfall/stop"])
+    np.savez(t / "c0_windows.npz", **z)
+    r = cmp.compare(cmp.load(c, ["s"]), cmp.load(t, ["s"]), ["s"], 50, 0)["fall"]
+    assert r["reach_mean_prob_control"] == 0 and r["reach_mean_prob_treat"] == pytest.approx(1.0)
+    zero = write_run(tmp_path / "z", u_imag=0.0)
+    with pytest.raises(cmp.ZeroDisagreement):
+        cmp.compare(cmp.load(c, ["s"]), cmp.load(zero, ["s"]), ["s"], 10, 0)

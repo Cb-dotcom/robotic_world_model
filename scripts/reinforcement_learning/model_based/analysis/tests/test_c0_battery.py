@@ -323,7 +323,7 @@ def test_feedback_modes():
     assert mean["own"].shape[0] == tilted["own"].shape[0] == 1 and rand["own"].shape[0] == s1["own"].shape[0] == 5
     # step 0 sees the same real inputs in every mode
     np.testing.assert_allclose(mean["own"][0, 0], head["own"][:, 0].mean(0), rtol=1e-5, atol=1e-6)
-    tilt = np.linalg.norm(head["own"][:, 0][..., 6:8], axis=-1)                          # identity normalization
+    tilt = c0.tilt_deg(torch.from_numpy(head["own"][:, 0][..., 6:9])).numpy()           # identity normalization
     pick = tilt.argmax(0)
     np.testing.assert_allclose(tilted["own"][0, 0], head["own"][pick, 0, np.arange(len(origins))], rtol=1e-5, atol=1e-6)
     for p in range(5):
@@ -353,3 +353,92 @@ def test_single_path_mode_summary_is_json_safe(tmp_path, monkeypatch):
     assert saved["meta"]["feedback"] == "mean" and saved["report"]["pooled"]["fall"]["c1a"]["ratio"] is None
     with np.load(tmp_path / "mean" / "c0_windows.npz") as z:
         assert z["src/fall/ratio"].shape == (1, 26, 2, 45) and z["src/fall/target"].shape == (26, 2, 45)
+
+
+def test_held_actions_free_run():
+    model, contract, trace = real_model(), identity_contract(), random_trace()
+    origins, _ = c0.fall_windows(trace)
+    rec = c0.imagined_pass(model, contract, trace, origins, 5)
+    held = c0.imagined_pass(model, contract, trace, origins, 5, actions_mode="held")
+    np.testing.assert_array_equal(rec["own"][:, 0], held["own"][:, 0])                  # step 0 uses the context only
+    assert np.abs(rec["own"][:, 1:] - held["own"][:, 1:]).max() > 1e-5
+    const = random_trace()
+    const["action"][:] = const["action"][0:1]                                           # every row the same action
+    a = c0.imagined_pass(model, contract, const, origins, 5)
+    b = c0.imagined_pass(model, contract, const, origins, 5, actions_mode="held")
+    np.testing.assert_array_equal(a["own"], b["own"])
+    with pytest.raises(ValueError):
+        c0.imagined_pass(model, contract, trace, origins, 5, actions_mode="zero")
+
+
+def test_tilt_angle_any_vector_length():
+    g = torch.tensor([[0, 0, -1.0], [1.0, 0, 0], [0, 0, 1.0], [0.5, 0, -3.0], [0, 0, -0.2]])
+    np.testing.assert_allclose(c0.tilt_deg(g).numpy(), [0, 90, 180, np.degrees(np.arctan2(0.5, 3)), 0], atol=1e-4)
+
+
+def test_spearman_ties_and_constant_input():
+    np.testing.assert_array_equal(c0.average_ranks([3, 1, 3, 2]), [3.5, 1, 3.5, 2])
+    assert np.isnan(c0.spearman(np.ones(10), np.ones(10)))
+    assert np.isnan(c0.spearman(np.arange(10), np.ones(10)))
+    assert np.isnan(c0.spearman([1, 2], [2, 3]))
+    assert c0.spearman([1, 2, 2, 3], [1, 2, 2, 3]) == pytest.approx(1.0)
+    assert c0.spearman([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1.0)
+    a = np.array([1, 1, 2, 3, 3, 3]); b = np.array([2, 1, 3, 3, 4, 5])
+    ra, rb = c0.average_ranks(a), c0.average_ranks(b)
+    assert c0.spearman(a, b) == pytest.approx(np.corrcoef(ra, rb)[0, 1])
+
+
+def test_pair_bootstrap_resamples_pairs_jointly():
+    rng = np.random.default_rng(0)
+    f = rng.normal(1.0, 0.3, 40)
+    n = 0.5 * f + rng.normal(0, 0.05, 40)                  # matched partner, not an exact copy
+    strata = np.array(["a"] * 25 + ["b"] * 15)
+    bf, bn = c0.pair_bootstrap(f, n, strata, 3000, 0)
+    lo, hi = c0.ci(bf / bn)
+    assert hi - lo > 1e-3                                  # not a degenerate zero-width interval
+    assert lo < f.mean() / n.mean() < hi
+    # one draw with a known index set: both groups use the same pairs
+    bf1, bn1 = c0.pair_bootstrap(np.arange(4.0), 10 * np.arange(4.0), np.array(["s"] * 4), 1, 3)
+    assert bn1[0] == pytest.approx(10 * bf1[0])
+    with pytest.raises(ValueError):
+        c0.pair_bootstrap(f, n[:-1], strata, 10, 0)
+
+
+def test_zero_disagreement_stops():
+    u_real = np.ones((26, 3, 45))
+    u_imag = np.ones((2, 26, 3, 45))
+    u_imag[0, 5, 1, :] = 0
+    with pytest.raises(c0.ZeroDisagreement, match="windows \\[1\\]"):
+        c0.log_ratio(u_imag, u_real, "sum")
+
+
+def test_gates_stop_the_run(tmp_path, monkeypatch):
+    import analyse_transition_fidelity as fidelity
+    import replay_fall_paths as replay
+    model, contract = real_model(), identity_contract()
+    monkeypatch.setattr(fidelity, "load_model", lambda path: (model, contract))
+    p = tmp_path / "t.npz"
+    np.savez(p, **random_trace())
+    wm = tmp_path / "wm.pt"
+    wm.write_bytes(b"x")
+    def report(r25):
+        steps = lambda first, last: [dict(uncertainty_mean=first)] + [dict(uncertainty_mean=1.0)] * 23 + [dict(uncertainty_mean=last)]
+        return dict(real_context=dict(steps=steps(1.0, r25)), imagined_context=dict(steps=steps(5.0, 2.0)),
+                    trace_sha256="x", wm_sha256="y")
+    def fake_run(trace, wm_path, out):
+        out.mkdir(parents=True)
+        (out / "paired_fall_replay.json").write_text(json.dumps(report(11.0)))
+    monkeypatch.setattr(replay, "run", fake_run)
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps(report(9.78)))
+    with pytest.raises(c0.GateFailed, match="reproduction"):
+        c0.run(wm, [("src", p)], tmp_path / "g1", repro_trace=p, repro_json=old, n_boot=20)
+    assert (tmp_path / "g1" / "c0_report.txt").is_file()          # evidence kept
+    real_summarize = c0.summarize
+    def bad_summary(*args, **kwargs):
+        rep = real_summarize(*args, **kwargs)
+        rep["pooled"]["hr0_check"]["passed"] = False
+        return rep
+    monkeypatch.setattr(c0, "summarize", bad_summary)
+    with pytest.raises(c0.GateFailed, match="HR\\(0\\)"):
+        c0.run(wm, [("src", p)], tmp_path / "g2", n_boot=20)
