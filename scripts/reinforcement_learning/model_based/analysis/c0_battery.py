@@ -23,6 +23,17 @@ depth d = number of imagined states fed back runs 0..25 and the last target is t
   (if H_nonfall(25) <= 0: H_fall(25) with CI above 0); not supported if the ratio CI lies below 1.5;
   otherwise inconclusive. Components are reported for the "only in gravity -> C6" reading.
 u_real and u_imag are reported separately (doubt E18: H can shrink because u_real drops).
+
+Cause-test outputs (plan §2), stored per window in c0_windows.npz and read by c0_compare.py:
+* prediction error per depth: real-context one-step error and the driving head's own imagined error,
+  in normalized units (45 dims) and as base-velocity error in m/s;
+* C1a: per-member trajectory spread = std over driving heads of each head's own imagined state,
+  against the shared-path disagreement u_imag, and its Spearman with the imagined error;
+* C1c: --wm a.pt,b.pt,... reads several single-head models as one ensemble on a shared path
+  (independent trunks; each model keeps its own memory, all see the same inputs);
+* C7: --imag-context K starts imagination from the last K real rows (cold memory: K = 1);
+  the real-context arm keeps 32 rows, so HR(0) is no longer 1 by construction;
+* C8: --head-subsets 2,5,10 adds the healing index of 50 random head subsets per size.
 """
 from __future__ import annotations
 
@@ -44,8 +55,28 @@ BINS_NOTE = "depth d = imagined states fed back before the prediction; d = 0 is 
 
 
 # ---------------------------------------------------------------- model passes
+class ModelSet:
+    """Several models read as one ensemble on a shared path (C1c: independent trunks)."""
+
+    def __init__(self, models):
+        self.models = list(models)
+        self.ensemble_size = sum(m.ensemble_size for m in self.models)
+
+    def reset(self):
+        for m in self.models:
+            m.reset()
+
+
 @torch.no_grad()
 def forward_all(model, xs, xa):
+    if isinstance(model, ModelSet):
+        parts = [forward_all(m, xs, xa) for m in model.models]
+        return tuple(torch.cat(group, 0) for group in zip(*parts))
+    return _forward_one(model, xs, xa)
+
+
+@torch.no_grad()
+def _forward_one(model, xs, xa):
     """One recurrent step of SystemDynamicsEnsemble.forward, returning every head's state mean.
 
     Same calls in the same order as the library forward (state trunk, state heads, auxiliary trunk,
@@ -81,39 +112,102 @@ def _normalized(contract, data, origins, lo, hi, key):
     return (values - stats[f"{key}_mean"]) / stats[f"{key}_std"]
 
 
+def make_subsets(heads, sizes, n=50, seed=0):
+    """Random head subsets {K: int array [n, K]} (sizes >= heads are skipped)."""
+    rng = np.random.default_rng(seed)
+    return {k: np.stack([np.sort(rng.choice(heads, k, replace=False)) for _ in range(n)])
+            for k in sizes if 2 <= k < heads}
+
+
+def subset_spread(means, subsets):
+    """Summed std over the heads of each subset: {K: [n, B]}."""
+    return {k: means[torch.from_numpy(idx)].std(dim=1).sum(-1).numpy() for k, idx in subsets.items()}
+
+
+def _errors(pred, target, stats):
+    """Squared errors: mean over dims in normalized units, and over base velocity (dims 0-2) in m/s."""
+    d = pred - target
+    vel = d[..., 0:3] * stats["state_std"][0:3]
+    return (d ** 2).mean(-1).numpy(), (vel ** 2).mean(-1).numpy()
+
+
 @torch.no_grad()
-def real_context_spread(model, contract, data, origins, horizon, batch=256):
-    """Teacher forcing: spread [horizon, W, 45] of the prediction of step k from 32 real rows."""
+def real_context_pass(model, contract, data, origins, horizon, subsets=None, batch=256):
+    """Teacher forcing: the prediction of step k from 32 real rows.
+    Returns spread [H, W, 45], se_norm [H, W], se_vel [H, W] (mean over heads), subset spreads
+    {K: [n, len(DEPTHS), W]} at DEPTHS."""
+    stats = contract.statistics
     rows = np.asarray([(t + k, n) for k in range(horizon) for t, n in origins], dtype=int).reshape(-1, 2)
-    out = []
+    target = (torch.from_numpy(data["next_state"][rows[:, 0], rows[:, 1]]).float() - stats["state_mean"]) / stats["state_std"]
+    spread, se_n, se_v, sub = [], [], [], {k: [] for k in (subsets or {})}
     for b in range(0, len(rows), batch):
         chunk = rows[b:b + batch]
         model.reset()
         means, _, _ = forward_all(model, _normalized(contract, data, chunk, -31, 1, "state"),
                                   _normalized(contract, data, chunk, -31, 1, "action"))
-        out.append(head_spread(means).numpy())
-    return np.concatenate(out).reshape(horizon, len(origins), -1)
+        spread.append(head_spread(means).numpy())
+        n_err, v_err = _errors(means, target[b:b + batch][None], stats)
+        se_n.append(n_err.mean(0))
+        se_v.append(v_err.mean(0))
+        for k, v in subset_spread(means, subsets or {}).items():
+            sub[k].append(v)
+    W = len(origins)
+    out = dict(spread=np.concatenate(spread).reshape(horizon, W, -1),
+               se_norm=np.concatenate(se_n).reshape(horizon, W), se_vel=np.concatenate(se_v).reshape(horizon, W))
+    depths = [d for d in DEPTHS if d < horizon]
+    out["subsets"] = {k: np.concatenate(v, axis=1).reshape(len(v[0]), horizon, W)[:, depths] for k, v in sub.items()}
+    return out
 
 
 @torch.no_grad()
-def imagined_spread(model, contract, data, origins, horizon):
-    """Imagination driven by each head's own mean: spread [heads, horizon, W, 45] and the driving
-    head's termination probability [heads, horizon, W]."""
-    states = _normalized(contract, data, origins, -31, 1, "state")
+def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subsets=None):
+    """Imagination driven by each head's own mean, started from the last `context` real rows.
+    Returns spread [heads, H, W, 45] (shared-path disagreement), own [heads, H, W, 45] (the driving
+    head's normalized state), stop [heads, H, W], se_norm / se_vel [heads, H, W] and subset spreads
+    {K: [n, heads, len(DEPTHS), W]} at DEPTHS."""
+    if not 1 <= context <= HISTORY:
+        raise ValueError(f"context must be 1..{HISTORY}")
+    stats = contract.statistics
+    states = _normalized(contract, data, origins, -31, 1, "state")[:, HISTORY - context:]
     actions = _normalized(contract, data, origins, -31, horizon, "action")
-    spread, stop = [], []
+    target = (torch.from_numpy(gather(data["next_state"], origins, 0, horizon)).float()
+              - stats["state_mean"]) / stats["state_std"]                                   # [W, H, 45]
+    depths = [d for d in DEPTHS if d < horizon]
+    spread, own, stop, se_n, se_v = [], [], [], [], []
+    sub = {k: np.full((len(idx), model.ensemble_size, len(depths), len(origins)), np.nan)
+           for k, idx in (subsets or {}).items()}
     for h in range(model.ensemble_size):
         model.reset()
-        xs, xa = states, actions[:, :32]
-        sp, st = [], []
+        xs, xa = states, actions[:, HISTORY - context:HISTORY]
+        sp, ow, st, en, ev = [], [], [], [], []
         for k in range(horizon):
             means, _, terms = forward_all(model, xs, xa)
             sp.append(head_spread(means).numpy())
+            ow.append(means[h].numpy())
             st.append(torch.sigmoid(terms[h]).squeeze(-1).numpy())
-            xs, xa = means[h][:, None], actions[:, 32 + k:33 + k]
-        spread.append(np.stack(sp))
-        stop.append(np.stack(st))
-    return np.stack(spread), np.stack(stop)
+            n_err, v_err = _errors(means[h], target[:, k], stats)
+            en.append(n_err)
+            ev.append(v_err)
+            if k in depths:
+                for K, v in subset_spread(means, subsets or {}).items():
+                    member = (subsets[K] == h).any(axis=1)          # only subsets that contain the driving head
+                    sub[K][member, h, depths.index(k)] = v[member]
+            xs, xa = means[h][:, None], actions[:, HISTORY + k:HISTORY + k + 1]
+        for acc, val in zip((spread, own, stop, se_n, se_v), (sp, ow, st, en, ev)):
+            acc.append(np.stack(val))
+    return dict(spread=np.stack(spread), own=np.stack(own), stop=np.stack(stop),
+                se_norm=np.stack(se_n), se_vel=np.stack(se_v), subsets=sub)
+
+
+def real_context_spread(model, contract, data, origins, horizon, batch=256):
+    """Spread [H, W, 45] of the real-context pass (kept for the 27 Oct equality test)."""
+    return real_context_pass(model, contract, data, origins, horizon, batch=batch)["spread"]
+
+
+def imagined_spread(model, contract, data, origins, horizon):
+    """Spread [heads, H, W, 45] and stop probability of the imagined pass (32-row context)."""
+    out = imagined_pass(model, contract, data, origins, horizon)
+    return out["spread"], out["stop"]
 
 
 # ---------------------------------------------------------------- windows
@@ -248,7 +342,7 @@ def reproduction_check(new, old, tolerance=REPRO_TOLERANCE):
 
 
 # ---------------------------------------------------------------- battery
-def battery_source(model, contract, name, trace, seed):
+def battery_source(model, contract, name, trace, seed, context=HISTORY, subsets=None):
     data = {k: trace[k] for k in ("state", "action", "next_state", "command", "done", "terminated", "time_out")}
     falls, counts = fall_windows(data)
     if not len(falls):
@@ -258,10 +352,14 @@ def battery_source(model, contract, name, trace, seed):
     ep = episode_index(data["done"])
     out = {}
     for kind, origins in (("fall", falls), ("nonfall", nonfalls)):
-        u_real = real_context_spread(model, contract, data, origins, HORIZON)
-        u_imag, stop = imagined_spread(model, contract, data, origins, HORIZON)
-        first = np.abs(u_imag[:, 0] - u_real[None, 0]).max()
-        out[kind] = dict(origins=origins, u_real=u_real, u_imag=u_imag, stop=stop,
+        real = real_context_pass(model, contract, data, origins, HORIZON, subsets)
+        imag = imagined_pass(model, contract, data, origins, HORIZON, context, subsets)
+        first = np.abs(imag["spread"][:, 0] - real["spread"][None, 0]).max()
+        out[kind] = dict(origins=origins, u_real=real["spread"], u_imag=imag["spread"],
+                         u_member=imag["own"].std(axis=0, ddof=1), stop=imag["stop"],
+                         se_real_norm=real["se_norm"], se_real_vel=real["se_vel"],
+                         se_imag_norm=imag["se_norm"], se_imag_vel=imag["se_vel"],
+                         sub_real=real["subsets"], sub_imag=imag["subsets"],
                          clusters=np.asarray([f"{name}/{n}/{ep[t, n]}" for t, n in origins]),
                          first_step_max_abs_delta=float(first))
     out["counts"] = dict(counts, nonfall_candidates=int(len(cands)),
@@ -272,47 +370,75 @@ def battery_source(model, contract, name, trace, seed):
     return out
 
 
-def summarize(sources, n_boot, seed):
-    """HI/H/HR and u_real/u_imag per kind, component and depth, pooled and per source."""
-    report = {"depth_definition": BINS_NOTE, "depths": list(DEPTHS), "components": list(COMPONENTS)}
+def spearman(a, b):
+    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
+    return float(np.corrcoef(ra, rb)[0, 1]) if len(a) > 2 else float("nan")
+
+
+def summarize(sources, n_boot, seed, context=HISTORY):
+    """HI/H/HR and u_real/u_imag per kind, component and depth, pooled and per source; errors;
+    C1a member spread; C8 subsets."""
+    report = {"depth_definition": BINS_NOTE, "depths": list(DEPTHS), "components": list(COMPONENTS),
+              "imag_context": context}
     names = list(sources)
+    d25, s_idx = DEPTHS.index(25), list(COMPONENTS).index("sum")
     for scope in ["pooled"] + names:
         use = names if scope == "pooled" else [scope]
-        block = {}
-        boots = {}
+        block, boots = {}, {}
         for kind in ("fall", "nonfall"):
-            lr = np.concatenate([np.stack([log_ratio(sources[s][kind]["u_imag"], sources[s][kind]["u_real"], c)
-                                           for c in COMPONENTS], axis=-1) for s in use], axis=1)  # [H, W, C]
-            clusters = np.concatenate([sources[s][kind]["clusters"] for s in use])
+            cat = lambda key, axis: np.concatenate([sources[s][kind][key] for s in use], axis=axis)
+            u_real, u_imag, u_mem = cat("u_real", 1), cat("u_imag", 2), cat("u_member", 1)
+            lr = np.stack([log_ratio(u_imag, u_real, c) for c in COMPONENTS], axis=-1)       # [H, W, C]
+            clusters = cat("clusters", 0)
             strata = np.concatenate([[s] * len(sources[s][kind]["clusters"]) for s in use])
-            vals = lr[list(DEPTHS)].transpose(1, 0, 2)                                         # [W, D, C]
-            point, boot = cluster_bootstrap(vals, clusters, strata, n_boot, seed)
+            point, boot = cluster_bootstrap(lr[list(DEPTHS)].transpose(1, 0, 2), clusters, strata, n_boot, seed)
             boots[kind] = boot
             rows = {}
             for di, d in enumerate(DEPTHS):
                 for ci_, c in enumerate(COMPONENTS):
                     lo, hi = COMPONENTS[c]
-                    ur = np.concatenate([sources[s][kind]["u_real"][d, :, lo:hi].sum(-1) for s in use])
-                    ui = np.concatenate([sources[s][kind]["u_imag"][:, d, :, lo:hi].sum(-1).mean(0) for s in use])
+                    ur, ui = u_real[d, :, lo:hi].sum(-1), u_imag[:, d, :, lo:hi].sum(-1).mean(0)
                     hi_b = boot[:, di, ci_]
                     rows[f"d{d}/{c}"] = dict(
                         HI=float(point[di, ci_]), HI_ci=ci(hi_b), HR=float(np.exp(point[di, ci_])),
                         H=float(-point[di, ci_]), H_ci=sorted(float(-x) for x in ci(hi_b)),
                         u_real_mean=float(ur.mean()), u_imag_mean=float(ui.mean()),
                         u_real_geomean=float(np.exp(np.log(ur).mean())), u_imag_geomean=float(np.exp(np.log(ui).mean())))
-            block[kind] = dict(windows=int(len(clusters)), clusters=int(len(np.unique(clusters))), rows=rows)
-        d25, s = DEPTHS.index(25), list(COMPONENTS).index("sum")
-        block["c0_rule_d25_sum"] = c0_verdict(-block["fall"]["rows"]["d25/sum"]["HI"], -boots["fall"][:, d25, s],
-                                              -block["nonfall"]["rows"]["d25/sum"]["HI"], -boots["nonfall"][:, d25, s])
-        block["hr0_check"] = dict(HR0_fall=block["fall"]["rows"]["d0/sum"]["HR"],
-                                  HR0_nonfall=block["nonfall"]["rows"]["d0/sum"]["HR"],
-                                  passed=bool(all(0.9 <= block[k]["rows"]["d0/sum"]["HR"] <= 1.1 for k in ("fall", "nonfall"))))
+            se_rn, se_rv = cat("se_real_norm", 1), cat("se_real_vel", 1)
+            se_in, se_iv = cat("se_imag_norm", 2), cat("se_imag_vel", 2)
+            errors = {f"d{d}": dict(real_norm_rmse=float(np.sqrt(se_rn[d].mean())), real_vel_rmse=float(np.sqrt(se_rv[d].mean())),
+                                    imag_norm_rmse=float(np.sqrt(se_in[:, d].mean())), imag_vel_rmse=float(np.sqrt(se_iv[:, d].mean())))
+                      for d in DEPTHS}
+            # C1a: per-member trajectory spread vs shared-path disagreement at d = 25 (sums)
+            mem25, shared25 = u_mem[25].sum(-1), u_imag[:, 25].sum(-1).mean(0)
+            pm, pb = cluster_bootstrap(np.stack([mem25, shared25], 1), clusters, strata, n_boot, seed)
+            c1a = dict(member_spread_d25=float(pm[0]), shared_disagreement_d25=float(pm[1]),
+                       ratio=float(pm[0] / pm[1]), ratio_ci=ci(pb[:, 0] / pb[:, 1]),
+                       spearman_member_spread_vs_imag_vel_error_d25=spearman(mem25, np.sqrt(se_iv[:, 25].mean(0))),
+                       rule="member spread >= 2x shared disagreement AND Spearman >= 0.5 (on falls)")
+            # C8: head subsets (mean over subsets of exp(HI_S) at d = 25, driving heads inside the subset)
+            c8 = {}
+            for K in sources[use[0]][kind]["sub_imag"]:
+                sr = np.concatenate([sources[s][kind]["sub_real"][K] for s in use], axis=-1)       # [n, D, W]
+                si = np.concatenate([sources[s][kind]["sub_imag"][K] for s in use], axis=-1)       # [n, heads, D, W]
+                his = np.nanmean(np.log(si[:, :, d25] / sr[:, None, d25]), axis=(1, 2))           # [n]
+                c8[f"K{K}"] = dict(HR_mean=float(np.exp(his).mean()), HR_p10=float(np.percentile(np.exp(his), 10)),
+                                   HR_p90=float(np.percentile(np.exp(his), 90)), subsets=int(len(his)))
+            c8["K_all"] = dict(HR_mean=rows["d25/sum"]["HR"], heads=int(u_imag.shape[0]))
+            block[kind] = dict(windows=int(len(clusters)), clusters=int(len(np.unique(clusters))), rows=rows,
+                               errors=errors, c1a=c1a, c8=c8)
+        block["c0_rule_d25_sum"] = c0_verdict(-block["fall"]["rows"]["d25/sum"]["HI"], -boots["fall"][:, d25, s_idx],
+                                              -block["nonfall"]["rows"]["d25/sum"]["HI"], -boots["nonfall"][:, d25, s_idx])
+        hr0 = {k: block[k]["rows"]["d0/sum"]["HR"] for k in ("fall", "nonfall")}
+        block["hr0_check"] = dict(HR0_fall=hr0["fall"], HR0_nonfall=hr0["nonfall"],
+                                  passed=bool(all(0.9 <= v <= 1.1 for v in hr0.values())) if context == HISTORY else None,
+                                  note=None if context == HISTORY else f"not applicable: imagination starts from {context} rows")
         report[scope] = block
     return report
 
 
 def text_report(report, repro, counts):
-    lines = ["Plan v6 C0 battery (CPU). " + BINS_NOTE, ""]
+    lines = ["Plan v6 C0 battery (CPU). " + BINS_NOTE, f"imagination context: {report['imag_context']} rows", ""]
     if repro is not None:
         lines.append(f"Reproduction of 27 Oct (tolerance {repro['tolerance']:.0%}): "
                      f"{'PASS' if repro['passed'] else 'FAIL'}; same input hashes: {repro['same_input_hashes']}")
@@ -321,27 +447,68 @@ def text_report(report, repro, counts):
         lines.append("")
     for name, c in counts.items():
         lines.append(f"{name}: {c}")
-    for scope in [k for k in report if k not in ("depth_definition", "depths", "components")]:
+    for scope in [k for k in report if k not in ("depth_definition", "depths", "components", "imag_context")]:
         b = report[scope]
         lines.append(f"\n== {scope}: falls {b['fall']['windows']} windows / {b['fall']['clusters']} episodes; "
                      f"non-falls {b['nonfall']['windows']} / {b['nonfall']['clusters']}")
-        lines.append(f"HR(0) check: fall {b['hr0_check']['HR0_fall']:.4f}, non-fall {b['hr0_check']['HR0_nonfall']:.4f} "
-                     f"-> {'PASS' if b['hr0_check']['passed'] else 'FAIL'}")
+        h0 = b["hr0_check"]
+        lines.append(f"HR(0) check: fall {h0['HR0_fall']:.4f}, non-fall {h0['HR0_nonfall']:.4f} -> "
+                     + (h0["note"] if h0["passed"] is None else ("PASS" if h0["passed"] else "FAIL")))
         lines.append(f"C0 rule (d=25, sum): {b['c0_rule_d25_sum']}")
         for kind in ("fall", "nonfall"):
+            k = b[kind]
             lines.append(f"  {kind}: d  component      H [95% CI]            HR      u_real   u_imag")
             for d in DEPTHS:
                 for comp in COMPONENTS:
                     if d not in (0, 25) and comp != "sum":
                         continue
-                    r = b[kind]["rows"][f"d{d}/{comp}"]
+                    r = k["rows"][f"d{d}/{comp}"]
                     lines.append(f"    {d:2d} {comp:15s} {r['H']:+.3f} [{r['H_ci'][0]:+.3f}, {r['H_ci'][1]:+.3f}]  "
                                  f"{r['HR']:.3f}  {r['u_real_mean']:.3f}  {r['u_imag_mean']:.3f}")
+            lines.append("    errors (RMSE)  d: real-context vel m/s | imagined vel m/s | real norm | imagined norm")
+            for d in DEPTHS:
+                e = k["errors"][f"d{d}"]
+                lines.append(f"      {d:2d}: {e['real_vel_rmse']:.4f} | {e['imag_vel_rmse']:.4f} | "
+                             f"{e['real_norm_rmse']:.4f} | {e['imag_norm_rmse']:.4f}")
+            c = k["c1a"]
+            lines.append(f"    C1a d=25 ({kind}): member spread {c['member_spread_d25']:.3f} / shared {c['shared_disagreement_d25']:.3f} "
+                         f"= {c['ratio']:.2f} [{c['ratio_ci'][0]:.2f}, {c['ratio_ci'][1]:.2f}]; "
+                         f"Spearman vs imagined error {c['spearman_member_spread_vs_imag_vel_error_d25']:+.2f}")
+            if len(k["c8"]) > 1:
+                lines.append(f"    C8 d=25 ({kind}) HR by head count: " + "; ".join(
+                    f"{K} {v['HR_mean']:.3f}" + (f" [{v['HR_p10']:.3f}-{v['HR_p90']:.3f}]" if "HR_p10" in v else "")
+                    for K, v in k["c8"].items()))
     return "\n".join(lines) + "\n"
 
 
-def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=0):
+def json_safe(obj):
+    """NaN / inf -> None (e.g. a Spearman over two windows), so the JSON stays strict."""
+    if isinstance(obj, float):
+        return obj if np.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    return obj
+
+
+def load_models(spec):
+    """One checkpoint, or several comma-separated ones read as one ensemble (C1c)."""
     from analyse_transition_fidelity import load_model
+    paths = [Path(p) for p in str(spec).split(",") if p]
+    if len(paths) == 1:
+        model, contract = load_model(paths[0])
+        return model, contract, paths
+    loaded = [load_model(p) for p in paths]
+    contract = loaded[0][1]
+    for _, other in loaded[1:]:
+        for key, value in contract.statistics.items():
+            if not torch.equal(value, other.statistics[key]):
+                raise ValueError(f"models in {spec} use different normalization ({key})")
+    return ModelSet(m for m, _ in loaded), contract, paths
+
+
+def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=0, context=HISTORY, head_subsets=()):
     import replay_fall_paths as replay
     torch.set_num_threads(4)
     out.mkdir(parents=True, exist_ok=False)
@@ -351,29 +518,37 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
         new = json.loads((out / "repro" / "paired_fall_replay.json").read_text())
         repro = reproduction_check(new, json.loads(Path(repro_json).read_text()))
         print(f"[c0] reproduction {'PASS' if repro['passed'] else 'FAIL'}: {repro['rows']}", flush=True)
-    model, contract = load_model(wm)
+    model, contract, paths = load_models(wm)
+    subsets = make_subsets(model.ensemble_size, head_subsets, seed=seed) if head_subsets else None
     sources, counts, inputs = {}, {}, {}
     for name, path in traces:
         with np.load(path, allow_pickle=False) as trace:
             validate_trace(trace)
-            sources[name] = battery_source(model, contract, name, trace, seed)
+            sources[name] = battery_source(model, contract, name, trace, seed, context, subsets)
         counts[name] = sources[name]["counts"]
         inputs[name] = dict(path=str(path), sha256=sha256(path))
         print(f"[c0] {name}: {counts[name]}", flush=True)
-    report = summarize(sources, n_boot, seed)
-    meta = dict(wm=str(wm), wm_sha256=sha256(wm), inputs=inputs, counts=counts, horizon=HORIZON,
-                history=HISTORY, bootstrap=n_boot, seed=seed, analysis_sha256=sha256(__file__),
+    report = summarize(sources, n_boot, seed, context)
+    meta = dict(wm=[str(p) for p in paths], wm_sha256=[sha256(p) for p in paths], heads=model.ensemble_size,
+                inputs=inputs, counts=counts, horizon=HORIZON, history=HISTORY, imag_context=context,
+                head_subsets={str(k): v.tolist() for k, v in (subsets or {}).items()},
+                bootstrap=n_boot, seed=seed, analysis_sha256=sha256(__file__),
                 match_features={k: v["match_features"] for k, v in sources.items()},
                 first_step_max_abs_delta={k: {kind: v[kind]["first_step_max_abs_delta"] for kind in ("fall", "nonfall")}
                                           for k, v in sources.items()},
                 normalization=contract.metadata(), reproduction=repro)
     with (out / "c0_report.json").open("x") as f:
-        json.dump(dict(meta=meta, report=report), f, indent=1, allow_nan=False)
-    arrays = {}
+        json.dump(json_safe(dict(meta=meta, report=report)), f, indent=1, allow_nan=False)
+    arrays = {"meta/state_mean": contract.statistics["state_mean"].numpy(),
+              "meta/state_std": contract.statistics["state_std"].numpy()}
     for name, src in sources.items():
         for kind in ("fall", "nonfall"):
-            for key in ("origins", "u_real", "u_imag", "stop"):
+            for key in ("origins", "u_real", "u_imag", "u_member", "stop", "se_real_norm", "se_real_vel",
+                        "se_imag_norm", "se_imag_vel"):
                 arrays[f"{name}/{kind}/{key}"] = src[kind][key]
+            for K, v in src[kind]["sub_real"].items():
+                arrays[f"{name}/{kind}/sub_real_K{K}"] = v
+                arrays[f"{name}/{kind}/sub_imag_K{K}"] = src[kind]["sub_imag"][K]
             arrays[f"{name}/{kind}/clusters"] = src[kind]["clusters"].astype("U")
     with (out / "c0_windows.npz").open("xb") as f:
         np.savez_compressed(f, **arrays)
@@ -385,12 +560,15 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--wm", type=Path, required=True, help="world model checkpoint (ETH: assets/models/pretrain_rnn_ens.pt)")
+    p.add_argument("--wm", required=True,
+                   help="world model checkpoint (ETH: assets/models/pretrain_rnn_ens.pt), or a,b,c (C1c: one ensemble)")
     p.add_argument("--trace", action="append", required=True, metavar="NAME=PATH",
                    help="pre-reset trace (repeat): batchA=..., batchC=..., round0_1701=...")
     p.add_argument("--out", type=Path, required=True, help="fresh output folder")
     p.add_argument("--repro-trace", type=Path, help="27 Oct trace (transition_fidelity.*/baseline.npz)")
     p.add_argument("--repro-json", type=Path, help="27 Oct paired_fall_replay.json")
+    p.add_argument("--imag-context", type=int, default=HISTORY, help="real rows that start imagination (C7 cold: 1)")
+    p.add_argument("--head-subsets", default="", help="C8: subset sizes, e.g. 2,5,10 (50 random subsets each)")
     p.add_argument("--bootstrap", type=int, default=10_000)
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
@@ -398,13 +576,19 @@ def main():
         p.error("output folder exists; use a fresh one")
     if (a.repro_trace is None) != (a.repro_json is None):
         p.error("--repro-trace and --repro-json go together")
+    if not 1 <= a.imag_context <= HISTORY:
+        p.error(f"--imag-context must be 1..{HISTORY}")
+    try:
+        sizes = tuple(int(x) for x in a.head_subsets.split(",") if x)
+    except ValueError:
+        p.error("--head-subsets takes integers, e.g. 2,5,10")
     traces = []
     for item in a.trace:
         name, _, path = item.partition("=")
         if not name or not path or "/" in name:
             p.error(f"bad --trace {item!r}; use NAME=PATH")
         traces.append((name, Path(path)))
-    run(a.wm, traces, a.out, a.repro_trace, a.repro_json, a.bootstrap, a.seed)
+    run(a.wm, traces, a.out, a.repro_trace, a.repro_json, a.bootstrap, a.seed, a.imag_context, sizes)
 
 
 if __name__ == "__main__":

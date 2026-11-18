@@ -213,3 +213,99 @@ def test_end_to_end_writes_reports_and_refuses_overwrite(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["c0_battery.py", "--wm", str(wm), "--trace", f"a={paths[0][1]}", "--out", str(out)])
     with pytest.raises(SystemExit):
         c0.main()
+
+
+def test_errors_and_member_spread_match_replay_paths():
+    model, contract, trace = real_model(), identity_contract(), random_trace()
+    origins, _ = c0.fall_windows(trace)
+    H = c0.HORIZON
+    real = c0.real_context_pass(model, contract, trace, origins, H, batch=5)
+    rows = np.asarray([(t + k, n) for k in range(H) for t, n in origins])
+    pred = replay.predict(model, contract, trace, rows, 1)[0]                          # [heads, rows, 45]
+    target = trace["next_state"][rows[:, 0], rows[:, 1]]
+    np.testing.assert_allclose(((pred - target[None]) ** 2).mean(-1).mean(0).reshape(H, -1), real["se_norm"], rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(((pred - target[None])[..., :3] ** 2).mean(-1).mean(0).reshape(H, -1), real["se_vel"], rtol=1e-4, atol=1e-6)
+    imag = c0.imagined_pass(model, contract, trace, origins, H)
+    states = replay.imagined_path(model, contract, trace, origins, H)[0]               # [heads, H, W, 45]
+    np.testing.assert_allclose(imag["own"], states, rtol=1e-4, atol=1e-5)
+    tgt = c0.gather(trace["next_state"], origins, 0, H).transpose(1, 0, 2)
+    np.testing.assert_allclose(imag["se_norm"], ((states - tgt[None]) ** 2).mean(-1), rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(imag["own"].std(axis=0, ddof=1), states.std(axis=0, ddof=1), rtol=1e-4, atol=1e-5)
+
+
+def test_model_set_reads_single_head_models_as_one_ensemble(monkeypatch):
+    ms = [real_model(heads=1, seed=s) for s in range(3)]
+    copies = [copy.deepcopy(m) for m in ms]
+    group = c0.ModelSet(ms)
+    assert group.ensemble_size == 3
+    torch.manual_seed(2)
+    xs, xa = torch.randn(4, 32, 45), torch.randn(4, 32, 12)
+    group.reset()
+    for m in copies:
+        m.reset()
+    means, contacts, terms = c0.forward_all(group, xs, xa)
+    assert means.shape == (3, 4, 45) and contacts.shape == (3, 4, 8) and terms.shape == (3, 4, 1)
+    for i, m in enumerate(copies):
+        torch.testing.assert_close(means[i], m(xs, xa, torch.zeros((1, 4, 1), dtype=torch.long))[0])
+    contract, trace = identity_contract(), random_trace()
+    origins, _ = c0.fall_windows(trace)
+    out = c0.imagined_pass(group, contract, trace, origins, 6)
+    assert out["spread"].shape == (3, 6, len(origins), 45) and np.isfinite(out["spread"]).all()
+    import analyse_transition_fidelity as fidelity
+    stats = {0: identity_contract(), 1: identity_contract(), 2: identity_contract()}
+    stats[2].statistics["state_std"] = torch.full((45,), 2.0)
+    monkeypatch.setattr(fidelity, "load_model", lambda p: (real_model(heads=1), stats[int(Path(p).stem[-1])]))
+    model, contract, paths = c0.load_models("m0.pt,m1.pt")
+    assert isinstance(model, c0.ModelSet) and len(paths) == 2
+    with pytest.raises(ValueError, match="different normalization"):
+        c0.load_models("m0.pt,m2.pt")
+
+
+def test_cold_context_changes_the_imagined_arm_only():
+    model, contract, trace = real_model(), identity_contract(), random_trace()
+    origins, _ = c0.fall_windows(trace)
+    warm = c0.imagined_pass(model, contract, trace, origins, 4)
+    same = c0.imagined_pass(model, contract, trace, origins, 4, context=32)
+    cold = c0.imagined_pass(model, contract, trace, origins, 4, context=1)
+    np.testing.assert_array_equal(warm["spread"], same["spread"])
+    assert np.abs(cold["spread"] - warm["spread"]).max() > 1e-4
+    for bad in (0, 33):
+        with pytest.raises(ValueError):
+            c0.imagined_pass(model, contract, trace, origins, 4, context=bad)
+
+
+def test_head_subsets_spread_and_membership():
+    subsets = c0.make_subsets(5, (2, 5, 10), n=7, seed=0)
+    assert set(subsets) == {2} and subsets[2].shape == (7, 2)
+    means = torch.randn(5, 3, 45)
+    got = c0.subset_spread(means, subsets)[2]
+    for j, idx in enumerate(subsets[2]):
+        np.testing.assert_allclose(got[j], means[torch.from_numpy(idx)].std(0).sum(-1).numpy(), rtol=1e-6)
+    model, contract, trace = real_model(), identity_contract(), random_trace()
+    origins, _ = c0.fall_windows(trace)
+    imag = c0.imagined_pass(model, contract, trace, origins, c0.HORIZON, subsets=subsets)
+    sub = imag["subsets"][2]                                                            # [n, heads, D, W]
+    for j, idx in enumerate(subsets[2]):
+        for h in range(5):
+            assert np.isfinite(sub[j, h]).all() == (h in idx)
+
+
+def test_summary_with_cold_context_and_subsets(tmp_path, monkeypatch):
+    import analyse_transition_fidelity as fidelity
+    model, contract = real_model(), identity_contract()
+    monkeypatch.setattr(fidelity, "load_model", lambda path: (model, contract))
+    p = tmp_path / "t.npz"
+    np.savez(p, **random_trace())
+    wm = tmp_path / "wm.pt"
+    wm.write_bytes(b"x")
+    report, _ = c0.run(wm, [("src", p)], tmp_path / "cold", n_boot=100, context=1, head_subsets=(2,))
+    pooled = report["pooled"]
+    assert pooled["hr0_check"]["passed"] is None and "not applicable" in pooled["hr0_check"]["note"]
+    assert set(pooled["fall"]["c8"]) == {"K2", "K_all"} and pooled["fall"]["c8"]["K_all"]["heads"] == 5
+    assert pooled["fall"]["c1a"]["ratio"] > 0 and "d25" in pooled["fall"]["errors"]
+    with np.load(tmp_path / "cold" / "c0_windows.npz") as arrays:
+        assert {"meta/state_std", "src/fall/u_member", "src/fall/se_imag_vel", "src/fall/sub_imag_K2"} <= set(arrays.files)
+    monkeypatch.setattr(sys, "argv", ["c0", "--wm", str(wm), "--trace", f"a={p}", "--out", str(tmp_path / "x"),
+                                      "--head-subsets", "two"])
+    with pytest.raises(SystemExit):
+        c0.main()
