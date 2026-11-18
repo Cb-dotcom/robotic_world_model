@@ -179,6 +179,12 @@ def test_reproduction_check_tolerance_and_hashes():
     assert ok["passed"] and ok["same_input_hashes"]
     bad = c0.reproduction_check(report(9.78, 5.11 * 1.06, 2.66, w="z"), old)
     assert not bad["passed"] and not bad["same_input_hashes"]
+    # numbers within tolerance but another model or trace: the gate fails (review 18 Nov, second round)
+    other = c0.reproduction_check(report(9.78, 5.11, 2.66, w="z"), old)
+    assert other["numbers_within_tolerance"] and not other["same_input_hashes"] and not other["passed"]
+    no_hash = report(9.78, 5.11, 2.66)
+    no_hash.pop("trace_sha256")
+    assert not c0.reproduction_check(no_hash, old)["passed"]
     assert bad["rows"]["imagined_step1"]["rel_diff"] == pytest.approx(.06)
 
 
@@ -393,15 +399,46 @@ def test_pair_bootstrap_resamples_pairs_jointly():
     f = rng.normal(1.0, 0.3, 40)
     n = 0.5 * f + rng.normal(0, 0.05, 40)                  # matched partner, not an exact copy
     strata = np.array(["a"] * 25 + ["b"] * 15)
-    bf, bn = c0.pair_bootstrap(f, n, strata, 3000, 0)
+    fc = np.array([f"{s}/f{i}" for i, s in enumerate(strata)])
+    nc = np.array([f"{s}/n{i}" for i, s in enumerate(strata)])  # no shared episode: components = pairs
+    bf, bn = c0.pair_bootstrap(f, n, strata, fc, nc, 3000, 0)
     lo, hi = c0.ci(bf / bn)
     assert hi - lo > 1e-3                                  # not a degenerate zero-width interval
     assert lo < f.mean() / n.mean() < hi
-    # one draw with a known index set: both groups use the same pairs
-    bf1, bn1 = c0.pair_bootstrap(np.arange(4.0), 10 * np.arange(4.0), np.array(["s"] * 4), 1, 3)
+    # one draw: both groups use the same pairs
+    one = np.array(["s"] * 4)
+    bf1, bn1 = c0.pair_bootstrap(np.arange(4.0), 10 * np.arange(4.0), one, [f"s/f{i}" for i in range(4)],
+                                 [f"s/n{i}" for i in range(4)], 1, 3)
     assert bn1[0] == pytest.approx(10 * bf1[0])
     with pytest.raises(ValueError):
-        c0.pair_bootstrap(f, n[:-1], strata, 10, 0)
+        c0.pair_bootstrap(f, n[:-1], strata, fc, nc[:-1], 10, 0)
+
+
+def test_pair_components_join_shared_episodes_transitively():
+    # pairs 0 and 1 share non-fall episode x; pair 2's non-fall episode is pair 1's fall episode; pair 3 alone
+    lab = c0.pair_components(["s/a", "s/b", "s/c", "s/d"], ["s/x", "s/x", "s/b", "s/y"])
+    assert lab[0] == lab[1] == lab[2] and lab[3] != lab[0]
+    # one component only: every draw is the full sample, so the interval has zero width
+    bf, bn = c0.pair_bootstrap(np.array([1.0, 2, 3]), np.array([1.0, 1, 1]), np.array(["s"] * 3),
+                               ["s/a", "s/b", "s/c"], ["s/x", "s/x", "s/b"], 200, 0)
+    assert np.ptp(bf) == 0 and bf[0] == pytest.approx(2.0)
+    with pytest.raises(ValueError, match="crosses sources"):
+        c0.pair_bootstrap(np.ones(2), np.ones(2), np.array(["a", "b"]), ["e1", "e2"], ["e3", "e3"], 10, 0)
+
+
+def test_pair_bootstrap_widens_when_nonfall_episodes_are_shared():
+    # 40 pairs; non-fall windows come from 4 episodes with strong episode effects (10 windows each)
+    rng = np.random.default_rng(1)
+    f = rng.normal(2.0, 0.1, 40)
+    ep = np.repeat(np.arange(4), 10)
+    n = np.array([0.4, 0.8, 1.2, 1.6])[ep] + rng.normal(0, 0.02, 40)
+    st = np.array(["s"] * 40)
+    fc = [f"s/f{i}" for i in range(40)]
+    shared = [f"s/n{e}" for e in ep]
+    indep = [f"s/n{i}" for i in range(40)]
+    w_shared = np.ptp(c0.ci(np.divide(*c0.pair_bootstrap(f, n, st, fc, shared, 4000, 0))))
+    w_indep = np.ptp(c0.ci(np.divide(*c0.pair_bootstrap(f, n, st, fc, indep, 4000, 0))))
+    assert w_shared > 2 * w_indep
 
 
 def test_zero_disagreement_stops():

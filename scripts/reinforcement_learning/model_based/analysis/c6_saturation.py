@@ -9,7 +9,8 @@ recomputed from the weights (PyTorch order r, z, n):
 and a unit is saturated when |pre-activation| > 3. Reported per depth d (row t + d): saturated share per
 gate and layer, and the normalized input magnitude (gravity dims, all dims). Pre-fall rows = d 16..25.
 Rule (plan §2): saturation association supported if saturation on pre-fall rows >= 2x walking (matched
-non-fall windows, same rows; ratio CI from jointly resampled matched pairs) with the ratio CI excluding 1, and H concentrates in gravity (gravity H(25)
+non-fall windows, same rows; ratio CI from an episode-cluster bootstrap of matched pairs) with the ratio CI
+excluding 1, and H concentrates in gravity (gravity H(25)
 CI above every other component's H, from the run's c0 report). An association only; the widened-normalizer
 refit is the intervention (plan §11 #7).
 """
@@ -110,7 +111,7 @@ def analyse(model, contract, run_dir, traces, n_boot=10_000, seed=0):
         overall = pre.mean(axis=(1, 2))                                                 # [2 trunks, W]
         point, boot = cluster_bootstrap(np.column_stack([overall.T, grav[:, PRE_FALL].mean(1)]), cl, st, n_boot, seed)
         boots[kind] = boot
-        paired[kind] = (overall.T, st)
+        paired[kind] = (overall.T, st, cl)
         res[kind] = dict(
             windows=int(len(cl)),
             pre_fall_saturation={"state_trunk": float(point[0]), "auxiliary_trunk": float(point[1])},
@@ -122,8 +123,9 @@ def analyse(model, contract, run_dir, traces, n_boot=10_000, seed=0):
                            for ti, trunk in enumerate(("state", "auxiliary")) for l in range(sat.shape[1])
                            for gi, g in enumerate(("reset", "update", "candidate"))})
     ratio = {}
-    # matched pairs resampled jointly (review 18 Nov), stratified by source
-    pf, pn = pair_bootstrap(paired["fall"][0], paired["nonfall"][0], paired["fall"][1], n_boot, seed)
+    # matched pairs resampled by episode component (review 18 Nov, two rounds), stratified by source
+    pf, pn = pair_bootstrap(paired["fall"][0], paired["nonfall"][0], paired["fall"][1], paired["fall"][2],
+                            paired["nonfall"][2], n_boot, seed)
     for ti, trunk in enumerate(("state_trunk", "auxiliary_trunk")):
         f, n = res["fall"]["pre_fall_saturation"][trunk], res["nonfall"]["pre_fall_saturation"][trunk]
         rb = pf[:, ti] / np.where(pn[:, ti] == 0, np.nan, pn[:, ti])

@@ -381,27 +381,66 @@ def cluster_bootstrap(values, clusters, strata, n_boot=10_000, seed=0):
     return point.reshape(shape), boot.reshape((n_boot,) + shape)
 
 
-def pair_bootstrap(fall_values, nonfall_values, strata, n_boot=10_000, seed=0):
-    """Joint resampling of matched pairs (fall window i with its matched non-fall window i), stratified by
-    source: the same draw picks both members of a pair. Each fall window is its own episode, so pairs are the
-    clusters on the fall side; non-fall windows that share an episode across pairs stay a stated limit.
+def pair_components(fall_clusters, nonfall_clusters):
+    """Cluster label per matched pair. Pairs that share an episode on either side (two non-fall windows from
+    one episode, or a non-fall window from the episode of another pair's fall) are joined, transitively
+    (union-find over episode ids). Returns integer labels [P] (review 18 Nov, second round: 206 non-fall
+    windows came from 128 episodes, so pairs were not independent)."""
+    fc, nc = np.asarray(fall_clusters).astype(str), np.asarray(nonfall_clusters).astype(str)
+    if fc.shape != nc.shape:
+        raise ValueError("fall and non-fall clusters must be paired (same shape)")
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in zip(fc, nc):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    _, labels = np.unique([find(a) for a in fc], return_inverse=True)
+    return labels.astype(int)
+
+
+def pair_bootstrap(fall_values, nonfall_values, strata, fall_clusters, nonfall_clusters, n_boot=10_000, seed=0):
+    """Episode-cluster bootstrap of matched pairs, stratified by source. The resampling unit is a pair
+    component (pair_components): every pair that shares an episode with another pair, on either side, is
+    drawn together with it, and both members of a pair are always drawn together. Means are ratio estimators
+    (sum over drawn pairs / number of drawn pairs), as in cluster_bootstrap.
     Returns the bootstrap means of both groups [n_boot(, K)] each."""
     f, n = np.asarray(fall_values, float), np.asarray(nonfall_values, float)
     if f.shape != n.shape:
         raise ValueError("fall and non-fall values must be paired (same shape)")
+    strata = np.asarray(strata)
+    comp = pair_components(fall_clusters, nonfall_clusters)
+    if len(comp) != len(f) or len(strata) != len(f):
+        raise ValueError("values, strata and clusters must have one entry per pair")
+    for c in np.unique(comp):
+        if len(np.unique(strata[comp == c])) != 1:
+            raise ValueError("a pair component crosses sources; cluster ids must include the source name")
     flat_f, flat_n = f.reshape(len(f), -1), n.reshape(len(n), -1)
     rng = np.random.default_rng(seed)
     sum_f = np.zeros((n_boot, flat_f.shape[1]))
     sum_n = np.zeros((n_boot, flat_n.shape[1]))
-    count = 0
+    cnt = np.zeros(n_boot)
     for s in np.unique(strata):
         idx = np.flatnonzero(strata == s)
-        draw = idx[rng.integers(0, len(idx), size=(n_boot, len(idx)))]
-        sum_f += flat_f[draw].sum(axis=1)
-        sum_n += flat_n[draw].sum(axis=1)
-        count += len(idx)
+        keys, inv = np.unique(comp[idx], return_inverse=True)
+        sf = np.zeros((len(keys), flat_f.shape[1]))
+        sn = np.zeros((len(keys), flat_n.shape[1]))
+        np.add.at(sf, inv, flat_f[idx])
+        np.add.at(sn, inv, flat_n[idx])
+        k = np.bincount(inv, minlength=len(keys)).astype(float)
+        draw = rng.integers(0, len(keys), size=(n_boot, len(keys)))
+        sum_f += sf[draw].sum(axis=1)
+        sum_n += sn[draw].sum(axis=1)
+        cnt += k[draw].sum(axis=1)
     shape = f.shape[1:]
-    return (sum_f / count).reshape((n_boot,) + shape), (sum_n / count).reshape((n_boot,) + shape)
+    return (sum_f / cnt[:, None]).reshape((n_boot,) + shape), (sum_n / cnt[:, None]).reshape((n_boot,) + shape)
 
 
 def ci(boot):
@@ -436,9 +475,12 @@ def reproduction_check(new, old, tolerance=REPRO_TOLERANCE):
                 "imagined_step25": imag[24]["uncertainty_mean"]}
     a, b = pick(new), pick(old)
     rows = {k: dict(old=b[k], new=a[k], rel_diff=abs(a[k] / b[k] - 1)) for k in a}
-    same_inputs = new.get("trace_sha256") == old.get("trace_sha256") and new.get("wm_sha256") == old.get("wm_sha256")
-    return dict(rows=rows, same_input_hashes=bool(same_inputs),
-                passed=bool(all(r["rel_diff"] <= tolerance for r in rows.values())), tolerance=tolerance)
+    keys = ("trace_sha256", "wm_sha256")
+    same_inputs = all(new.get(k) and old.get(k) and new[k] == old[k] for k in keys)   # missing hash = not the same
+    within = all(r["rel_diff"] <= tolerance for r in rows.values())
+    return dict(rows=rows, same_input_hashes=bool(same_inputs), numbers_within_tolerance=bool(within),
+                passed=bool(within and same_inputs), tolerance=tolerance,
+                rule="numbers within tolerance AND identical trace and model hashes (review 18 Nov, second round)")
 
 
 # ---------------------------------------------------------------- battery
@@ -515,7 +557,7 @@ def summarize(sources, n_boot, seed, context=HISTORY, feedback="head"):
     d25, s_idx = DEPTHS.index(25), list(COMPONENTS).index("sum")
     for scope in ["pooled"] + names:
         use = names if scope == "pooled" else [scope]
-        block, boots, c5_parts, pair_vals, pair_strata = {}, {}, {}, {}, {}
+        block, boots, c5_parts, pair_vals, pair_strata, pair_clusters = {}, {}, {}, {}, {}, {}
         for kind in ("fall", "nonfall"):
             cat = lambda key, axis: np.concatenate([sources[s][kind][key] for s in use], axis=axis)
             u_real, u_imag, u_mem = cat("u_real", 1), cat("u_imag", 2), cat("u_member", 1)
@@ -526,6 +568,7 @@ def summarize(sources, n_boot, seed, context=HISTORY, feedback="head"):
             boots[kind] = boot
             pair_vals[kind] = lr[25, :, list(COMPONENTS).index("sum")]
             pair_strata[kind] = strata
+            pair_clusters[kind] = clusters
             rows = {}
             for di, d in enumerate(DEPTHS):
                 for ci_, c in enumerate(COMPONENTS):
@@ -584,13 +627,17 @@ def summarize(sources, n_boot, seed, context=HISTORY, feedback="head"):
             cov_after[f"d{d}"] = dict(fall=float((r_f[:, d] <= s_d).mean()), nonfall=float((r_n[:, d] <= s_d).mean()))
         block["c5_scale"] = dict(s=scale, coverage_after=cov_after,
                                  rule="coverage < 30 % brought to 55-80 % by s(d) -> separate scale defect; "
-                                      "Spearman < 0.5 -> scale is not the cause")
-        # fall / non-fall ratio: joint resampling of matched pairs (review 18 Nov: separate same-seed
-        # resampling coupled unrelated episodes)
-        pf, pn = pair_bootstrap(pair_vals["fall"], pair_vals["nonfall"], pair_strata["fall"], n_boot, seed)
+                                      "Spearman < 0.5 -> separate ranking defect. Neither test shows whether "
+                                      "scale causes healing (review 18 Nov)")
+        # fall / non-fall ratio: episode-cluster bootstrap of matched pairs (review 18 Nov: first separate
+        # same-seed resampling, then pairs sharing a non-fall episode treated as independent)
+        pf, pn = pair_bootstrap(pair_vals["fall"], pair_vals["nonfall"], pair_strata["fall"],
+                                pair_clusters["fall"], pair_clusters["nonfall"], n_boot, seed)
         block["c0_rule_d25_sum"] = c0_verdict(-block["fall"]["rows"]["d25/sum"]["HI"], -pf,
                                               -block["nonfall"]["rows"]["d25/sum"]["HI"], -pn)
-        block["c0_rule_d25_sum"]["resampling"] = "matched pairs, stratified by source"
+        block["c0_rule_d25_sum"]["resampling"] = "matched pairs, episode components, stratified by source"
+        block["c0_rule_d25_sum"]["pair_components"] = int(len(np.unique(pair_components(
+            pair_clusters["fall"], pair_clusters["nonfall"]))))
         hr0 = {k: block[k]["rows"]["d0/sum"]["HR"] for k in ("fall", "nonfall")}
         block["hr0_check"] = dict(HR0_fall=hr0["fall"], HR0_nonfall=hr0["nonfall"],
                                   passed=bool(all(0.9 <= v <= 1.1 for v in hr0.values())) if context == HISTORY else None,
