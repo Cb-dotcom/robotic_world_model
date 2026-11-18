@@ -33,7 +33,12 @@ Cause-test outputs (plan §2), stored per window in c0_windows.npz and read by c
   (independent trunks; each model keeps its own memory, all see the same inputs);
 * C7: --imag-context K starts imagination from the last K real rows (cold memory: K = 1);
   the real-context arm keeps 32 rows, so HR(0) is no longer 1 by construction;
-* C8: --head-subsets 2,5,10 adds the healing index of 50 random head subsets per size.
+* C8: --head-subsets 2,5,10 adds the healing index of 50 random head subsets per size;
+* C5 / C9: --feedback head (default) | sampled (mean + aleatoric std x N(0,1)) | random_step | mean |
+  most_tilted chooses the state fed back in imagination; the report gives the share of paths that reach
+  the fall (termination > 0.5 anywhere; tilt >= 30 deg), aleatoric sigma by depth, 1-sigma coverage
+  of |error| by the head spread, the scale s(d) fitted on non-falls and the fall coverage after it,
+  and the Spearman of spread vs error by depth.
 """
 from __future__ import annotations
 
@@ -81,15 +86,17 @@ def _forward_one(model, xs, xa):
 
     Same calls in the same order as the library forward (state trunk, state heads, auxiliary trunk,
     auxiliary heads), so the hidden states advance exactly as in `model(xs, xa, ids)`.
-    Returns means [heads, B, 45], contact logits [heads, B, 8], termination logits [heads, B, 1].
+    Returns means [heads, B, 45], contact logits [heads, B, 8], termination logits [heads, B, 1],
+    aleatoric stds [heads, B, 45] (normalized units).
     """
     base = model.state_base(xs, xa)
-    means = []
+    means, stds = [], []
     for head in model.state_heads:
-        mean, _ = head(base, xs)
+        mean, std = head(base, xs)
         if model.prediction_type == "sequence":
-            mean = mean[:, -1]
+            mean, std = mean[:, -1], std[:, -1]
         means.append(mean)
+        stds.append(std)
     aux = model.auxiliary_base(xs, xa)
     contacts, terms = [], []
     for head in model.auxiliary_heads:
@@ -98,7 +105,7 @@ def _forward_one(model, xs, xa):
             contact, term = contact[:, -1], term[:, -1]
         contacts.append(contact)
         terms.append(term)
-    return torch.stack(means), torch.stack(contacts), torch.stack(terms)
+    return torch.stack(means), torch.stack(contacts), torch.stack(terms), torch.stack(stds)
 
 
 def head_spread(means):
@@ -139,64 +146,102 @@ def real_context_pass(model, contract, data, origins, horizon, subsets=None, bat
     stats = contract.statistics
     rows = np.asarray([(t + k, n) for k in range(horizon) for t, n in origins], dtype=int).reshape(-1, 2)
     target = (torch.from_numpy(data["next_state"][rows[:, 0], rows[:, 1]]).float() - stats["state_mean"]) / stats["state_std"]
-    spread, se_n, se_v, sub = [], [], [], {k: [] for k in (subsets or {})}
+    spread, sigma, se_n, se_v, sub = [], [], [], [], {k: [] for k in (subsets or {})}
     for b in range(0, len(rows), batch):
         chunk = rows[b:b + batch]
         model.reset()
-        means, _, _ = forward_all(model, _normalized(contract, data, chunk, -31, 1, "state"),
-                                  _normalized(contract, data, chunk, -31, 1, "action"))
+        means, _, _, stds = forward_all(model, _normalized(contract, data, chunk, -31, 1, "state"),
+                                        _normalized(contract, data, chunk, -31, 1, "action"))
         spread.append(head_spread(means).numpy())
+        sigma.append(stds.sum(-1).mean(0).numpy())
         n_err, v_err = _errors(means, target[b:b + batch][None], stats)
         se_n.append(n_err.mean(0))
         se_v.append(v_err.mean(0))
         for k, v in subset_spread(means, subsets or {}).items():
             sub[k].append(v)
     W = len(origins)
-    out = dict(spread=np.concatenate(spread).reshape(horizon, W, -1),
+    out = dict(spread=np.concatenate(spread).reshape(horizon, W, -1), sigma=np.concatenate(sigma).reshape(horizon, W),
                se_norm=np.concatenate(se_n).reshape(horizon, W), se_vel=np.concatenate(se_v).reshape(horizon, W))
     depths = [d for d in DEPTHS if d < horizon]
     out["subsets"] = {k: np.concatenate(v, axis=1).reshape(len(v[0]), horizon, W)[:, depths] for k, v in sub.items()}
     return out
 
 
+FEEDBACK = ("head", "random_step", "mean", "most_tilted", "sampled")
+GRAVITY = slice(6, 9)
+
+
 @torch.no_grad()
-def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subsets=None):
-    """Imagination driven by each head's own mean, started from the last `context` real rows.
-    Returns spread [heads, H, W, 45] (shared-path disagreement), own [heads, H, W, 45] (the driving
-    head's normalized state), stop [heads, H, W], se_norm / se_vel [heads, H, W] and subset spreads
-    {K: [n, heads, len(DEPTHS), W]} at DEPTHS."""
+def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subsets=None, feedback="head", seed=0):
+    """Imagination started from the last `context` real rows; the state fed back at each step depends on
+    `feedback` (plan C5, C9):
+      head         each head drives its own path with its mean (RWM-U imagination; one path per head)
+      random_step  a new random head at every step (one path per seed, as many paths as heads)
+      mean         the ensemble mean (one path)
+      most_tilted  the head whose state is most tilted (largest gravity x-y norm, physical units; one path)
+      sampled      each head's mean + its aleatoric std x N(0, 1) (one path per head)
+    Per path p: spread [P, H, W, 45] (disagreement of all heads on that path), own [P, H, W, 45] (fed
+    state, normalized), stop [P, H, W] (driving head, or the ensemble mean probability for mean,
+    most_tilted and random_step), se_norm / se_vel [P, H, W] (fed state vs target), sigma [P, H, W]
+    (aleatoric std summed over dims, mean over heads), ratio [P, H, W, 45] = |fed - target| / spread
+    (for 1-sigma coverage), tilt [P, H, W] (fed gravity x-y norm), and subset spreads at DEPTHS."""
     if not 1 <= context <= HISTORY:
         raise ValueError(f"context must be 1..{HISTORY}")
+    if feedback not in FEEDBACK:
+        raise ValueError(f"feedback must be one of {FEEDBACK}")
     stats = contract.statistics
     states = _normalized(contract, data, origins, -31, 1, "state")[:, HISTORY - context:]
     actions = _normalized(contract, data, origins, -31, horizon, "action")
     target = (torch.from_numpy(gather(data["next_state"], origins, 0, horizon)).float()
               - stats["state_mean"]) / stats["state_std"]                                   # [W, H, 45]
     depths = [d for d in DEPTHS if d < horizon]
-    spread, own, stop, se_n, se_v = [], [], [], [], []
-    sub = {k: np.full((len(idx), model.ensemble_size, len(depths), len(origins)), np.nan)
-           for k, idx in (subsets or {}).items()}
-    for h in range(model.ensemble_size):
+    heads = model.ensemble_size
+    paths = 1 if feedback in ("mean", "most_tilted") else heads
+    gstd, gmean = stats["state_std"][GRAVITY], stats["state_mean"][GRAVITY]
+    keys = ("spread", "own", "stop", "se_norm", "se_vel", "sigma", "ratio", "tilt")
+    acc = {k: [] for k in keys}
+    sub = {k: np.full((len(idx), paths, len(depths), len(origins)), np.nan) for k, idx in (subsets or {}).items()}
+    for p in range(paths):
+        rng = torch.Generator().manual_seed(seed * 1000 + p)
         model.reset()
         xs, xa = states, actions[:, HISTORY - context:HISTORY]
-        sp, ow, st, en, ev = [], [], [], [], []
+        rec = {k: [] for k in keys}
         for k in range(horizon):
-            means, _, terms = forward_all(model, xs, xa)
-            sp.append(head_spread(means).numpy())
-            ow.append(means[h].numpy())
-            st.append(torch.sigmoid(terms[h]).squeeze(-1).numpy())
-            n_err, v_err = _errors(means[h], target[:, k], stats)
-            en.append(n_err)
-            ev.append(v_err)
+            means, _, terms, stds = forward_all(model, xs, xa)
+            probs = torch.sigmoid(terms).squeeze(-1)                                           # [heads, B]
+            if feedback == "head":
+                fed, stop = means[p], probs[p]
+            elif feedback == "sampled":
+                fed = means[p] + stds[p] * torch.randn(means[p].shape, generator=rng)
+                stop = probs[p]
+            elif feedback == "random_step":
+                pick = torch.randint(heads, (means.shape[1],), generator=rng)
+                fed, stop = means[pick, torch.arange(means.shape[1])], probs.mean(0)
+            elif feedback == "mean":
+                fed, stop = means.mean(0), probs.mean(0)
+            else:                                                                               # most_tilted
+                tilt_h = torch.linalg.norm((means[..., GRAVITY] * gstd + gmean)[..., :2], dim=-1)  # [heads, B]
+                fed, stop = means[tilt_h.argmax(0), torch.arange(means.shape[1])], probs.mean(0)
+            spread = head_spread(means)
+            rec["spread"].append(spread.numpy())
+            rec["own"].append(fed.numpy())
+            rec["stop"].append(stop.numpy())
+            n_err, v_err = _errors(fed, target[:, k], stats)
+            rec["se_norm"].append(n_err)
+            rec["se_vel"].append(v_err)
+            rec["sigma"].append(stds.sum(-1).mean(0).numpy())
+            rec["ratio"].append(((fed - target[:, k]).abs() / spread.clamp_min(1e-12)).numpy())
+            rec["tilt"].append(torch.linalg.norm((fed[:, GRAVITY] * gstd + gmean)[:, :2], dim=-1).numpy())
             if k in depths:
                 for K, v in subset_spread(means, subsets or {}).items():
-                    member = (subsets[K] == h).any(axis=1)          # only subsets that contain the driving head
-                    sub[K][member, h, depths.index(k)] = v[member]
-            xs, xa = means[h][:, None], actions[:, HISTORY + k:HISTORY + k + 1]
-        for acc, val in zip((spread, own, stop, se_n, se_v), (sp, ow, st, en, ev)):
-            acc.append(np.stack(val))
-    return dict(spread=np.stack(spread), own=np.stack(own), stop=np.stack(stop),
-                se_norm=np.stack(se_n), se_vel=np.stack(se_v), subsets=sub)
+                    member = (subsets[K] == p).any(axis=1) if feedback in ("head", "sampled") else np.ones(len(v), bool)
+                    sub[K][member, p, depths.index(k)] = v[member]
+            xs, xa = fed[:, None], actions[:, HISTORY + k:HISTORY + k + 1]
+        for key in keys:
+            acc[key].append(np.stack(rec[key]))
+    out = {k: np.stack(v) for k, v in acc.items()}
+    out["subsets"] = sub
+    return out
 
 
 def real_context_spread(model, contract, data, origins, horizon, batch=256):
@@ -342,7 +387,7 @@ def reproduction_check(new, old, tolerance=REPRO_TOLERANCE):
 
 
 # ---------------------------------------------------------------- battery
-def battery_source(model, contract, name, trace, seed, context=HISTORY, subsets=None):
+def battery_source(model, contract, name, trace, seed, context=HISTORY, subsets=None, feedback="head"):
     data = {k: trace[k] for k in ("state", "action", "next_state", "command", "done", "terminated", "time_out")}
     falls, counts = fall_windows(data)
     if not len(falls):
@@ -353,10 +398,16 @@ def battery_source(model, contract, name, trace, seed, context=HISTORY, subsets=
     out = {}
     for kind, origins in (("fall", falls), ("nonfall", nonfalls)):
         real = real_context_pass(model, contract, data, origins, HORIZON, subsets)
-        imag = imagined_pass(model, contract, data, origins, HORIZON, context, subsets)
+        imag = imagined_pass(model, contract, data, origins, HORIZON, context, subsets, feedback, seed)
         first = np.abs(imag["spread"][:, 0] - real["spread"][None, 0]).max()
+        stats = contract.statistics
+        target = (gather(data["next_state"], origins, 0, HORIZON).transpose(1, 0, 2)
+                  - stats["state_mean"].numpy()) / stats["state_std"].numpy()
+        member = imag["own"].std(axis=0, ddof=1) if imag["own"].shape[0] > 1 else np.full(imag["own"].shape[1:], np.nan)
         out[kind] = dict(origins=origins, u_real=real["spread"], u_imag=imag["spread"],
-                         u_member=imag["own"].std(axis=0, ddof=1), stop=imag["stop"],
+                         u_member=member, stop=imag["stop"], own=imag["own"].astype(np.float32),
+                         target=target.astype(np.float32), sigma_real=real["sigma"], sigma_imag=imag["sigma"],
+                         ratio=imag["ratio"].astype(np.float32), tilt=imag["tilt"],
                          se_real_norm=real["se_norm"], se_real_vel=real["se_vel"],
                          se_imag_norm=imag["se_norm"], se_imag_vel=imag["se_vel"],
                          sub_real=real["subsets"], sub_imag=imag["subsets"],
@@ -375,16 +426,16 @@ def spearman(a, b):
     return float(np.corrcoef(ra, rb)[0, 1]) if len(a) > 2 else float("nan")
 
 
-def summarize(sources, n_boot, seed, context=HISTORY):
+def summarize(sources, n_boot, seed, context=HISTORY, feedback="head"):
     """HI/H/HR and u_real/u_imag per kind, component and depth, pooled and per source; errors;
     C1a member spread; C8 subsets."""
     report = {"depth_definition": BINS_NOTE, "depths": list(DEPTHS), "components": list(COMPONENTS),
-              "imag_context": context}
+              "imag_context": context, "feedback": feedback}
     names = list(sources)
     d25, s_idx = DEPTHS.index(25), list(COMPONENTS).index("sum")
     for scope in ["pooled"] + names:
         use = names if scope == "pooled" else [scope]
-        block, boots = {}, {}
+        block, boots, c5_parts = {}, {}, {}
         for kind in ("fall", "nonfall"):
             cat = lambda key, axis: np.concatenate([sources[s][kind][key] for s in use], axis=axis)
             u_real, u_imag, u_mem = cat("u_real", 1), cat("u_imag", 2), cat("u_member", 1)
@@ -425,8 +476,29 @@ def summarize(sources, n_boot, seed, context=HISTORY):
                 c8[f"K{K}"] = dict(HR_mean=float(np.exp(his).mean()), HR_p10=float(np.percentile(np.exp(his), 10)),
                                    HR_p90=float(np.percentile(np.exp(his), 90)), subsets=int(len(his)))
             c8["K_all"] = dict(HR_mean=rows["d25/sum"]["HR"], heads=int(u_imag.shape[0]))
+            stop, tilt, ratio = cat("stop", 2), cat("tilt", 2), cat("ratio", 2)
+            sig_r, sig_i = cat("sigma_real", 1), cat("sigma_imag", 2)
+            c5 = dict(reach_termination=float((stop > 0.5).any(axis=1).mean()),
+                      reach_tilt_30deg=float((tilt >= 0.5).any(axis=1).mean()),
+                      sigma={f"d{d}": dict(real=float(sig_r[d].mean()), imagined=float(sig_i[:, d].mean())) for d in DEPTHS},
+                      coverage_raw={f"d{d}": float((ratio[:, d] <= 1).mean()) for d in DEPTHS},
+                      spearman_spread_vs_error={f"d{d}": spearman(u_imag[:, d].sum(-1).mean(0), np.sqrt(se_iv[:, d].mean(0)))
+                                                for d in DEPTHS})
+            c5_parts[kind] = (ratio, u_imag)
             block[kind] = dict(windows=int(len(clusters)), clusters=int(len(np.unique(clusters))), rows=rows,
-                               errors=errors, c1a=c1a, c8=c8)
+                               errors=errors, c1a=c1a, c8=c8, c5=c5)
+        # C5 scale: s(d) = sqrt(sum e^2 / sum u^2) on non-falls, then 1-sigma coverage on falls with u * s(d)
+        r_n, u_n = c5_parts["nonfall"]
+        r_f, _ = c5_parts["fall"]
+        scale, cov_after = {}, {}
+        for d in DEPTHS:
+            e2 = ((r_n[:, d] * u_n[:, d]) ** 2).sum()
+            s_d = float(np.sqrt(e2 / (u_n[:, d] ** 2).sum()))
+            scale[f"d{d}"] = s_d
+            cov_after[f"d{d}"] = dict(fall=float((r_f[:, d] <= s_d).mean()), nonfall=float((r_n[:, d] <= s_d).mean()))
+        block["c5_scale"] = dict(s=scale, coverage_after=cov_after,
+                                 rule="coverage < 30 % brought to 55-80 % by s(d) -> separate scale defect; "
+                                      "Spearman < 0.5 -> scale is not the cause")
         block["c0_rule_d25_sum"] = c0_verdict(-block["fall"]["rows"]["d25/sum"]["HI"], -boots["fall"][:, d25, s_idx],
                                               -block["nonfall"]["rows"]["d25/sum"]["HI"], -boots["nonfall"][:, d25, s_idx])
         hr0 = {k: block[k]["rows"]["d0/sum"]["HR"] for k in ("fall", "nonfall")}
@@ -438,7 +510,8 @@ def summarize(sources, n_boot, seed, context=HISTORY):
 
 
 def text_report(report, repro, counts):
-    lines = ["Plan v6 C0 battery (CPU). " + BINS_NOTE, f"imagination context: {report['imag_context']} rows", ""]
+    lines = ["Plan v6 C0 battery (CPU). " + BINS_NOTE,
+             f"imagination context: {report['imag_context']} rows; feedback: {report.get('feedback', 'head')}", ""]
     if repro is not None:
         lines.append(f"Reproduction of 27 Oct (tolerance {repro['tolerance']:.0%}): "
                      f"{'PASS' if repro['passed'] else 'FAIL'}; same input hashes: {repro['same_input_hashes']}")
@@ -447,7 +520,7 @@ def text_report(report, repro, counts):
         lines.append("")
     for name, c in counts.items():
         lines.append(f"{name}: {c}")
-    for scope in [k for k in report if k not in ("depth_definition", "depths", "components", "imag_context")]:
+    for scope in [k for k in report if k not in ("depth_definition", "depths", "components", "imag_context", "feedback")]:
         b = report[scope]
         lines.append(f"\n== {scope}: falls {b['fall']['windows']} windows / {b['fall']['clusters']} episodes; "
                      f"non-falls {b['nonfall']['windows']} / {b['nonfall']['clusters']}")
@@ -455,6 +528,9 @@ def text_report(report, repro, counts):
         lines.append(f"HR(0) check: fall {h0['HR0_fall']:.4f}, non-fall {h0['HR0_nonfall']:.4f} -> "
                      + (h0["note"] if h0["passed"] is None else ("PASS" if h0["passed"] else "FAIL")))
         lines.append(f"C0 rule (d=25, sum): {b['c0_rule_d25_sum']}")
+        sc = b["c5_scale"]
+        lines.append("C5 scale s(d) from non-falls: " + ", ".join(f"{d} {v:.2f}" for d, v in sc["s"].items())
+                     + "; fall coverage after s(d): " + ", ".join(f"{d} {v['fall']:.3f}" for d, v in sc["coverage_after"].items()))
         for kind in ("fall", "nonfall"):
             k = b[kind]
             lines.append(f"  {kind}: d  component      H [95% CI]            HR      u_real   u_imag")
@@ -474,6 +550,13 @@ def text_report(report, repro, counts):
             lines.append(f"    C1a d=25 ({kind}): member spread {c['member_spread_d25']:.3f} / shared {c['shared_disagreement_d25']:.3f} "
                          f"= {c['ratio']:.2f} [{c['ratio_ci'][0]:.2f}, {c['ratio_ci'][1]:.2f}]; "
                          f"Spearman vs imagined error {c['spearman_member_spread_vs_imag_vel_error_d25']:+.2f}")
+            c5 = k["c5"]
+            lines.append(f"    C5/C9 ({kind}): reach termination {c5['reach_termination']:.3f}, reach tilt>=30deg "
+                         f"{c5['reach_tilt_30deg']:.3f}; sigma real/imag d1 {c5['sigma']['d1']['real']:.3f}/"
+                         f"{c5['sigma']['d1']['imagined']:.3f}, d25 {c5['sigma']['d25']['real']:.3f}/{c5['sigma']['d25']['imagined']:.3f}")
+            lines.append("      1-sigma coverage raw by depth: " + ", ".join(f"{d} {v:.3f}" for d, v in c5["coverage_raw"].items())
+                         + "; Spearman spread vs error: " + ", ".join(
+                             f"{d} {v:+.2f}" if v == v else f"{d} n/a" for d, v in c5["spearman_spread_vs_error"].items()))
             if len(k["c8"]) > 1:
                 lines.append(f"    C8 d=25 ({kind}) HR by head count: " + "; ".join(
                     f"{K} {v['HR_mean']:.3f}" + (f" [{v['HR_p10']:.3f}-{v['HR_p90']:.3f}]" if "HR_p10" in v else "")
@@ -508,7 +591,8 @@ def load_models(spec):
     return ModelSet(m for m, _ in loaded), contract, paths
 
 
-def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=0, context=HISTORY, head_subsets=()):
+def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=0, context=HISTORY, head_subsets=(),
+        feedback="head"):
     import replay_fall_paths as replay
     torch.set_num_threads(4)
     out.mkdir(parents=True, exist_ok=False)
@@ -524,13 +608,13 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
     for name, path in traces:
         with np.load(path, allow_pickle=False) as trace:
             validate_trace(trace)
-            sources[name] = battery_source(model, contract, name, trace, seed, context, subsets)
+            sources[name] = battery_source(model, contract, name, trace, seed, context, subsets, feedback)
         counts[name] = sources[name]["counts"]
         inputs[name] = dict(path=str(path), sha256=sha256(path))
         print(f"[c0] {name}: {counts[name]}", flush=True)
-    report = summarize(sources, n_boot, seed, context)
+    report = summarize(sources, n_boot, seed, context, feedback)
     meta = dict(wm=[str(p) for p in paths], wm_sha256=[sha256(p) for p in paths], heads=model.ensemble_size,
-                inputs=inputs, counts=counts, horizon=HORIZON, history=HISTORY, imag_context=context,
+                inputs=inputs, counts=counts, horizon=HORIZON, history=HISTORY, imag_context=context, feedback=feedback,
                 head_subsets={str(k): v.tolist() for k, v in (subsets or {}).items()},
                 bootstrap=n_boot, seed=seed, analysis_sha256=sha256(__file__),
                 match_features={k: v["match_features"] for k, v in sources.items()},
@@ -544,7 +628,7 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
     for name, src in sources.items():
         for kind in ("fall", "nonfall"):
             for key in ("origins", "u_real", "u_imag", "u_member", "stop", "se_real_norm", "se_real_vel",
-                        "se_imag_norm", "se_imag_vel"):
+                        "se_imag_norm", "se_imag_vel", "own", "target", "sigma_real", "sigma_imag", "ratio", "tilt"):
                 arrays[f"{name}/{kind}/{key}"] = src[kind][key]
             for K, v in src[kind]["sub_real"].items():
                 arrays[f"{name}/{kind}/sub_real_K{K}"] = v
@@ -569,6 +653,8 @@ def main():
     p.add_argument("--repro-json", type=Path, help="27 Oct paired_fall_replay.json")
     p.add_argument("--imag-context", type=int, default=HISTORY, help="real rows that start imagination (C7 cold: 1)")
     p.add_argument("--head-subsets", default="", help="C8: subset sizes, e.g. 2,5,10 (50 random subsets each)")
+    p.add_argument("--feedback", default="head", choices=FEEDBACK,
+                   help="state fed back in imagination (C5 sampled; C9 random_step, mean, most_tilted)")
     p.add_argument("--bootstrap", type=int, default=10_000)
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
@@ -588,7 +674,7 @@ def main():
         if not name or not path or "/" in name:
             p.error(f"bad --trace {item!r}; use NAME=PATH")
         traces.append((name, Path(path)))
-    run(a.wm, traces, a.out, a.repro_trace, a.repro_json, a.bootstrap, a.seed, a.imag_context, sizes)
+    run(a.wm, traces, a.out, a.repro_trace, a.repro_json, a.bootstrap, a.seed, a.imag_context, sizes, a.feedback)
 
 
 if __name__ == "__main__":

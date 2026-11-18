@@ -66,7 +66,7 @@ def test_forward_all_matches_library_forward_over_recurrent_steps():
     m1.reset(); m2.reset()
     for step in range(3):
         mean, _, epi, _, contact, term = m1(xs, xa, ids)
-        means, contacts, terms = c0.forward_all(m2, xs, xa)
+        means, contacts, terms, _ = c0.forward_all(m2, xs, xa)
         torch.testing.assert_close(means[2], mean)
         torch.testing.assert_close(c0.head_spread(means).sum(-1), epi)
         torch.testing.assert_close(contacts[2], contact)
@@ -243,7 +243,7 @@ def test_model_set_reads_single_head_models_as_one_ensemble(monkeypatch):
     group.reset()
     for m in copies:
         m.reset()
-    means, contacts, terms = c0.forward_all(group, xs, xa)
+    means, contacts, terms, stds = c0.forward_all(group, xs, xa)
     assert means.shape == (3, 4, 45) and contacts.shape == (3, 4, 8) and terms.shape == (3, 4, 1)
     for i, m in enumerate(copies):
         torch.testing.assert_close(means[i], m(xs, xa, torch.zeros((1, 4, 1), dtype=torch.long))[0])
@@ -309,3 +309,47 @@ def test_summary_with_cold_context_and_subsets(tmp_path, monkeypatch):
                                       "--head-subsets", "two"])
     with pytest.raises(SystemExit):
         c0.main()
+
+
+def test_feedback_modes():
+    model, contract, trace = real_model(), identity_contract(), random_trace()
+    origins, _ = c0.fall_windows(trace)
+    head = c0.imagined_pass(model, contract, trace, origins, 3)
+    mean = c0.imagined_pass(model, contract, trace, origins, 3, feedback="mean")
+    tilted = c0.imagined_pass(model, contract, trace, origins, 3, feedback="most_tilted")
+    rand = c0.imagined_pass(model, contract, trace, origins, 3, feedback="random_step")
+    s1 = c0.imagined_pass(model, contract, trace, origins, 3, feedback="sampled", seed=1)
+    s1b = c0.imagined_pass(model, contract, trace, origins, 3, feedback="sampled", seed=1)
+    assert mean["own"].shape[0] == tilted["own"].shape[0] == 1 and rand["own"].shape[0] == s1["own"].shape[0] == 5
+    # step 0 sees the same real inputs in every mode
+    np.testing.assert_allclose(mean["own"][0, 0], head["own"][:, 0].mean(0), rtol=1e-5, atol=1e-6)
+    tilt = np.linalg.norm(head["own"][:, 0][..., 6:8], axis=-1)                          # identity normalization
+    pick = tilt.argmax(0)
+    np.testing.assert_allclose(tilted["own"][0, 0], head["own"][pick, 0, np.arange(len(origins))], rtol=1e-5, atol=1e-6)
+    for p in range(5):
+        for w in range(len(origins)):
+            assert any(np.allclose(rand["own"][p, 0, w], head["own"][h, 0, w], atol=1e-6) for h in range(5))
+    np.testing.assert_array_equal(s1["own"], s1b["own"])
+    assert np.abs(s1["own"][:, 0] - head["own"][:, 0]).max() > 1e-4
+    np.testing.assert_allclose(head["ratio"][:, 0] * head["spread"][:, 0], np.abs(head["own"][:, 0] - (
+        c0.gather(trace["next_state"], origins, 0, 3).transpose(1, 0, 2)[None, 0])), rtol=1e-4, atol=1e-5)
+    with pytest.raises(ValueError):
+        c0.imagined_pass(model, contract, trace, origins, 3, feedback="best")
+
+
+def test_single_path_mode_summary_is_json_safe(tmp_path, monkeypatch):
+    import analyse_transition_fidelity as fidelity
+    model, contract = real_model(), identity_contract()
+    monkeypatch.setattr(fidelity, "load_model", lambda path: (model, contract))
+    p = tmp_path / "t.npz"
+    np.savez(p, **random_trace())
+    wm = tmp_path / "wm.pt"
+    wm.write_bytes(b"x")
+    report, _ = c0.run(wm, [("src", p)], tmp_path / "mean", n_boot=50, feedback="mean")
+    pooled = report["pooled"]
+    assert set(pooled["c5_scale"]["s"]) == {f"d{d}" for d in c0.DEPTHS}
+    assert 0 <= pooled["fall"]["c5"]["reach_termination"] <= 1
+    saved = json.loads((tmp_path / "mean" / "c0_report.json").read_text())
+    assert saved["meta"]["feedback"] == "mean" and saved["report"]["pooled"]["fall"]["c1a"]["ratio"] is None
+    with np.load(tmp_path / "mean" / "c0_windows.npz") as z:
+        assert z["src/fall/ratio"].shape == (1, 26, 2, 45) and z["src/fall/target"].shape == (26, 2, 45)

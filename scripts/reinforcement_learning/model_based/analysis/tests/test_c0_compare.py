@@ -97,3 +97,17 @@ def test_same_model_twice_gives_zero_closure(tmp_path, monkeypatch):
     assert r["dlog_u_real"] == pytest.approx(0, abs=1e-9) and r["se_real_change"] == pytest.approx(0, abs=1e-9)
     if r["closure"] is not None:
         assert r["closure"] == pytest.approx(0, abs=1e-9)
+
+
+def test_reach_ratio(tmp_path):
+    c = write_run(tmp_path / "c")
+    t = write_run(tmp_path / "t")
+    z = dict(np.load(t / "c0_windows.npz"))
+    z["s/fall/stop"][:, 5, :2] = 0.9                       # treatment: 2 of 4 windows reach the fall on every path
+    np.savez(t / "c0_windows.npz", **z)
+    zc = dict(np.load(c / "c0_windows.npz"))
+    zc["s/fall/stop"][0, 5, 0] = 0.9                       # control: 1 window, one of two paths
+    np.savez(c / "c0_windows.npz", **zc)
+    r = cmp.compare(cmp.load(c, ["s"]), cmp.load(t, ["s"]), ["s"], 100, 0)["fall"]
+    assert r["reach_control"] == pytest.approx(0.125) and r["reach_treat"] == pytest.approx(0.5)
+    assert r["reach_ratio"] == pytest.approx(4.0)

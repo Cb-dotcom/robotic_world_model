@@ -11,6 +11,8 @@ control model, on the same windows. CPU only, no model runs (reads c0_windows.np
   from a lower u_real is visible.
 * Errors: real-context one-step base-velocity RMSE over all window steps; imagined base-velocity RMSE at
   d = 1 and d = 25 (driving head's own path). Changes in % of the control.
+* C5: fall reach = share of imagined paths whose termination probability passes 0.5 anywhere (rule:
+  sampled feedback reaches the fall in >= 2x more paths than mean feedback -> averaging is a cause).
 * Paired cluster bootstrap: the same resampled episodes for control and treatment, stratified by source.
 * Noise floor: the same numbers for refits of the control recipe with other seeds (--noise).
 The cause rules of plan §2 are applied by reading this table; they are not automated here.
@@ -55,14 +57,16 @@ def window_values(run, control_std, sources, kind):
         own = np.log(r["u_imag"][:, D_LAST].sum(-1) / r["u_real"][D_LAST].sum(-1)[None]).mean(0)
         cols.append(np.column_stack(his + [own, np.log(ur.sum(-1)), np.log(ui.sum(-1)).mean(0),
                                            r["se_real_vel"].mean(0), r["se_imag_vel"][:, D_ONE].mean(0),
-                                           r["se_imag_vel"][:, D_LAST].mean(0)]))
+                                           r["se_imag_vel"][:, D_LAST].mean(0),
+                                           (r["stop"] > 0.5).any(axis=1).mean(0)]))
         clusters.append(r["clusters"])
         strata.append([s] * len(r["clusters"]))
     return np.concatenate(cols), np.concatenate(clusters), np.concatenate(strata)
 
 
 NC = len(COMPONENTS)
-COL = {"own": NC, "log_ur": NC + 1, "log_ui": NC + 2, "se_real": NC + 3, "se_d1": NC + 4, "se_d25": NC + 5}
+COL = {"own": NC, "log_ur": NC + 1, "log_ui": NC + 2, "se_real": NC + 3, "se_d1": NC + 4, "se_d25": NC + 5,
+       "reach": NC + 6}
 
 
 def compare(control, treat, sources, n_boot, seed):
@@ -91,6 +95,12 @@ def compare(control, treat, sources, n_boot, seed):
             out[f"{name}_rmse_treat"] = float(np.sqrt(t[j]))
             out[f"{name}_change"] = float(np.sqrt(t[j] / c[j]) - 1)
             out[f"{name}_change_ci"] = ci(np.sqrt(bt[:, j] / bc[:, j]) - 1)
+        j = COL["reach"]
+        out["reach_control"], out["reach_treat"] = float(c[j]), float(t[j])
+        out["reach_ratio"] = float(t[j] / c[j]) if c[j] > 0 else None
+        if c[j] > 0:
+            ok = bc[:, j] > 0
+            out["reach_ratio_ci"] = ci(bt[ok, j] / bc[ok, j])
         if kind == "fall":
             valid = ci(hb_c)[0] > 0
             comp = {}
@@ -115,7 +125,7 @@ def table(results):
              f"[{first['nonfall']['H_control_ci'][0]:.3f}, {first['nonfall']['H_control_ci'][1]:.3f}]; "
              f"imagined vel RMSE d25 = {first['fall']['se_d25_rmse_control']:.3f} m/s"]
     lines += ["model           | falls H(25) [95% CI]     | closure [95% CI]        | dlog u_real | dlog u_imag | "
-             "1-step vel err | imag err d1 | imag err d25 | non-falls H(25) | gravity closure"]
+             "1-step vel err | imag err d1 | imag err d25 | non-falls H(25) | gravity closure | fall reach (ctrl -> treat)"]
     for name, r in results.items():
         f, n = r["fall"], r["nonfall"]
         clo = (f"{f['closure']:+.2f} [{f['closure_ci'][0]:+.2f}, {f['closure_ci'][1]:+.2f}]"
@@ -124,7 +134,8 @@ def table(results):
         gc = f"{g['closure']:+.2f}" if g["closure"] is not None else "n/a"
         lines.append(f"{name:15s} | {f['H_treat']:.3f} [{f['H_treat_ci'][0]:.3f}, {f['H_treat_ci'][1]:.3f}] | {clo:23s} | "
                      f"{f['dlog_u_real']:+.3f}      | {f['dlog_u_imag']:+.3f}      | {f['se_real_change']:+.1%}         | "
-                     f"{f['se_d1_change']:+.1%}      | {f['se_d25_change']:+.1%}       | {n['H_treat']:.3f}           | {gc}")
+                     f"{f['se_d1_change']:+.1%}      | {f['se_d25_change']:+.1%}       | {n['H_treat']:.3f}           | {gc:15s} | "
+                     f"{f['reach_control']:.3f} -> {f['reach_treat']:.3f}")
     return "\n".join(lines)
 
 
