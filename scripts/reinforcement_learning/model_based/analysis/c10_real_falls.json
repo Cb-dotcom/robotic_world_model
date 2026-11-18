@@ -1,0 +1,22 @@
+{
+  "description": "Real (simulator) fall counts of the 8 C10 policies, ANYmal Pretrain, eval_episode_stats.py, 32 envs x 10000 steps per seed, seeds 42 + 43 pooled, pushes on, std .5. Copied from the vault run-log; each row names its source row.",
+  "seconds_per_cell": 12800,
+  "policies": {
+    "1601":    {"run": 1601, "model": "ETH frozen", "lambda": 1, "10s": {"falls": 156}, "30s": {"falls": 39},
+                "source": "run-log 2026-11-13 done, E1-A result (control 1601; re-eval reproduces 156/689)"},
+    "1701_B1": {"run": 1701, "model": "ETH frozen", "lambda": 1, "10s": {"falls": 178}, "30s": {"falls": 38},
+                "source": "run-log 2026-11-13 interim / 2026-11-14 done E1-R (B seed 1)"},
+    "1901":    {"run": 1901, "model": "E1-A fine-tuned", "lambda": 1, "10s": {"falls": 266}, "30s": {"falls": 121},
+                "source": "run-log 2026-11-13 done, E1-A result"},
+    "2102_B2": {"run": 2102, "model": "ETH frozen", "lambda": 1, "10s": {"falls": 238}, "30s": {"falls": 65},
+                "source": "run-log 2026-11-14 done, E1-R (B seed 2)"},
+    "2103_B3": {"run": 2103, "model": "ETH frozen", "lambda": 1, "10s": {"falls": 157}, "30s": {"falls": 26},
+                "source": "run-log 2026-11-14 done, E1-R (B seed 3)"},
+    "2004_D1": {"run": 2004, "model": "E1-V refit", "lambda": 1, "10s": {"falls": 28}, "30s": {"falls": 14},
+                "source": "run-log 2026-11-14 done, E1-R (D seed 1 = E1-V arm D)"},
+    "2402_D2": {"run": 2402, "model": "E1-V refit", "lambda": 1, "10s": {"falls": 38}, "30s": {"falls": 32},
+                "source": "run-log 2026-11-14 done, E1-R (D seed 2)"},
+    "2403_D3": {"run": 2403, "model": "E1-V refit", "lambda": 1, "10s": {"falls": 41}, "30s": {"falls": 21},
+                "source": "run-log 2026-11-14 done, E1-R (D seed 3)"}
+  }
+}

@@ -41,6 +41,10 @@ Cause-test outputs (plan §2), stored per window in c0_windows.npz and read by c
   and the Spearman of spread vs error by depth;
 * C2 free run: --actions held keeps the last real action after the context (the real arm keeps the
   recorded actions, so H is not meaningful there; c2_attractor.py reads the imagined states).
+* C0 closed loop: --actions policy lets the recorded policy act on each imagined path (policy_loop.py; the
+  policy must reproduce the recorded actions first). The real arm keeps the real path, so H compares the
+  closed-loop imagination with the real-context disagreement on the same rows; c0_compare.py against the
+  recorded-action run gives "closed loop heals more / less" (plan C0: strengthens C10; no threshold).
 """
 from __future__ import annotations
 
@@ -178,13 +182,13 @@ def tilt_deg(gravity):
 
 
 FEEDBACK = ("head", "random_step", "mean", "most_tilted", "sampled")
-ACTIONS = ("recorded", "held")
+ACTIONS = ("recorded", "held", "policy")
 GRAVITY = slice(6, 9)
 
 
 @torch.no_grad()
 def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subsets=None, feedback="head", seed=0,
-                  actions_mode="recorded"):
+                  actions_mode="recorded", policy=None, builder=None):
     """Imagination started from the last `context` real rows; the state fed back at each step depends on
     `feedback` (plan C5, C9):
       head         each head drives its own path with its mean (RWM-U imagination; one path per head)
@@ -192,6 +196,9 @@ def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subs
       mean         the ensemble mean (one path)
       most_tilted  the head whose state is most tilted (largest tilt angle, physical units; one path)
       sampled      each head's mean + its aleatoric std x N(0, 1) (one path per head)
+    Actions after the real context: recorded (the real path's actions), held (the last real action, C2 free run)
+    or policy (closed loop, plan C0: the policy acts on each path's own imagined state, the recorded command
+    of that row and its own previous action; the first action, at the last real row, is the recorded one).
     Per path p: spread [P, H, W, 45] (disagreement of all heads on that path), own [P, H, W, 45] (fed
     state, normalized), stop [P, H, W] (termination probability of the head whose state is fed; the
     ensemble mean only in mean mode), stop_mean [P, H, W] (ensemble mean probability, every mode, for a
@@ -205,6 +212,8 @@ def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subs
         raise ValueError(f"feedback must be one of {FEEDBACK}")
     if actions_mode not in ACTIONS:
         raise ValueError(f"actions must be one of {ACTIONS}")
+    if actions_mode == "policy" and (policy is None or builder is None):
+        raise ValueError("actions 'policy' needs a policy and an observation builder (policy_loop.py)")
     stats = contract.statistics
     states = _normalized(contract, data, origins, -31, 1, "state")[:, HISTORY - context:]
     actions = _normalized(contract, data, origins, -31, horizon, "action")
@@ -213,17 +222,21 @@ def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subs
         actions[:, HISTORY:] = actions[:, HISTORY - 1:HISTORY]
     target = (torch.from_numpy(gather(data["next_state"], origins, 0, horizon)).float()
               - stats["state_mean"]) / stats["state_std"]                                   # [W, H, 45]
+    if actions_mode == "policy":
+        commands = torch.from_numpy(gather(data["command"], origins, 1, horizon)).float()   # rows t+1 .. t+H-1
+        rec_phys = actions * stats["action_std"] + stats["action_mean"]
     depths = [d for d in DEPTHS if d < horizon]
     heads = model.ensemble_size
     paths = 1 if feedback in ("mean", "most_tilted") else heads
     gstd, gmean = stats["state_std"][GRAVITY], stats["state_mean"][GRAVITY]
-    keys = ("spread", "own", "stop", "stop_mean", "se_norm", "se_vel", "sigma", "ratio", "tilt", "gnorm")
+    keys = ("spread", "own", "stop", "stop_mean", "se_norm", "se_vel", "sigma", "ratio", "tilt", "gnorm", "act_dev")
     acc = {k: [] for k in keys}
     sub = {k: np.full((len(idx), paths, len(depths), len(origins)), np.nan) for k, idx in (subsets or {}).items()}
     for p in range(paths):
         rng = torch.Generator().manual_seed(seed * 1000 + p)
         model.reset()
         xs, xa = states, actions[:, HISTORY - context:HISTORY]
+        last_a = actions[:, HISTORY - 1]                                    # recorded action at the last real row
         rec = {k: [] for k in keys}
         for k in range(horizon):
             means, _, terms, stds = forward_all(model, xs, xa)
@@ -260,7 +273,17 @@ def imagined_pass(model, contract, data, origins, horizon, context=HISTORY, subs
                 for K, v in subset_spread(means, subsets or {}).items():
                     member = (subsets[K] == p).any(axis=1) if feedback in ("head", "sampled") else np.ones(len(v), bool)
                     sub[K][member, p, depths.index(k)] = v[member]
-            xs, xa = fed[:, None], actions[:, HISTORY + k:HISTORY + k + 1]
+            if actions_mode == "policy":
+                if k + 1 < horizon:
+                    a_phys = policy(builder(fed, last_a, commands[:, k]))
+                    last_a = (a_phys - stats["action_mean"]) / stats["action_std"]
+                    rec["act_dev"].append((a_phys - rec_phys[:, HISTORY + k]).abs().mean(-1).numpy())
+                else:
+                    rec["act_dev"].append(np.full(len(origins), np.nan))
+                xs, xa = fed[:, None], last_a[:, None]
+            else:
+                rec["act_dev"].append(np.full(len(origins), np.nan))
+                xs, xa = fed[:, None], actions[:, HISTORY + k:HISTORY + k + 1]
         for key in keys:
             acc[key].append(np.stack(rec[key]))
     out = {k: np.stack(v) for k, v in acc.items()}
@@ -485,7 +508,7 @@ def reproduction_check(new, old, tolerance=REPRO_TOLERANCE):
 
 # ---------------------------------------------------------------- battery
 def battery_source(model, contract, name, trace, seed, context=HISTORY, subsets=None, feedback="head",
-                   actions_mode="recorded"):
+                   actions_mode="recorded", policy=None, builder=None):
     data = {k: trace[k] for k in ("state", "action", "next_state", "command", "done", "terminated", "time_out")}
     falls, counts = fall_windows(data)
     if not len(falls):
@@ -496,7 +519,8 @@ def battery_source(model, contract, name, trace, seed, context=HISTORY, subsets=
     out = {}
     for kind, origins in (("fall", falls), ("nonfall", nonfalls)):
         real = real_context_pass(model, contract, data, origins, HORIZON, subsets)
-        imag = imagined_pass(model, contract, data, origins, HORIZON, context, subsets, feedback, seed, actions_mode)
+        imag = imagined_pass(model, contract, data, origins, HORIZON, context, subsets, feedback, seed, actions_mode,
+                             policy, builder)
         first = np.abs(imag["spread"][:, 0] - real["spread"][None, 0]).max()
         stats = contract.statistics
         target = (gather(data["next_state"], origins, 0, HORIZON).transpose(1, 0, 2)
@@ -506,7 +530,7 @@ def battery_source(model, contract, name, trace, seed, context=HISTORY, subsets=
                          u_member=member, stop=imag["stop"], own=imag["own"].astype(np.float32),
                          target=target.astype(np.float32), sigma_real=real["sigma"], sigma_imag=imag["sigma"],
                          ratio=imag["ratio"].astype(np.float32), tilt=imag["tilt"], gnorm=imag["gnorm"],
-                         stop_mean=imag["stop_mean"],
+                         stop_mean=imag["stop_mean"], act_dev=imag["act_dev"],
                          tilt_real=tilt_deg(gather(data["next_state"], origins, 0, HORIZON).transpose(1, 0, 2)[..., 6:9]).numpy(),
                          se_real_norm=real["se_norm"], se_real_vel=real["se_vel"],
                          se_imag_norm=imag["se_norm"], se_imag_vel=imag["se_vel"],
@@ -732,7 +756,7 @@ def load_models(spec):
 
 
 def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=0, context=HISTORY, head_subsets=(),
-        feedback="head", actions_mode="recorded"):
+        feedback="head", actions_mode="recorded", policies=None, policy_activation="elu"):
     import replay_fall_paths as replay
     torch.set_num_threads(4)
     out.mkdir(parents=True, exist_ok=False)
@@ -744,11 +768,21 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
         print(f"[c0] reproduction {'PASS' if repro['passed'] else 'FAIL'}: {repro['rows']}", flush=True)
     model, contract, paths = load_models(wm)
     subsets = make_subsets(model.ensemble_size, head_subsets, seed=seed) if head_subsets else None
-    sources, counts, inputs = {}, {}, {}
+    sources, counts, inputs, policy_meta = {}, {}, {}, {}
     for name, path in traces:
         with np.load(path, allow_pickle=False) as trace:
-            validate_trace(trace)
-            sources[name] = battery_source(model, contract, name, trace, seed, context, subsets, feedback, actions_mode)
+            trace_meta = validate_trace(trace)
+            policy = builder = None
+            if actions_mode == "policy":
+                import policy_loop
+                stats = {k: contract.statistics[k] for k in ("state_mean", "state_std", "action_mean", "action_std")}
+                policy = policy_loop.resolve_policy(name, trace_meta, policies or {}, policy_activation)
+                builder = policy_loop.ObservationBuilder(policy_loop.env_name_from_meta(trace_meta), stats)
+                checks = policy_loop.policy_checks(name, trace, trace_meta, policy, builder, stats, seed=seed)
+                policy_meta[name] = dict(policy.describe(), checks=checks, env=builder.env_name)
+                print(f"[c0] {name}: policy {policy.path} checks {checks}", flush=True)
+            sources[name] = battery_source(model, contract, name, trace, seed, context, subsets, feedback, actions_mode,
+                                           policy, builder)
         counts[name] = sources[name]["counts"]
         inputs[name] = dict(path=str(path), sha256=sha256(path))
         print(f"[c0] {name}: {counts[name]}", flush=True)
@@ -761,7 +795,7 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
                 match_features={k: v["match_features"] for k, v in sources.items()},
                 first_step_max_abs_delta={k: {kind: v[kind]["first_step_max_abs_delta"] for kind in ("fall", "nonfall")}
                                           for k, v in sources.items()},
-                normalization=contract.metadata(), reproduction=repro)
+                normalization=contract.metadata(), reproduction=repro, policy=policy_meta or None)
     with (out / "c0_report.json").open("x") as f:
         json.dump(json_safe(dict(meta=meta, report=report)), f, indent=1, allow_nan=False)
     arrays = {"meta/state_mean": contract.statistics["state_mean"].numpy(),
@@ -770,7 +804,7 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
         for kind in ("fall", "nonfall"):
             for key in ("origins", "u_real", "u_imag", "u_member", "stop", "se_real_norm", "se_real_vel",
                         "se_imag_norm", "se_imag_vel", "own", "target", "sigma_real", "sigma_imag", "ratio", "tilt",
-                        "gnorm", "stop_mean", "tilt_real"):
+                        "gnorm", "stop_mean", "tilt_real", "act_dev"):
                 arrays[f"{name}/{kind}/{key}"] = src[kind][key]
             for K, v in src[kind]["sub_real"].items():
                 arrays[f"{name}/{kind}/sub_real_K{K}"] = v
@@ -779,6 +813,18 @@ def run(wm, traces, out, repro_trace=None, repro_json=None, n_boot=10_000, seed=
     with (out / "c0_windows.npz").open("xb") as f:
         np.savez_compressed(f, **arrays)
     text = text_report(report, repro, counts)
+    if policy_meta:
+        lines = ["", "Closed loop (policy in the loop): mean |policy action - recorded action| per joint, by depth"]
+        for name, src in sources.items():
+            c = policy_meta[name]["checks"]
+            lines.append(f"  {name}: policy {Path(policy_meta[name]['path']).name} (sha256 {policy_meta[name]['sha256'][:12]}); "
+                         f"check: max |a(recorded obs) - a| {c['max_abs_action_error']:.2e}, rebuilt obs error "
+                         f"{max(c['obs_mean_abs_error'].values()):.2e} (recorded obs noise: {c['recorded_policy_noise']})")
+            for kind in ("fall", "nonfall"):
+                dev = np.nanmean(src[kind]["act_dev"][:, :-1], axis=(0, 2))       # the last depth has no next action
+                policy_meta[name].setdefault("action_deviation", {})[kind] = {f"d{d}": float(dev[d]) for d in DEPTHS[:-1]}
+                lines.append(f"    {kind}: " + ", ".join(f"d{d} {dev[d]:.3f}" for d in DEPTHS[:-1]))
+        text += "\n".join(lines) + "\n"
     (out / "c0_report.txt").write_text(text)
     print(text, flush=True)
     failed = []
@@ -807,7 +853,11 @@ def main():
     p.add_argument("--imag-context", type=int, default=HISTORY, help="real rows that start imagination (C7 cold: 1)")
     p.add_argument("--head-subsets", default="", help="C8: subset sizes, e.g. 2,5,10 (50 random subsets each)")
     p.add_argument("--actions", default="recorded", choices=ACTIONS,
-                   help="actions after the context: recorded, or held at the last real action (C2 free run)")
+                   help="actions after the context: recorded, held at the last real action (C2 free run), or policy "
+                        "(closed loop, plan C0; checkpoint from the trace metadata or --policy)")
+    p.add_argument("--policy", action="append", default=[], metavar="NAME=PATH",
+                   help="policy checkpoint for trace NAME (default: the trace metadata 'checkpoint', SHA-256 checked)")
+    p.add_argument("--policy-activation", default="elu", help="actor activation (ANYmal offline policies: elu)")
     p.add_argument("--feedback", default="head", choices=FEEDBACK,
                    help="state fed back in imagination (C5 sampled; C9 random_step, mean, most_tilted)")
     p.add_argument("--bootstrap", type=int, default=10_000)
@@ -823,6 +873,14 @@ def main():
         sizes = tuple(int(x) for x in a.head_subsets.split(",") if x)
     except ValueError:
         p.error("--head-subsets takes integers, e.g. 2,5,10")
+    policies = {}
+    for item in a.policy:
+        name, _, path = item.partition("=")
+        if not name or not path:
+            p.error(f"bad --policy {item!r}; use NAME=PATH")
+        policies[name] = path
+    if policies and a.actions != "policy":
+        p.error("--policy needs --actions policy")
     traces = []
     for item in a.trace:
         name, _, path = item.partition("=")
@@ -831,9 +889,13 @@ def main():
         traces.append((name, Path(path)))
     try:
         run(a.wm, traces, a.out, a.repro_trace, a.repro_json, a.bootstrap, a.seed, a.imag_context, sizes, a.feedback,
-            a.actions)
+            a.actions, policies, a.policy_activation)
     except (GateFailed, ZeroDisagreement) as exc:
         raise SystemExit(f"[c0] STOPPED: {exc}")
+    except RuntimeError as exc:
+        if type(exc).__name__ == "PolicyMismatch":
+            raise SystemExit(f"[c0] STOPPED: {exc}")
+        raise
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ ROBOTS = {
     "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-NoVel-v0": {"robot": "go2", "foot": ".*_foot"},
     "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-Gait-v0": {"robot": "go2", "foot": ".*_foot"},
     "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-Posture-v0": {"robot": "go2", "foot": ".*_foot"},
+    "Template-Isaac-Velocity-Flat-Unitree-Go2-Start-Unitree-Check-v0": {"robot": "go2", "foot": ".*_foot"},
 }
 if args.task not in ROBOTS:
     parser.error(f"Supported tasks: {sorted(ROBOTS)}")
@@ -191,6 +192,12 @@ def main(env_cfg, agent_cfg):
                     reward_names=reward_names,
                     reward_weights={name: base.reward_manager.get_term_cfg(name).weight for name in reward_names},
                     reward_units="reward_terms are weighted per-second; reward=sum(terms)*step_dt",
+                    reward_params={name: {k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
+                                          for k, v in (base.reward_manager.get_term_cfg(name).params or {}).items()}
+                                   for name in reward_names},
+                    joint_names=list(base.scene["robot"].joint_names),
+                    default_joint_pos=base.scene["robot"].data.default_joint_pos[0].tolist(),
+                    soft_joint_pos_limits=base.scene["robot"].data.soft_joint_pos_limits[0].tolist(),
                     sensor_body_names=list(base.scene["contact_forces"].body_names),
                     timer_foot_body_names=base.scene["contact_forces"].find_bodies(ROBOT["foot"])[1],
                     terminal_semantics="Physical termination and timeout stored separately; terminal next_state captured before reset")

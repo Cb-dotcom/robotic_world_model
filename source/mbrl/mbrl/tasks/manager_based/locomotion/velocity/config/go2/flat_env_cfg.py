@@ -467,3 +467,19 @@ class UnitreeGo2FlatEnvCfg_START_UNITREE(UnitreeGo2FlatEnvCfg_START):
         self.curriculum.lin_vel_cmd_levels = CurrTerm(
             func=mdp.unitree_lin_vel_cmd_levels,
             params={"reward_term_name": "track_lin_vel_xy_exp", "limit_lin_vel_x": limit_x, "limit_lin_vel_y": limit_y})
+
+
+# ---------------------------------------------------------------------------
+# E16 reward check (plan v6 §4 reward contract, 18 Nov 2026): s2's training rewards (START_UNITREE, every term
+# and weight unchanged) on the full Start-v0 command ranges with the curriculum off, so that the recorded
+# reward terms cover the commands imagination samples. Recording only; no training.
+# ---------------------------------------------------------------------------
+@configclass
+class UnitreeGo2FlatEnvCfg_START_UNITREE_CHECK(UnitreeGo2FlatEnvCfg_START_UNITREE):
+    def __post_init__(self):
+        super().__post_init__()
+        levels = self.curriculum.lin_vel_cmd_levels.params
+        cmd = self.commands.base_velocity
+        cmd.ranges.lin_vel_x = tuple(levels["limit_lin_vel_x"])
+        cmd.ranges.lin_vel_y = tuple(levels["limit_lin_vel_y"])
+        self.curriculum.lin_vel_cmd_levels = None

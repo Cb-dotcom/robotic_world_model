@@ -479,3 +479,82 @@ def test_gates_stop_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr(c0, "summarize", bad_summary)
     with pytest.raises(c0.GateFailed, match="HR\\(0\\)"):
         c0.run(wm, [("src", p)], tmp_path / "g2", n_boot=20)
+
+
+def _policy_setup(tmp_path, seed=0, normalizer=False):
+    import policy_loop as pl
+    stats = {k: v for k, v in identity_contract().statistics.items()}
+    ck = pl.save_actor(tmp_path / f"policy_{seed}.pt", seed=seed, normalizer=normalizer)
+    policy = pl.Policy(ck)
+    builder = pl.ObservationBuilder("anymal_d_flat", stats)
+    tr = pl.consistent_policy_trace(random_trace(), policy, builder, stats)
+    meta = json.loads(str(tr["metadata"]))
+    meta.update(checkpoint=str(ck), checkpoint_sha256=pl.sha256(ck), task="Template-Isaac-Velocity-Flat-Anymal-D-Pretrain-v0",
+                policy_noise=False, clip_actions=None)
+    tr["metadata"] = np.array(json.dumps(meta))
+    return pl, stats, policy, builder, tr, meta
+
+
+def test_policy_loader_and_checks(tmp_path):
+    pl, stats, policy, builder, tr, meta = _policy_setup(tmp_path, normalizer=True)
+    assert policy.norm is not None and policy.obs_dim == 48
+    c = pl.policy_checks("s", tr, meta, policy, builder, stats, rows=200)
+    assert c["passed"] and c["max_abs_action_error"] < 1e-5 and max(c["obs_mean_abs_error"].values()) < 1e-6
+    # the observation layout is the imagination env's: command in 9:12, previous action in 36:48
+    np.testing.assert_allclose(tr["policy_observation"][5, 1, 9:12], tr["command"][5, 1], atol=1e-6)
+    np.testing.assert_allclose(tr["policy_observation"][5, 1, 36:48], tr["action"][4, 1], atol=1e-6)
+    other = pl.Policy(pl.save_actor(tmp_path / "other.pt", seed=9))
+    with pytest.raises(pl.PolicyMismatch, match="reproduce the recorded actions"):
+        pl.policy_checks("s", tr, meta, other, builder, stats, rows=200)
+    bad = dict(tr, command=tr["command"] + 0.5)                   # commands that the policy never saw
+    with pytest.raises(pl.PolicyMismatch, match="rebuilt observation"):
+        pl.policy_checks("s", bad, meta, policy, builder, stats, rows=200)
+    with pytest.raises(pl.PolicyMismatch, match="sha256"):
+        pl.resolve_policy("s", dict(meta, checkpoint_sha256="0" * 64), {})
+
+
+def test_closed_loop_pass_feeds_the_policy_its_own_path(tmp_path):
+    pl, stats, policy, builder, tr, meta = _policy_setup(tmp_path)
+    model, contract = real_model(), identity_contract()
+    origins = c0.fall_windows(tr)[0]
+    calls = []
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __call__(self, state, last_a, command):
+            calls.append((state.clone(), last_a.clone(), command.clone()))
+            return self.inner(state, last_a, command)
+
+    rec = c0.imagined_pass(model, contract, tr, origins, 6)
+    clo = c0.imagined_pass(model, contract, tr, origins, 6, actions_mode="policy", policy=policy, builder=Spy(builder))
+    np.testing.assert_allclose(clo["spread"][:, 0], rec["spread"][:, 0], atol=1e-6)    # first step: real action
+    assert not np.allclose(clo["spread"][:, 3], rec["spread"][:, 3])                    # then the policy acts
+    t0 = origins[:, 0]
+    first_state, first_last, first_cmd = calls[0]                                       # path 0, step 0
+    np.testing.assert_allclose(first_state.numpy(), rec["own"][0, 0], atol=1e-6)       # its own imagined state
+    np.testing.assert_allclose(first_last.numpy(), tr["action"][t0, origins[:, 1]], atol=1e-6)
+    np.testing.assert_allclose(first_cmd.numpy(), tr["command"][t0 + 1, origins[:, 1]], atol=1e-6)
+    _, second_last, _ = calls[1]
+    np.testing.assert_allclose(second_last.numpy(), policy(builder(*calls[0])).numpy(), atol=1e-6)
+    assert np.isfinite(clo["act_dev"][:, :5]).all() and np.isnan(clo["act_dev"][:, 5]).all()
+    with pytest.raises(ValueError, match="needs a policy"):
+        c0.imagined_pass(model, contract, tr, origins, 6, actions_mode="policy")
+
+
+def test_closed_loop_run_writes_policy_checks(tmp_path, monkeypatch):
+    import analyse_transition_fidelity as fidelity
+    pl, stats, policy, builder, tr, meta = _policy_setup(tmp_path)
+    model, contract = real_model(), identity_contract()
+    monkeypatch.setattr(fidelity, "load_model", lambda path: (model, contract))
+    p = tmp_path / "t.npz"
+    np.savez(p, **tr)
+    wm = tmp_path / "wm.pt"
+    wm.write_bytes(b"x")
+    c0.run(wm, [("src", p)], tmp_path / "out", n_boot=20, actions_mode="policy")
+    rep = json.loads((tmp_path / "out" / "c0_report.json").read_text())
+    assert rep["meta"]["actions"] == "policy" and rep["meta"]["policy"]["src"]["checks"]["passed"]
+    assert "Closed loop" in (tmp_path / "out" / "c0_report.txt").read_text()
+    z = np.load(tmp_path / "out" / "c0_windows.npz")
+    assert "src/fall/act_dev" in z.files

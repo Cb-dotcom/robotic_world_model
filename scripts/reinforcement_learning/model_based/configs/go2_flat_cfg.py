@@ -121,3 +121,60 @@ class Go2FlatConfig(BaseConfig):
     policy_architecture_config: PolicyArchitectureConfig = field(default_factory=PolicyArchitectureConfig)
     policy_algorithm_config:    PolicyAlgorithmConfig    = field(default_factory=PolicyAlgorithmConfig)
     policy_training_config:     PolicyTrainingConfig     = field(default_factory=PolicyTrainingConfig)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# E16 imagined-reward contract for the Go2 start policy s2 (plan v6 §4 "reward contract", gate 4 Dec 2026).
+# STATUS: PROPOSED 18 Nov 2026 by Claude; Charbel decides before Go2 round 0 (by 4 Dec). Every term of s2's
+# training reward (Go2-Start-Unitree-v0 = UnitreeGo2FlatEnvCfg_START_UNITREE) is listed: included terms use the
+# simulator's weight and parameters and are checked against the simulator term on recorded data
+# (analysis/e16_reward_check.py); excluded terms carry the reason. Key = simulator term name = imagined key.
+# ---------------------------------------------------------------------------------------------------------------
+S2_REWARD_CONTRACT = {
+    "track_lin_vel_xy_exp": dict(decision="include", weight=1.5, source="state lin vel + command"),
+    "track_ang_vel_z_exp":  dict(decision="include", weight=0.75, source="state ang vel + command"),
+    "lin_vel_z_l2":         dict(decision="include", weight=-2.0, source="state"),
+    "ang_vel_xy_l2":        dict(decision="include", weight=-0.05, source="state"),
+    "joint_vel":            dict(decision="include", weight=-0.001, source="state joint vel (joint_vel_l2)"),
+    "dof_acc_l2":           dict(decision="include", weight=-2.5e-7,
+                                 source="finite difference of predicted joint vel (simulator: joint_acc)"),
+    "dof_torques_l2":       dict(decision="include", weight=-2e-4, source="state torque (applied torque)"),
+    "action_rate_l2":       dict(decision="include", weight=-0.1, source="action and previous action"),
+    "dof_pos_limits":       dict(decision="include", weight=-10.0,
+                                 source="state joint pos + default pose + soft limits from the recorded asset"),
+    "energy":               dict(decision="include", weight=-2e-5, source="state joint vel x torque"),
+    "flat_orientation_l2":  dict(decision="include", weight=-2.5, source="state gravity"),
+    "joint_pos":            dict(decision="include", weight=-0.7,
+                                 source="state joint pos (relative to default) + command + base speed; x5 standing",
+                                 params=dict(stand_still_scale=5.0, velocity_threshold=0.3)),
+    "feet_air_time":        dict(decision="include", weight=0.1, params=dict(threshold=0.5),
+                                 source="foot timers driven by the predicted foot contact"),
+    "air_time_variance":    dict(decision="include", weight=-1.0,
+                                 source="foot timers driven by the predicted foot contact"),
+    "feet_slide":           dict(decision="include", weight=-0.1,
+                                 source="leg kinematics + predicted foot contact (checked 11 Nov at -0.25)"),
+    "undesired_contacts":   dict(decision="include", weight=-1.0,
+                                 source="predicted THIGH contacts only; hip and calf contacts are not predicted by "
+                                        "the world model (the check measures the missing part)"),
+}
+S2_EXCLUDED_IMAGINED_TERMS = {
+    "stand_still": "removed from s2's reward (START_UNITREE sets it to None); weight 0 in imagination",
+}
+
+
+def s2_reward_term_weights():
+    """reward_term_weights for imagination under the s2 contract (included terms only)."""
+    return {k: v["weight"] for k, v in S2_REWARD_CONTRACT.items() if v["decision"] == "include"}
+
+
+def apply_s2_reward_contract(env_cls, default_joint_pos=None, soft_joint_pos_limits=None):
+    """Set the Go2 env's term parameters for the s2 contract (class attributes; imagination instances inherit)."""
+    env_cls.feet_air_time_threshold = S2_REWARD_CONTRACT["feet_air_time"]["params"]["threshold"]
+    env_cls.joint_pos_stand_still_scale = S2_REWARD_CONTRACT["joint_pos"]["params"]["stand_still_scale"]
+    env_cls.joint_pos_velocity_threshold = S2_REWARD_CONTRACT["joint_pos"]["params"]["velocity_threshold"]
+    env_cls.timers_before_rewards = True
+    if default_joint_pos is not None:
+        env_cls.default_joint_pos = list(default_joint_pos)
+    if soft_joint_pos_limits is not None:
+        env_cls.soft_joint_pos_limits = [list(x) for x in soft_joint_pos_limits]
+    return env_cls

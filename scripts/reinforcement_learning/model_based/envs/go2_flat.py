@@ -4,7 +4,9 @@ Offline RWM-U + MOPO-PPO env for Unitree Go2 flat-terrain velocity tracking.
 Ported directly from anymal_d_flat.py with two Go2-specific changes inside
 _compute_imagination_reward_terms (matching go2_manager_based_mbrl_env.py):
   1. feet_air_time threshold:  0.5  ->  0.25  (Go2 morphology calibration)
-  2. undesired_contacts:       emitted in ANYmal dict, NOT emitted on Go2 path
+  2. undesired_contacts:       emitted (thigh contacts only), weighted only by the s2 contract
+  3. s2 terms (E16, 18 Nov 2026): joint_vel, energy, joint_pos, air_time_variance and a real dof_pos_limits;
+     a term counts only when its key is in reward_term_weights, so older configs are unchanged
 
 Everything else (state layout, observation construction, command sampling,
 extensions/contacts/terminations parsing, interval events, dims) is identical
@@ -24,6 +26,14 @@ class Go2FlatEnv(BaseEnv):
     # Base COM offset from the root-link origin, base frame. URDF value until
     # rsl_rl/validate_go2_feet_slide.py selects the one that matches the simulator asset.
     feet_slide_base_com_offset = (0.021112, 0.0, -0.005366)
+    # Reward-contract parameters (E16, 18 Nov 2026). Defaults keep the June / Start-v0 behaviour; the s2
+    # contract (configs/go2_flat_cfg.py S2_REWARD_CONTRACT) sets them from the simulator's term parameters.
+    feet_air_time_threshold = 0.25
+    joint_pos_stand_still_scale = 5.0          # unitree joint_position_penalty
+    joint_pos_velocity_threshold = 0.3
+    default_joint_pos = None                   # [12] rad, sim joint order; needed for dof_pos_limits
+    soft_joint_pos_limits = None               # [12, 2] rad; None keeps dof_pos_limits = 0 (old behaviour)
+    timers_before_rewards = False              # True: update the foot timers first, as the contact sensor does
 
     def _init_additional_imagination_attributes(self):
         self.last_air_time = torch.zeros(self.num_envs, 4, device=self.device)
@@ -138,9 +148,11 @@ class Go2FlatEnv(BaseEnv):
         dof_acc_l2 = torch.sum(torch.square(joint_acc), dim=1)
         action_rate_l2 = torch.sum(torch.square(self.obs_last_action - rollout_action), dim=1)
         if foot_contact is not None:
-            first_contact = (self.current_contact_time > 0.0) * (self.current_contact_time < (self._step_dt + 1.0e-8))
-            # Go2 morphology: feet_air_time threshold 0.25 (matches UnitreeGo2FlatEnvCfg)
-            feet_air_time = torch.sum((self.last_air_time - 0.25) * first_contact, dim=1) * (torch.norm(self.base_velocity[:, :2], dim=1) > 0.1)
+            if not self.timers_before_rewards:
+                first_contact = (self.current_contact_time > 0.0) * (self.current_contact_time < (self._step_dt + 1.0e-8))
+                # Go2 morphology: feet_air_time threshold 0.25 by default (matches UnitreeGo2FlatEnvCfg)
+                feet_air_time = torch.sum((self.last_air_time - self.feet_air_time_threshold) * first_contact, dim=1) \
+                    * (torch.norm(self.base_velocity[:, :2], dim=1) > 0.1)
 
             is_contact = foot_contact.bool()
             is_first_contact = (self.current_air_time > 0) * is_contact
@@ -161,12 +173,36 @@ class Go2FlatEnv(BaseEnv):
             self.current_contact_time = torch.where(
                 is_contact, self.current_contact_time + self._step_dt, 0.0
             )
+            if self.timers_before_rewards:
+                first_contact = (self.current_contact_time > 0.0) * (self.current_contact_time < (self._step_dt + 1.0e-8))
+                feet_air_time = torch.sum((self.last_air_time - self.feet_air_time_threshold) * first_contact, dim=1) \
+                    * (torch.norm(self.base_velocity[:, :2], dim=1) > 0.1)
+            # unitree air_time_variance_penalty: variance over feet of the clipped last air / contact times
+            air_time_variance = torch.var(torch.clip(self.last_air_time, max=0.5), dim=1) \
+                + torch.var(torch.clip(self.last_contact_time, max=0.5), dim=1)
         else:
             feet_air_time = torch.zeros(self.num_envs, device=self.device)
-        # undesired_contacts intentionally NOT emitted on Go2 path (stand_still is the collision proxy)
+            air_time_variance = torch.zeros(self.num_envs, device=self.device)
+        # stand_still: Go2 collision proxy of the June / Start-v0 recipe (s2 removed it; see S2_REWARD_CONTRACT)
         stand_still = torch.sum(torch.abs(joint_pos), dim=1) * (torch.norm(self.base_velocity, dim=1) < 0.05)
         flat_orientation_l2 = torch.sum(torch.square(projected_gravity[:, :2]), dim=1)
-        dof_pos_limits = torch.zeros(self.num_envs, device=self.device)
+        if self.soft_joint_pos_limits is not None and self.default_joint_pos is not None:
+            # Isaac Lab joint_pos_limits on absolute joint positions (state holds joint_pos - default)
+            q = joint_pos + torch.as_tensor(self.default_joint_pos, device=self.device)
+            lim = torch.as_tensor(self.soft_joint_pos_limits, device=self.device)
+            dof_pos_limits = torch.sum(-(q - lim[:, 0]).clip(max=0.0) + (q - lim[:, 1]).clip(min=0.0), dim=1)
+        else:
+            dof_pos_limits = torch.zeros(self.num_envs, device=self.device)
+        # s2 terms (unitree_rl_lab 4960b84 functions, rewards.py of mbrl): all from state, command and contacts
+        joint_vel_l2 = torch.sum(torch.square(joint_vel), dim=1)
+        energy = torch.sum(torch.abs(joint_vel) * torch.abs(joint_torque), dim=1)
+        moving = torch.logical_or(torch.linalg.norm(self.base_velocity, dim=1) > 0.0,
+                                  torch.linalg.norm(base_lin_vel[:, :2], dim=1) > self.joint_pos_velocity_threshold)
+        joint_pos_dev = torch.linalg.norm(joint_pos, dim=1)
+        joint_position_penalty = torch.where(moving, joint_pos_dev, self.joint_pos_stand_still_scale * joint_pos_dev)
+        # undesired_contacts: the world model predicts thigh contacts only (hip and calf are not predicted)
+        undesired_contacts = torch.sum(thigh_contact, dim=1) if thigh_contact is not None \
+            else torch.zeros(self.num_envs, device=self.device)
         # Isaac Lab feet_slide reconstructed by leg kinematics from the imagined state and the
         # predicted foot contact (same gate as the sensor). Weight is set in go2_flat_cfg.
         if foot_contact is not None:
@@ -187,6 +223,11 @@ class Go2FlatEnv(BaseEnv):
             "flat_orientation_l2": flat_orientation_l2,
             "dof_pos_limits": dof_pos_limits,
             "feet_slide": feet_slide,
+            "joint_vel": joint_vel_l2,
+            "energy": energy,
+            "joint_pos": joint_position_penalty,
+            "air_time_variance": air_time_variance,
+            "undesired_contacts": undesired_contacts,
         }
         last_obs = torch.cat([base_lin_vel, base_ang_vel, projected_gravity, self.base_velocity, joint_pos, joint_vel, rollout_action], dim=1)
         self.last_obs = TensorDict({"policy": last_obs}, batch_size=[self.num_envs], device=self.device)
