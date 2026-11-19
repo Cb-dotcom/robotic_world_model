@@ -34,6 +34,10 @@ class Go2FlatEnv(BaseEnv):
     default_joint_pos = None                   # [12] rad, sim joint order; needed for dof_pos_limits
     soft_joint_pos_limits = None               # [12, 2] rad; None keeps dof_pos_limits = 0 (old behaviour)
     timers_before_rewards = False              # True: update the foot timers first, as the contact sensor does
+    # dof_acc_l2 differences the predicted joint velocity against the previous POLICY observation, which carries
+    # observation noise (+-1.5 rad/s): noise alone gives an acceleration penalty at constant velocity (review
+    # 19 Nov). True: difference against the previous noise-free state instead (physical acceleration).
+    acceleration_from_state = False
 
     def _init_additional_imagination_attributes(self):
         self.last_air_time = torch.zeros(self.num_envs, 4, device=self.device)
@@ -74,6 +78,7 @@ class Go2FlatEnv(BaseEnv):
         obs_projected_gravity = state_history_denormalized[:, 6:9]
         obs_joint_pos = state_history_denormalized[:, 9:21]
         obs_joint_vel = state_history_denormalized[:, 21:33]
+        self.last_joint_vel_state = obs_joint_vel.clone()           # before noise: the state the policy acts from
         self.obs_last_action = action_history_denormalized
         if self.observation_noise:
             obs_base_lin_vel += 2 * (torch.rand_like(obs_base_lin_vel) - 0.5) * 0.1
@@ -133,7 +138,10 @@ class Go2FlatEnv(BaseEnv):
         joint_pos = parsed_imagination_states["joint_pos"]
         joint_vel = parsed_imagination_states["joint_vel"]
         joint_torque = parsed_imagination_states["joint_torque"]
-        joint_acc = (joint_vel - self.last_obs["policy"][:, 24:36]) / self._step_dt
+        if self.acceleration_from_state and getattr(self, "last_joint_vel_state", None) is not None:
+            joint_acc = (joint_vel - self.last_joint_vel_state) / self._step_dt
+        else:
+            joint_acc = (joint_vel - self.last_obs["policy"][:, 24:36]) / self._step_dt
         thigh_contact = parsed_contacts["thigh_contact"]
         foot_contact = parsed_contacts["foot_contact"]
 

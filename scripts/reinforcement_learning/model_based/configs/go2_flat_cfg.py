@@ -137,7 +137,8 @@ S2_REWARD_CONTRACT = {
     "ang_vel_xy_l2":        dict(decision="include", weight=-0.05, source="state"),
     "joint_vel":            dict(decision="include", weight=-0.001, source="state joint vel (joint_vel_l2)"),
     "dof_acc_l2":           dict(decision="include", weight=-2.5e-7,
-                                 source="finite difference of predicted joint vel (simulator: joint_acc)"),
+                                 source="finite difference of predicted joint vel against the previous noise-free "
+                                        "state (simulator: joint_acc; E16 18 Nov: about half its size)"),
     "dof_torques_l2":       dict(decision="include", weight=-2e-4, source="state torque (applied torque)"),
     "action_rate_l2":       dict(decision="include", weight=-0.1, source="action and previous action"),
     "dof_pos_limits":       dict(decision="include", weight=-10.0,
@@ -173,6 +174,7 @@ def apply_s2_reward_contract(env_cls, default_joint_pos=None, soft_joint_pos_lim
     env_cls.joint_pos_stand_still_scale = S2_REWARD_CONTRACT["joint_pos"]["params"]["stand_still_scale"]
     env_cls.joint_pos_velocity_threshold = S2_REWARD_CONTRACT["joint_pos"]["params"]["velocity_threshold"]
     env_cls.timers_before_rewards = True
+    env_cls.acceleration_from_state = True      # physical acceleration, not observation noise (review 19 Nov)
     if default_joint_pos is not None:
         env_cls.default_joint_pos = list(default_joint_pos)
     if soft_joint_pos_limits is not None:

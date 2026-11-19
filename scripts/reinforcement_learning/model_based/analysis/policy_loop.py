@@ -30,7 +30,8 @@ ACTIVATIONS = {"elu": torch.nn.ELU, "relu": torch.nn.ReLU, "tanh": torch.nn.Tanh
 OBS_BLOCKS = {"lin_vel": (0, 3), "ang_vel": (3, 6), "gravity": (6, 9), "command": (9, 12), "joint_pos": (12, 24),
               "joint_vel": (24, 36), "last_action": (36, 48)}
 ACTION_TOL = 1e-3          # max |policy(recorded obs) - recorded action|: larger means another policy
-OBS_TOL = 1e-4             # mean |rebuilt obs - recorded obs| per block when the recorder's policy obs had no noise
+OBS_TOL = 1e-4             # mean |rebuilt obs - recorded obs| per block, for every block that carries no noise
+NOISE_FREE_BLOCKS = ("command", "last_action")   # never corrupted by observation noise (review 19 Nov)
 
 
 class PolicyMismatch(RuntimeError):
@@ -149,8 +150,10 @@ def resolve_policy(name, meta, overrides, activation="elu"):
 
 def policy_checks(name, trace, meta, policy, builder, stats, rows=2048, seed=0):
     """(1) the policy reproduces the recorded actions from the recorded observations; (2) the rebuilt observation
-    (state, command, previous action) equals the recorded one block by block when the recorder's policy
-    observation had no noise. Rows from all envs and steps, sampled with a fixed seed."""
+    (state, command, previous action) equals the recorded one block by block: always for the command and the
+    previous action (no noise), and for every block when the recorder's policy observation had no noise. With
+    noise, the noisy blocks are reported with their correlation (a layout error shows as a low correlation).
+    Rows from all envs and steps, sampled with a fixed seed."""
     obs_rec = trace["policy_observation"]
     T, N = obs_rec.shape[:2]
     rng = np.random.default_rng(seed)
@@ -167,16 +170,23 @@ def policy_checks(name, trace, meta, policy, builder, stats, rows=2048, seed=0):
     prev_n = (torch.from_numpy(trace["previous_action"][t, n]).float() - a[0]) / a[1]
     rebuilt = builder(state_n, prev_n, torch.from_numpy(trace["command"][t, n]).float())
     blocks = {k: float((rebuilt[:, lo:hi] - o[:, lo:hi]).abs().mean()) for k, (lo, hi) in OBS_BLOCKS.items()}
+
+    def corr(a, b):
+        a, b = a.flatten().double(), b.flatten().double()
+        return float(torch.corrcoef(torch.stack([a, b]))[0, 1]) if a.std() > 0 and b.std() > 0 else float("nan")
+
+    corrs = {k: corr(rebuilt[:, lo:hi], o[:, lo:hi]) for k, (lo, hi) in OBS_BLOCKS.items()}
     noisy = bool(meta.get("policy_noise", False))
-    out = dict(rows=int(len(pick)), max_abs_action_error=action_err, obs_mean_abs_error=blocks,
-               recorded_policy_noise=noisy, action_tolerance=ACTION_TOL, obs_tolerance=OBS_TOL)
+    checked = list(NOISE_FREE_BLOCKS) if noisy else list(OBS_BLOCKS)
+    out = dict(rows=int(len(pick)), max_abs_action_error=action_err, obs_mean_abs_error=blocks, obs_corr=corrs,
+               recorded_policy_noise=noisy, obs_blocks_checked=checked, action_tolerance=ACTION_TOL,
+               obs_tolerance=OBS_TOL)
     problems = []
     if action_err > ACTION_TOL:
         problems.append(f"policy does not reproduce the recorded actions (max |error| {action_err:.3g})")
-    if not noisy:
-        bad = {k: v for k, v in blocks.items() if v > OBS_TOL}
-        if bad:
-            problems.append(f"rebuilt observation differs from the recorded one: {json.dumps(bad)}")
+    bad = {k: blocks[k] for k in checked if blocks[k] > OBS_TOL}
+    if bad:
+        problems.append(f"rebuilt observation differs from the recorded one: {json.dumps(bad)}")
     out["passed"] = not problems
     if problems:
         raise PolicyMismatch(f"{name}: " + "; ".join(problems))
@@ -220,3 +230,42 @@ def consistent_policy_trace(trace, policy, builder, stats):
         obs[t] = o.numpy()
         action[t] = policy(o).numpy()
     return dict(trace, action=action, previous_action=prev, policy_observation=obs)
+
+
+def main():
+    """Recheck the policies of saved traces (no imagined pass): python policy_loop.py --wm WM --trace NAME=NPZ ..."""
+    import argparse
+    from c0_battery import load_models
+    from pre_reset_transitions import validate_trace
+    p = argparse.ArgumentParser(description=main.__doc__)
+    p.add_argument("--wm", required=True, help="world model whose normalizer the closed loop used")
+    p.add_argument("--trace", action="append", required=True, metavar="NAME=NPZ")
+    p.add_argument("--policy", action="append", default=[], metavar="NAME=PATH")
+    p.add_argument("--policy-activation", default="elu")
+    p.add_argument("--out", type=Path, help="optional JSON output")
+    a = p.parse_args()
+    _, contract, _ = load_models(a.wm)
+    stats = {k: contract.statistics[k] for k in ("state_mean", "state_std", "action_mean", "action_std")}
+    overrides = dict(item.partition("=")[::2] for item in a.policy)
+    results, failed = {}, []
+    for item in a.trace:
+        name, _, path = item.partition("=")
+        with np.load(path, allow_pickle=False) as z:
+            meta = validate_trace(z)
+            try:
+                policy = resolve_policy(name, meta, overrides, a.policy_activation)
+                builder = ObservationBuilder(env_name_from_meta(meta), stats)
+                results[name] = dict(policy.describe(), checks=policy_checks(name, z, meta, policy, builder, stats))
+            except PolicyMismatch as exc:
+                results[name] = dict(error=str(exc))
+                failed.append(name)
+        print(f"[policy_loop] {name}: {json.dumps(results[name].get('checks', results[name]))}", flush=True)
+    if a.out:
+        a.out.write_text(json.dumps(results, indent=1))
+    if failed:
+        raise SystemExit(f"[policy_loop] FAILED: {failed}")
+    print("[policy_loop] all checks passed", flush=True)
+
+
+if __name__ == "__main__":
+    main()

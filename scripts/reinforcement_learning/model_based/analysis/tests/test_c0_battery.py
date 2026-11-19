@@ -558,3 +558,34 @@ def test_closed_loop_run_writes_policy_checks(tmp_path, monkeypatch):
     assert "Closed loop" in (tmp_path / "out" / "c0_report.txt").read_text()
     z = np.load(tmp_path / "out" / "c0_windows.npz")
     assert "src/fall/act_dev" in z.files
+
+
+
+def test_noise_free_observation_blocks_are_checked_even_with_noise(tmp_path):
+    pl, stats, policy, builder, tr, meta = _policy_setup(tmp_path)
+    noisy_meta = dict(meta, policy_noise=True)
+    rng = np.random.default_rng(0)
+    obs = tr["policy_observation"].copy()
+    obs[..., 24:36] += rng.uniform(-1.5, 1.5, obs[..., 24:36].shape)        # joint-velocity noise only
+    noisy = dict(tr, policy_observation=obs)
+    noisy["action"] = policy(torch.from_numpy(obs.reshape(-1, 48))).numpy().reshape(tr["action"].shape)
+    c = pl.policy_checks("s", noisy, noisy_meta, policy, builder, stats, rows=300)
+    assert c["passed"] and c["obs_blocks_checked"] == ["command", "last_action"]
+    assert c["obs_mean_abs_error"]["joint_vel"] == pytest.approx(0.75, abs=0.1)   # E|U(-1.5, 1.5)|
+    bad = dict(noisy, command=noisy["command"] + 0.3)                       # commands carry no noise
+    with pytest.raises(pl.PolicyMismatch, match="command"):
+        pl.policy_checks("s", bad, noisy_meta, policy, builder, stats, rows=300)
+
+
+def test_policy_recheck_cli(tmp_path, monkeypatch, capsys):
+    import analyse_transition_fidelity as fidelity
+    pl, stats, policy, builder, tr, meta = _policy_setup(tmp_path)
+    monkeypatch.setattr(fidelity, "load_model", lambda path: (real_model(), identity_contract()))
+    p = tmp_path / "t.npz"
+    np.savez(p, **tr)
+    wm = tmp_path / "wm.pt"
+    wm.write_bytes(b"x")
+    monkeypatch.setattr(sys, "argv", ["policy_loop.py", "--wm", str(wm), "--trace", f"src={p}", "--out", str(tmp_path / "c.json")])
+    pl.main()
+    assert "all checks passed" in capsys.readouterr().out
+    assert json.loads((tmp_path / "c.json").read_text())["src"]["checks"]["passed"]

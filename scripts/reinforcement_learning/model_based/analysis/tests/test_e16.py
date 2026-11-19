@@ -137,3 +137,44 @@ def test_old_go2_configs_are_unchanged():
     assert not {"joint_vel", "energy", "joint_pos", "air_time_variance", "undesired_contacts"} & set(w)
     assert Go2FlatEnv.feet_air_time_threshold == 0.25 and Go2FlatEnv.timers_before_rewards is False
     assert Go2FlatEnv.soft_joint_pos_limits is None
+
+
+def test_runtime_acceleration_ignores_observation_noise():
+    """Runtime order of the imagination loop: get_imagination_observation (noisy policy obs), then the reward.
+    At constant physical joint velocity, dof_acc_l2 must be zero with the s2 setting (review 19 Nov)."""
+    from envs.go2_flat import Go2FlatEnv
+    from policy_loop import _Denormalizer
+    stats = dict(state_mean=np.zeros(45), state_std=np.ones(45), action_mean=np.zeros(12), action_std=np.ones(12))
+
+    def env_with(flag):
+        env = Go2FlatEnv.__new__(Go2FlatEnv)
+        env._num_envs, env.device, env._step_dt, env.observation_noise = 64, "cpu", DT, True
+        env.dataset = _Denormalizer(stats)
+        env.base_velocity = torch.zeros(64, 3)
+        env.acceleration_from_state = flag
+        for key in ("current_air_time", "last_air_time", "current_contact_time", "last_contact_time"):
+            setattr(env, key, torch.zeros(64, 4))
+        return env
+
+    torch.manual_seed(0)
+    state = torch.randn(64, 45) * 0.3
+    state[:, 6:9] = torch.tensor([0.0, 0.0, -1.0])
+    out = {}
+    for flag in (False, True):
+        env = env_with(flag)
+        env.get_imagination_observation(state[:, None], torch.zeros(64, 1, 12))      # the policy's (noisy) view
+        parsed = env._parse_imagination_states(state.clone())                       # same physical velocity
+        env._compute_imagination_reward_terms(parsed, torch.zeros(64, 12), None,
+                                              {"thigh_contact": torch.zeros(64, 4), "foot_contact": torch.ones(64, 4)})
+        out[flag] = float(env.imagination_reward_per_step["dof_acc_l2"].mean())
+    assert out[False] > 1000.0          # noise of +-1.5 rad/s over 0.02 s: a large spurious acceleration
+    assert out[True] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_s2_contract_sets_the_runtime_flags():
+    from configs.go2_flat_cfg import apply_s2_reward_contract
+
+    class Env:
+        pass
+    apply_s2_reward_contract(Env, DEFAULT, LIMITS)
+    assert Env.acceleration_from_state and Env.timers_before_rewards and Env.feet_air_time_threshold == 0.5
