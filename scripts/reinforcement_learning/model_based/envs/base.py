@@ -3,6 +3,16 @@ from tensordict import TensorDict
 
 
 class BaseEnv:
+    # F1 (plan v6 §3, amendment A1, 19 Nov 2026): per-member trajectory spread penalty. Off when f1_members = 0
+    # (standard RWM-U penalty, unchanged). On: every env carries K member paths (head k of the ensemble on its
+    # own path, own trunk and auxiliary memory, all driven by the policy's actions); the policy follows the
+    # member of its driving head, so rewards, terminations and contacts equal the standard path's; the penalty
+    # term is uncertainty_penalty_weight * f1_gain * f1_scale[d] * spread, spread = sum over the normalized
+    # state dims of the std over members, d = imagined states fed back since the episode start.
+    f1_members = 0
+    f1_scale = None          # s(d), d = 0 .. len - 1 (the last value is held beyond, never reached at d <= 255)
+    f1_gain = None           # g, fixed by the declared mean-matching rule (A1 §2)
+
     def __init__(
         self,
         num_envs: int,
@@ -56,6 +66,8 @@ class BaseEnv:
         self._init_intervals()
         self._init_additional_imagination_attributes()
         state_history, action_history = self._init_imagination_history()
+        if self._f1_on():
+            self._f1_init(state_history)
         self._init_imagination_command()
         self.last_obs = TensorDict({"policy": torch.zeros(self._num_envs, self.observation_dim)}, batch_size=[self._num_envs], device=self.device)
         self.extras = {}
@@ -64,8 +76,14 @@ class BaseEnv:
     
     def _reset_idx(self, env_ids):
         self.extras["log"] = dict()
-        self.system_dynamics.reset_partial(env_ids)
-        self.system_dynamics_model_ids[:, env_ids, :] = torch.randint(0, self.system_dynamics.ensemble_size, (1, len(env_ids), 1), device=self.device)
+        if self._f1_on():
+            # memory rows of every member path of these envs; the driving head is drawn among the K members
+            self.system_dynamics.reset_partial(self._f1_rows(env_ids))
+            high = int(self.f1_members)
+        else:
+            self.system_dynamics.reset_partial(env_ids)
+            high = self.system_dynamics.ensemble_size
+        self.system_dynamics_model_ids[:, env_ids, :] = torch.randint(0, high, (1, len(env_ids), 1), device=self.device)
         info = self._reset_imagination_reward_buffer(env_ids)
         self.extras["log"].update(info)
         self._reset_intervals(env_ids)
@@ -166,7 +184,13 @@ class BaseEnv:
     def imagination_step(self, rollout_action, state_history, action_history):
         _, rollout_action_normalized = self.dataset.normalize(None, rollout_action)
         action_history = torch.cat([action_history[:, 1:], rollout_action_normalized.unsqueeze(1)], dim=1)
-        imagination_states, aleatoric_uncertainty, self.epistemic_uncertainty, extensions, contacts, terminations = self.system_dynamics.forward(state_history, action_history, self.system_dynamics_model_ids)
+        if self._f1_on():
+            imagination_states, aleatoric_uncertainty, self.epistemic_uncertainty, extensions, contacts, terminations = \
+                self._f1_forward(state_history, action_history)
+        else:
+            imagination_states, aleatoric_uncertainty, self.epistemic_uncertainty, extensions, contacts, terminations = \
+                self.system_dynamics.forward(state_history, action_history, self.system_dynamics_model_ids)
+        driving_prediction = imagination_states
         imagination_states_denormalized, _ = self.dataset.denormalize(imagination_states, None)
         parsed_imagination_states = self._parse_imagination_states(imagination_states_denormalized)
         parsed_extensions = self._parse_extensions(extensions)
@@ -178,10 +202,14 @@ class BaseEnv:
         self._reset_imagination_command(command_ids)
         event_ids = self._process_event_env_ids()
         imagination_states = self._apply_interval_events(imagination_states_denormalized, parsed_imagination_states, event_ids)
+        if self._f1_on():
+            self._f1_advance(driving_prediction, imagination_states, event_ids)
         state_history = torch.cat([state_history[:, 1:], imagination_states.unsqueeze(1)], dim=1)
         reset_env_ids = dones.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
             state_history, action_history = self._reset_imagination_history(reset_env_ids, state_history, action_history)
+            if self._f1_on():
+                self._f1_restart(reset_env_ids, state_history)
         return self.last_obs, rewards, dones, extras, state_history, action_history, self.epistemic_uncertainty
 
     def _post_imagination_step(self):
@@ -190,8 +218,9 @@ class BaseEnv:
         rewards = torch.zeros(self._num_envs, dtype=torch.float, device=self.device)
         for term in self.imagination_episode_sums.keys():
             if term == "uncertainty":
-                rewards += self.uncertainty_penalty_weight * self.epistemic_uncertainty * self._step_dt
-                self.imagination_episode_sums[term] += self.uncertainty_penalty_weight * self.epistemic_uncertainty * self._step_dt
+                penalty = self.f1_penalty if self._f1_on() else self.epistemic_uncertainty
+                rewards += self.uncertainty_penalty_weight * penalty * self._step_dt
+                self.imagination_episode_sums[term] += self.uncertainty_penalty_weight * penalty * self._step_dt
             else:
                 term_value = self.imagination_reward_per_step[term]
                 rewards += self.reward_term_weights[term] * term_value * self._step_dt
@@ -228,6 +257,74 @@ class BaseEnv:
         else:
             return (self.episode_length_buf % self.event_intervals == 0).nonzero(as_tuple=False).squeeze(-1)
         
+    # ------------------------------------------------------------------ F1 (amendment A1)
+    def _f1_on(self):
+        return int(getattr(self, "f1_members", 0) or 0) > 0
+
+    def _f1_rows(self, env_ids):
+        """Rows of the member batch (member-major: row = k * num_envs + env) for env_ids."""
+        k = torch.arange(int(self.f1_members), device=self.device).view(-1, 1)
+        return (k * self._num_envs + env_ids.view(1, -1)).reshape(-1)
+
+    def _f1_init(self, state_history):
+        K = int(self.f1_members)
+        if K > self.system_dynamics.ensemble_size:
+            raise ValueError(f"f1_members {K} > ensemble size {self.system_dynamics.ensemble_size}")
+        if getattr(self, "warm_start_resets", False):
+            raise NotImplementedError("F1 with warm-start resets is not implemented (A1 uses paper mode)")
+        rule = getattr(self, "termination_rule", None)
+        if rule is not None and (rule[0] != "selected" or rule[2] is not None):
+            raise NotImplementedError("F1 supports the default 'selected' termination rule only (A1)")
+        if self.f1_scale is None or self.f1_gain is None:
+            raise ValueError("F1 needs f1_scale (s(d)) and f1_gain (g) from the frozen calibration")
+        self._f1_scale_t = torch.as_tensor(self.f1_scale, dtype=torch.float32, device=self.device).flatten()
+        if self._f1_scale_t.numel() < self._max_episode_length:
+            raise ValueError(f"f1_scale covers {self._f1_scale_t.numel()} depths < episode length {self._max_episode_length}")
+        self.f1_states = state_history.repeat(K, 1, 1).clone()                 # [K*N, H, S], member-major
+        self.f1_depth = torch.zeros(self._num_envs, dtype=torch.long, device=self.device)
+        self._f1_ids = torch.arange(K, device=self.device).repeat_interleave(self._num_envs).view(1, -1, 1)
+        self.f1_spread = torch.zeros(self._num_envs, device=self.device)
+        self.f1_penalty = torch.zeros(self._num_envs, device=self.device)
+
+    def _f1_forward(self, state_history, action_history):
+        """One step of every member path. Returns the driving member's outputs, in the standard forward's order."""
+        K, N, L = int(self.f1_members), self._num_envs, state_history.shape[1]
+        xs = self.f1_states[:, -L:]                                             # same length as the driving input
+        xa = action_history.repeat(K, 1, 1)
+        means, aleatoric, epistemic, extensions, contacts, terminations = self.system_dynamics.forward(xs, xa, self._f1_ids)
+        drive = self.system_dynamics_model_ids.view(1, N, 1)
+
+        def pick(t):
+            if t is None:
+                return None
+            flat = t.reshape(K, N, -1)
+            return torch.gather(flat, 0, drive.expand(1, N, flat.shape[-1])).squeeze(0).reshape((N,) + tuple(t.shape[1:]))
+
+        member_means = means.reshape(K, N, -1)
+        self._f1_member_means = member_means
+        self.f1_spread = member_means.std(dim=0).sum(dim=1)
+        depth = self.f1_depth.clamp(max=self._f1_scale_t.numel() - 1)
+        self.f1_penalty = float(self.f1_gain) * self._f1_scale_t[depth] * self.f1_spread
+        return pick(means), pick(aleatoric), pick(epistemic), pick(extensions), pick(contacts), pick(terminations)
+
+    def _f1_advance(self, driving_prediction, driving_after_events, event_ids):
+        """Append each member's prediction; an interval push shifts every member by the driving path's shift."""
+        member_next = self._f1_member_means.clone()
+        if len(event_ids) > 0:
+            member_next[:, event_ids] += (driving_after_events[event_ids] - driving_prediction[event_ids]).unsqueeze(0)
+        # the driving member continues exactly as the driving path
+        drive = self.system_dynamics_model_ids.view(1, -1, 1).expand(1, self._num_envs, member_next.shape[-1])
+        member_next.scatter_(0, drive, driving_after_events.unsqueeze(0))
+        self.f1_states = torch.cat([self.f1_states[:, 1:], member_next.reshape(-1, 1, member_next.shape[-1])], dim=1)
+        self.f1_depth += 1
+
+    def _f1_restart(self, env_ids, state_history):
+        """Members of reset envs restart from the driving path's new start rows; depth 0."""
+        L = state_history.shape[1]
+        rows = self._f1_rows(env_ids)
+        self.f1_states[rows, -L:] = state_history[env_ids].repeat(int(self.f1_members), 1, 1)
+        self.f1_depth[env_ids] = 0
+
     @property
     def num_envs(self):
         return self._num_envs

@@ -2,14 +2,23 @@
 from pathlib import Path
 import sys
 
+import pytest
 import torch
 
 MB = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(MB / "envs"))
 import go2_kinematics as K  # noqa: E402
 
-torch.set_default_dtype(torch.float64)
-DEFAULT = torch.tensor(K.DEFAULT_Q)
+DEFAULT = torch.tensor(K.DEFAULT_Q, dtype=torch.float64)
+
+
+@pytest.fixture(autouse=True)
+def float64_default():
+    """float64 inside this module only; the old module-level switch leaked into every later test file."""
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    yield
+    torch.set_default_dtype(old)
 
 
 def test_straight_legs_geometry():
