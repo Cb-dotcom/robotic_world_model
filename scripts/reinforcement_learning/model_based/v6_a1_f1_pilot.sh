@@ -40,6 +40,7 @@ if [ "$PHASE" = calibrate ]; then
   { git rev-parse HEAD; git status --short | grep -v '^??' ; } > "$OUT/git.txt"
   CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_f1_env.py $AN/tests/test_f1_calibrate.py $AN/tests/test_c0_battery.py \
     > "$OUT/tests.log" 2>&1 || fail "CPU tests failed (tests.log)"
+  grep -qE "[0-9]+ skipped" "$OUT/tests.log" && fail "tests were skipped (tests.log): rsl_rl not importable?"
   status "tests passed"
   CUDA_VISIBLE_DEVICES="" $PY $AN/f1_calibrate.py --wm "$WM" --trace "$CAL_TRACE" --out "$OUT/calibration" \
     > "$OUT/calibration.log" 2>&1 || fail "calibration ($(tail -1 "$OUT/calibration.log"))"
@@ -61,6 +62,8 @@ need "$CAL" "$WM"
 DDIRS=( $LOGS/*_2004 ); [ ${#DDIRS[@]} -eq 1 ] || fail "need exactly one $LOGS/*_2004 (arm D)"
 D_DIR=${DDIRS[0]}
 need "$D_DIR/run_args.json"
+CTRL_WM=$($PY -c "import json, sys; print(json.load(open(sys.argv[1]))['world_model_checkpoint']['sha256'])" "$D_DIR/run_args.json" 2>/dev/null | tail -1)
+[ "$CTRL_WM" = "$(sha256sum "$WM" | cut -d' ' -f1)" ] || fail "run 2004 was trained with another world model (${CTRL_WM:-none}); A1 needs the same file"
 for C in 10 30; do for S in 42 43; do need "$D_EVAL/D_cmd${C}_s${S}/eval.log"; done; done
 ls -d $LOGS/*_$RUN >/dev/null 2>&1 && fail "run $RUN already exists"
 git diff --quiet HEAD -- scripts source || fail "uncommitted changes in scripts/ or source/"
