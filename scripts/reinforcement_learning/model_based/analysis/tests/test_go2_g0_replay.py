@@ -136,6 +136,12 @@ def test_warm_check_reading_rule(tmp_path):
     assert wc.compare(tmp_path / "c.log", tmp_path / "w2.log")["trap_removed_by_warm_resets"] is True
     (tmp_path / "w3.log").write_text(log([(50, 2.0), (100, 3.0), (299, 6.0)]))
     assert wc.compare(tmp_path / "c.log", tmp_path / "w3.log")["trap_removed_by_warm_resets"] is False
+    assert wc.compare(tmp_path / "c.log", tmp_path / "w.log", expected_iterations=300)[
+        "trap_removed_by_warm_resets"
+    ]
+    (tmp_path / "partial.log").write_text(log([(50, 20.0), (100, 40.0)]))
+    with pytest.raises(ValueError, match="expected both logs to end at iteration 299"):
+        wc.compare(tmp_path / "c.log", tmp_path / "partial.log", expected_iterations=300)
 
 
 def test_trainer_development_iteration_cap(tmp_path, monkeypatch):

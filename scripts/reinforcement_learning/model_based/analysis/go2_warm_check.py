@@ -35,8 +35,16 @@ def series(log_path):
     return out
 
 
-def compare(cold_log, warm_log, marks=(50, 100, 200)):
+def compare(cold_log, warm_log, marks=(50, 100, 200), *, expected_iterations=None):
     c, w = series(cold_log), series(warm_log)
+    if expected_iterations is not None:
+        expected_last = expected_iterations - 1
+        cold_last = max(c, default=None)
+        warm_last = max(w, default=None)
+        if cold_last != expected_last or warm_last != expected_last:
+            raise ValueError(
+                f"expected both logs to end at iteration {expected_last}; cold={cold_last}, warm={warm_last}"
+            )
     common = sorted(set(c) & set(w))
     if not common:
         raise ValueError("no common logged iteration with mean reward and mean episode length")
@@ -56,8 +64,12 @@ def main(argv=None):
     p.add_argument("--cold-log", type=Path, required=True)
     p.add_argument("--warm-log", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--expected-iterations", type=int, help="require the final iteration in both logs")
     a = p.parse_args(argv)
-    r = compare(a.cold_log, a.warm_log)
+    try:
+        r = compare(a.cold_log, a.warm_log, expected_iterations=a.expected_iterations)
+    except ValueError as error:
+        p.error(str(error))
     a.out.write_text(json.dumps(r, indent=1))
     lines = ["A4 D0: cold vs warm imagination resets, G0 model, G0 settings (development check)",
              "iteration | cold: mean reward, mean episode length | warm: mean reward, mean episode length"]

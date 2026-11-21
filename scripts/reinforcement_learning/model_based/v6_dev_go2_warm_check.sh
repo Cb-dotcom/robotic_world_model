@@ -46,5 +46,7 @@ for ARM in cold:paper:3101 warm:paper_warm:3102; do
   status "$NAME done"
 done
 CUDA_VISIBLE_DEVICES="" $PY $AN/go2_warm_check.py --cold-log "$OUT/train_cold.log" --warm-log "$OUT/train_warm.log" \
-  --out "$OUT/warm_check.json" | tee "$OUT/warm_check.txt"
+  --expected-iterations "$ITERS" --out "$OUT/warm_check.json" 2>&1 | tee "$OUT/warm_check.txt" \
+  || fail "could not score the cold/warm pair (warm_check.txt)"
+[ -s "$OUT/warm_check.json" ] || fail "scorer did not write warm_check.json"
 status "done; $(sha256sum "$OUT/warm_check.json")"
