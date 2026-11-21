@@ -29,7 +29,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from c0_battery import ZeroDisagreement, ci, pair_bootstrap  # noqa: E402
+from c0_battery import ZeroDisagreement, ci, log_ratio, pair_bootstrap  # noqa: E402
 from pre_reset_transitions import sha256  # noqa: E402
 
 DEPTHS = (25, 16)
@@ -37,7 +37,9 @@ STEP_MS = 20
 
 
 def load_sources(path):
-    """{source: {kind: (log_ctx [H, W], log_imag [H, W], clusters [W])}} in the saved order."""
+    """{source: {kind: (log_ctx [H, W], log_imag [H, W], clusters [W], registered LR [H, W])}} in the saved order.
+    log_ctx and log_imag are float64 (the decomposition); the registered LR is c0_battery.log_ratio on the saved
+    float32 spreads, exactly as the registered run computed it (the reproduction check)."""
     out = {}
     with np.load(path, allow_pickle=False) as z:
         names = []
@@ -48,11 +50,13 @@ def load_sources(path):
         for name in names:
             out[name] = {}
             for kind in ("fall", "nonfall"):
-                ur = z[f"{name}/{kind}/u_real"].sum(-1)                       # [H, W]
-                ui = z[f"{name}/{kind}/u_imag"].sum(-1)                       # [heads, H, W]
+                u_real, u_imag = z[f"{name}/{kind}/u_real"], z[f"{name}/{kind}/u_imag"]
+                lr = log_ratio(u_imag, u_real, "sum")                          # registered path, float32 [H, W]
+                ur = u_real.astype(np.float64).sum(-1)                          # [H, W]
+                ui = u_imag.astype(np.float64).sum(-1)                          # [heads, H, W]
                 if (ur <= 0).any() or (ui <= 0).any():
                     raise ZeroDisagreement(f"{name}/{kind}: zero summed spread")
-                out[name][kind] = (np.log(ur), np.log(ui).mean(0), z[f"{name}/{kind}/clusters"].astype(str))
+                out[name][kind] = (np.log(ur), np.log(ui).mean(0), z[f"{name}/{kind}/clusters"].astype(str), lr)
     return out
 
 
@@ -62,6 +66,16 @@ def analyse(sources, n_boot=10_000, seed=0):
     strata = np.concatenate([[s] * len(sources[s]["fall"][2]) for s in names])
     res = {}
     for d in DEPTHS:
+        # registered path (as c0_battery.summarize / c0_verdict): H = -mean of the float32 LR, the same pair draws
+        reg = {kind: np.asarray(cat(kind, 3)[d], float) for kind in ("fall", "nonfall")}
+        rf, rn = pair_bootstrap(reg["fall"], reg["nonfall"], strata, cat("fall", 2), cat("nonfall", 2), n_boot, seed)
+        h_reg = {kind: float(-reg[kind].mean()) for kind in reg}
+        rb_reg = (-rf) / np.where(rn == 0, np.nan, -rn)
+        registered_path = dict(H_fall=h_reg["fall"], H_nonfall=h_reg["nonfall"], H_fall_ci=sorted(-x for x in ci(rf)),
+                               H_nonfall_ci=sorted(-x for x in ci(rn)),
+                               ratio=h_reg["fall"] / h_reg["nonfall"] if h_reg["nonfall"] != 0 else float("nan"),
+                               ratio_ci=ci(rb_reg[np.isfinite(rb_reg)]))
+        # decomposition: float64 logs of the same spreads, the same draws
         vals = {kind: np.stack([cat(kind, 0)[d], cat(kind, 1)[d]], axis=1) for kind in ("fall", "nonfall")}  # [W, 2]
         bf, bn = pair_bootstrap(vals["fall"], vals["nonfall"], strata, cat("fall", 2), cat("nonfall", 2), n_boot, seed)
         pt = {kind: vals[kind].mean(0) for kind in vals}
@@ -87,27 +101,29 @@ def analyse(sources, n_boot=10_000, seed=0):
                  "imagination_part = -(C_imag,fall - C_imag,nonfall)")
         row["ratio_H"] = dict(ratio=float(h_f / h_n) if h_n != 0 else float("nan"),
                               ratio_ci=ci(rb[np.isfinite(rb)]))
+        row["registered_path"] = registered_path
+        row["float64_vs_registered_max_rel"] = float(max(abs(h_f - h_reg["fall"]) / abs(h_reg["fall"]),
+                                                         abs(h_n - h_reg["nonfall"]) / abs(h_reg["nonfall"])))
         row["ms_before_terminal_target"] = (25 - d) * STEP_MS
         res[f"d{d}"] = row
     return res
 
 
-def check_registered(res, report_path):
-    """At d = 25 the H values and the ratio must reproduce the registered C0 numbers (to float32 precision: the
-    saved spreads are float32, and the summation order differs; relative tolerance 1e-6)."""
+def check_registered(res, report_path, rtol=1e-9):
+    """At d = 25 the registered path (c0_battery.log_ratio on the saved float32 spreads, float64 mean, the same
+    pair-bootstrap draws) must reproduce the registered C0 numbers; the largest relative difference is reported."""
     rep = json.loads(Path(report_path).read_text())["report"]["pooled"]
     rule = rep["c0_rule_d25_sum"]
     reg = dict(H_fall=rep["fall"]["rows"]["d25/sum"]["H"], H_nonfall=rep["nonfall"]["rows"]["d25/sum"]["H"],
                ratio=rule.get("ratio"), ratio_ci=rule.get("ratio_ci"), h_fall_ci=rule.get("h_fall_ci"))
-    new = res["d25"]
-    ok = (np.isclose(new["fall"]["H"], reg["H_fall"], rtol=1e-6, atol=1e-9)
-          and np.isclose(new["nonfall"]["H"], reg["H_nonfall"], rtol=1e-6, atol=1e-9))
+    new = res["d25"]["registered_path"]
+    pairs = [(new["H_fall"], reg["H_fall"]), (new["H_nonfall"], reg["H_nonfall"])]
     if reg["ratio"] is not None:                 # the registered branch with H_nonfall > 0 (the real data)
-        ok = ok and np.isclose(new["ratio_H"]["ratio"], reg["ratio"], rtol=1e-9) \
-            and np.allclose(new["ratio_H"]["ratio_ci"], reg["ratio_ci"], rtol=1e-6)
+        pairs += [(new["ratio"], reg["ratio"])] + list(zip(new["ratio_ci"], reg["ratio_ci"]))
     else:                                        # H_nonfall <= 0: the rule reads H_fall's interval
-        ok = ok and np.allclose(new["fall"]["H_ci"], reg["h_fall_ci"], rtol=1e-6)
-    return dict(registered=reg, reproduced=bool(ok))
+        pairs += list(zip(new["H_fall_ci"], reg["h_fall_ci"]))
+    rel = max(abs(a - b) / max(abs(b), 1e-300) for a, b in pairs)
+    return dict(registered=reg, reproduced=bool(rel <= rtol), max_rel_diff=float(rel), rtol=rtol)
 
 
 def main():
@@ -126,16 +142,21 @@ def main():
                    report_sha256=sha256(a.report), n_boot=a.n_boot, seed=a.seed, analysis_sha256=sha256(__file__))
     (a.out / "c0_supplement.json").write_text(json.dumps(payload, indent=1))
     lines = ["C0 supplementary analyses (A3 §1; registered endpoint d25 unchanged; no verdict)",
-             f"registered numbers reproduced at d25: {chk['reproduced']}"]
+             f"registered numbers reproduced at d25: {chk['reproduced']} (registered arithmetic path; max relative "
+             f"difference {chk['max_rel_diff']:.2e}, tolerance {chk['rtol']:.0e})",
+             "decomposition in float64; it differs from the registered float32 path by at most "
+             f"{max(res[f'd{d}']['float64_vs_registered_max_rel'] for d in DEPTHS):.1e} (relative)"]
     for d in DEPTHS:
         r = res[f"d{d}"]
         f_, n_, df = r["fall"], r["nonfall"], r["difference"]
         lines += [f"d{d} ({r['ms_before_terminal_target']} ms before the terminal target):",
                   f"  geometric mean u_imag/u_ctx: fall {f_['geomean_imag_over_ctx']:.3f} ({f_['windows']} windows), "
                   f"non-fall {n_['geomean_imag_over_ctx']:.3f}",
-                  f"  H fall {f_['H']:.3f} [{f_['H_ci'][0]:.3f}, {f_['H_ci'][1]:.3f}]; non-fall {n_['H']:.3f} "
-                  f"[{n_['H_ci'][0]:.3f}, {n_['H_ci'][1]:.3f}]; ratio {r['ratio_H']['ratio']:.2f} "
-                  f"[{r['ratio_H']['ratio_ci'][0]:.2f}, {r['ratio_H']['ratio_ci'][1]:.2f}]",
+                  f"  registered path: H fall {r['registered_path']['H_fall']:.4f} [{r['registered_path']['H_fall_ci'][0]:.3f}, "
+                  f"{r['registered_path']['H_fall_ci'][1]:.3f}]; non-fall {r['registered_path']['H_nonfall']:.4f} "
+                  f"[{r['registered_path']['H_nonfall_ci'][0]:.3f}, {r['registered_path']['H_nonfall_ci'][1]:.3f}]; "
+                  f"ratio {r['registered_path']['ratio']:.3f} [{r['registered_path']['ratio_ci'][0]:.3f}, "
+                  f"{r['registered_path']['ratio_ci'][1]:.3f}]",
                   f"  geometric means: u_ctx fall {f_['geomean_u_ctx']:.3f} vs non-fall {n_['geomean_u_ctx']:.3f}; "
                   f"u_imag fall {f_['geomean_u_imag']:.3f} vs non-fall {n_['geomean_u_imag']:.3f}",
                   f"  dH = {df['dH']:.3f} [{df['dH_ci'][0]:.3f}, {df['dH_ci'][1]:.3f}] = context part "

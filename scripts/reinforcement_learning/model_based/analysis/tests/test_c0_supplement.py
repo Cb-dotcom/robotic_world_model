@@ -35,7 +35,8 @@ def test_supplement_reproduces_the_registered_numbers(tmp_path, monkeypatch):
     out = c0_run(tmp_path, monkeypatch)
     res = sup.analyse(sup.load_sources(out / "c0_windows.npz"), n_boot=300, seed=0)
     chk = sup.check_registered(res, out / "c0_report.json")
-    assert chk["reproduced"], chk
+    assert chk["reproduced"] and chk["max_rel_diff"] <= 1e-12, chk     # the registered arithmetic, repeated
+    assert res["d25"]["float64_vs_registered_max_rel"] < 1e-5          # float64 decomposition vs float32 path
     for d in ("d25", "d16"):
         r = res[d]
         assert abs(r["difference"]["identity_error"]) < 1e-12
@@ -43,7 +44,7 @@ def test_supplement_reproduces_the_registered_numbers(tmp_path, monkeypatch):
         assert r["fall"]["geomean_imag_over_ctx"] == pytest.approx(np.exp(-r["fall"]["H"]))
     assert res["d16"]["ms_before_terminal_target"] == 180
     rep = json.loads((out / "c0_report.json").read_text())["report"]["pooled"]
-    assert res["d16"]["fall"]["H"] == pytest.approx(rep["fall"]["rows"]["d16/sum"]["H"], rel=1e-6)
+    assert res["d16"]["registered_path"]["H_fall"] == pytest.approx(rep["fall"]["rows"]["d16/sum"]["H"], rel=1e-9)
 
 
 def test_supplement_cli_stops_when_the_report_does_not_match(tmp_path, monkeypatch):
