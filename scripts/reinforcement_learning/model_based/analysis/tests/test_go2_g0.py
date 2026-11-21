@@ -273,3 +273,42 @@ def test_trainer_wiring_reaches_the_run_config(tmp_path, monkeypatch):
     assert cfg.data_config.dataset_folder == "start_data" and Path(cfg.data_config.dataset_root) == (tmp_path / "m").resolve()
     assert T.args_cli.init_policy_checkpoint == str(init.resolve()) and T.args_cli.seed == 1000
     assert Go2FlatEnv.timers_before_rewards is True
+
+
+def test_g0_diagnose_collects_the_evidence(tmp_path):
+    import go2_g0_diagnose as dg
+    from policy_loop import ObservationBuilder, Policy, consistent_policy_trace, save_actor
+    tr = round0_trace(T=300, N=6)
+    s2 = Policy(save_actor(tmp_path / "s2.pt"))
+    ident = dict(state_mean=np.zeros(45, np.float32), state_std=np.ones(45, np.float32),
+                 action_mean=np.zeros(12, np.float32), action_std=np.ones(12, np.float32))
+    tr = consistent_policy_trace(tr, s2, ObservationBuilder("go2_flat", ident), ident)
+    phys = save(tmp_path / "r0.npz", tr)
+    prep.prepare(phys, tmp_path / "m", frac=0.2, seed=101)
+    with np.load(tmp_path / "m" / "go2_norm.npz") as z:
+        stats = {k: z[k] for k in z.files}
+    wm = fake_go2_wm(tmp_path / "wm.pt", stats)
+    asset, _, _ = e16_npz(tmp_path)
+    torch.manual_seed(5)
+    g0 = save_actor(tmp_path / "g0.pt")
+    for tag, folder, length in (("G0", tmp_path / "ev", 12), ("unitree_s2", tmp_path / "s2ev", 1000)):
+        for s in (42, 43):
+            d = folder / f"{tag}_cmd10_s{s}"
+            d.mkdir(parents=True)
+            with (d / "episodes.csv").open("w") as f:
+                f.write("env,start,length,fall,censored\n")
+                for e in range(10):
+                    f.write(f"{e},0,{length},{length < 100},False\n")
+                f.write("0,0,3,False,True\n")
+    log = tmp_path / "train.log"
+    log.write_text("".join(f"  Learning iteration {i}/2500  \n  Mean reward: {i / 100:.2f}\n  Mean episode length: 200.0\n"
+                           for i in (0, 100, 500, 1000, 2499)))
+    r = dg.run(g0, wm, tmp_path / "m" / "start_data", asset, phys, tmp_path / "ev", tmp_path / "s2ev", log,
+               tmp_path / "out", envs=8, steps=20, device="cpu")
+    pe = r["physics_episodes"]
+    assert pe["g0"]["episodes"] == 20 and pe["g0"]["median_steps"] == 12 and pe["g0"]["share_under_25_steps"] == 1.0
+    assert pe["s2"]["falls"] == 0
+    sup = r["action_support_on_s2_observations"]
+    assert sup["rows"] == 300 * 6 and 0 <= sup["share_outside_s2_range"] <= 1
+    assert r["imagination_g0"]["steps"] == 20 and r["imagination_g0"]["actions"]["abs_mean"] > 0
+    assert r["training"]["1000"]["mean_reward"] == 10.0 and "last (2499)" in r["training"]
