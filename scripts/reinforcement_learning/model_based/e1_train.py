@@ -61,6 +61,8 @@ def main(argv=None):
     pre.add_argument("--start-data", type=Path, default=None, help="A3: imagination start-data folder (go2_flat)")
     pre.add_argument("--init-policy-checkpoint", type=Path, default=None,
                      help="A3: initial actor/critic (later rounds); the optimizer is new")
+    pre.add_argument("--max-iterations", type=int, default=None,
+                     help="development checks only (A4): stop PPO after this many iterations (default: the recipe's)")
     known, rest = pre.parse_known_args(argv)
     wm = known.wm_checkpoint.resolve()
     if not wm.is_file():
@@ -104,6 +106,11 @@ def main(argv=None):
         # p15_train sets -1.0 after resolve_task_config; override it last, just before the run.
         cfg.environment_config.uncertainty_penalty_weight = float(known.penalty_weight)
         print(f"[e1] uncertainty_penalty_weight = {known.penalty_weight}", flush=True)
+        if known.max_iterations is not None:
+            if known.max_iterations < 1:
+                raise SystemExit("--max-iterations must be >= 1")
+            cfg.policy_training_config.max_iterations = int(known.max_iterations)
+            print(f"[dev] max_iterations = {known.max_iterations} (development check, not the paper recipe)", flush=True)
         if known.init_policy_checkpoint is not None:
             import go2_study
             T.args_cli.init_policy_checkpoint = str(known.init_policy_checkpoint.resolve())

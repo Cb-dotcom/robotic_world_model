@@ -17,7 +17,7 @@ pytest.importorskip("rsl_rl.modules")
 
 import go2_g0_replay as rp  # noqa: E402
 import go2_round0_prepare as prep  # noqa: E402
-from test_go2_g0 import fake_go2_wm, round0_trace, save  # noqa: E402
+from test_go2_g0 import fake_go2_wm, restore_go2_class, round0_trace, save  # noqa: E402,F401 (autouse fixture)
 
 IDENT = dict(state_mean=np.zeros(45, np.float32), state_std=np.ones(45, np.float32),
              action_mean=np.zeros(12, np.float32), action_std=np.ones(12, np.float32))
@@ -121,3 +121,38 @@ def test_replay_end_to_end_checks_its_inputs(tmp_path):
     np.savez(tmp_path / "other.npz", **{k: v + 1 for k, v in stats.items()})
     with pytest.raises(ValueError, match="differs"):
         rp.run(wm, tmp_path / "other.npz", phys, held, tmp_path / "out3", K=20, frac=0.2)
+
+
+def test_warm_check_reading_rule(tmp_path):
+    import go2_warm_check as wc
+    log = lambda lens: "".join(f"  Learning iteration {i}/300  \n  Mean reward: {-0.01 * i:.2f}\n  Mean episode length: {L}\n"
+                               for i, L in lens)
+    (tmp_path / "c.log").write_text(log([(50, 1.1), (100, 1.2), (299, 1.3)]))
+    (tmp_path / "w.log").write_text(log([(50, 20.0), (100, 40.0), (299, 80.0)]))
+    r = wc.compare(tmp_path / "c.log", tmp_path / "w.log")
+    assert r["last_common_iteration"] == 299 and r["trap_removed_by_warm_resets"] is True
+    assert set(r["iterations"]) == {"50", "100", "299"}
+    (tmp_path / "w2.log").write_text(log([(50, 2.0), (100, 3.0), (299, 30.0)]))
+    assert wc.compare(tmp_path / "c.log", tmp_path / "w2.log")["trap_removed_by_warm_resets"] is True
+    (tmp_path / "w3.log").write_text(log([(50, 2.0), (100, 3.0), (299, 6.0)]))
+    assert wc.compare(tmp_path / "c.log", tmp_path / "w3.log")["trap_removed_by_warm_resets"] is False
+
+
+def test_trainer_development_iteration_cap(tmp_path, monkeypatch):
+    import e1_train
+    import train as T
+    from test_go2_g0 import e16_npz
+    tr = round0_trace()
+    prep.prepare(save(tmp_path / "r0.npz", tr), tmp_path / "m", frac=0.2, seed=101)
+    asset, _, _ = e16_npz(tmp_path)
+    wm = tmp_path / "wm.pt"
+    wm.write_bytes(b"x")
+    seen = {}
+    monkeypatch.setattr(T, "run", lambda cfg: seen.setdefault("cfg", cfg))
+    from envs import BaseEnv
+    e1_train.main(["--wm-checkpoint", str(wm), "--reward-contract", "s2", "--asset-trace", str(asset),
+                   "--start-data", str(tmp_path / "m" / "start_data"), "--max-iterations", "300",
+                   "paper_warm", "3102", "go2_flat", "--seed", "1000"])
+    assert seen["cfg"].policy_training_config.max_iterations == 300 and BaseEnv.warm_start_resets is True
+    assert seen["cfg"].environment_config.num_envs == 4096 and seen["cfg"].environment_config.uncertainty_penalty_weight == -1.0
+    BaseEnv.warm_start_resets = False
