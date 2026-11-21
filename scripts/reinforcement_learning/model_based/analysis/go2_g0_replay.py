@@ -152,16 +152,18 @@ def episode_context(sd, ep, device):
 
 
 @torch.no_grad()
-def rollouts(sd, eps, starts, K, H, mode, device):
+def rollouts(sd, eps, starts, K, H, mode, device, keep=None):
     """Own-prediction rollouts with recorded actions; head h drives copy h of every start (model_ids = h).
 
     Step 1 predicts row j0 (warm: states j0-H..j0-1, actions j0-H+1..j0; cold: state j0-1, action j0).
     Step m > 1 feeds the driving head's predicted state for row j0+m-2 and the recorded action j0+m-1.
-    Returns stop probabilities and squared errors vs the recorded rows, both [starts, E, K].
+    Returns stop probabilities and squared errors vs the recorded rows, both [starts, E, K]; with keep (1-based step
+    numbers) also {step: driving predictions [starts, E, 45] (normalized)}.
     """
     E, n = len(sd.state_heads), len(starts)
     if n == 0:
-        return np.zeros((0, E, K), np.float32), np.zeros((0, E, K), np.float32)
+        empty = (np.zeros((0, E, K), np.float32), np.zeros((0, E, K), np.float32))
+        return empty if keep is None else (*empty, {m: np.zeros((0, E, 45), np.float32) for m in keep})
     rep = lambda a: torch.from_numpy(np.repeat(a, E, axis=0)).to(device)  # start-major, head-minor rows
     drive = torch.arange(E, device=device).repeat(n)
     cols = torch.arange(n * E, device=device)
@@ -170,6 +172,7 @@ def rollouts(sd, eps, starts, K, H, mode, device):
     xa = rep(np.stack([eps[i].A[j - c + 1:j + 1] for i, j in starts]))
     P = np.empty((n, E, K), np.float32)
     ERR = np.empty((n, E, K), np.float32)
+    kept = {}
     sd.reset()
     for m in range(K):
         means, logits = all_heads(sd, xs, xa)
@@ -177,11 +180,13 @@ def rollouts(sd, eps, starts, K, H, mode, device):
         tgt = rep(np.stack([eps[i].S[j + m] for i, j in starts]))
         P[:, :, m] = torch.sigmoid(logits[drive, cols]).view(n, E).cpu().numpy()
         ERR[:, :, m] = ((pred - tgt) ** 2).mean(-1).view(n, E).cpu().numpy()
+        if keep is not None and m + 1 in keep:
+            kept[m + 1] = pred.view(n, E, -1).cpu().numpy()
         if m + 1 < K:
             xs = pred.unsqueeze(1)
             xa = rep(np.stack([eps[i].A[j + m + 1:j + m + 2] for i, j in starts]))
     sd.reset()
-    return P, ERR
+    return (P, ERR) if keep is None else (P, ERR, kept)
 
 
 # ----------------------------------------------------------------------------- statistics

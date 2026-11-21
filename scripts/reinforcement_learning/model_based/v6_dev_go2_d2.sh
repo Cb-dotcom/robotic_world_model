@@ -2,7 +2,7 @@
 # A4 D2 (21 Nov 2026): one mixed-data Go2 world model (round-0 nominal + D1 shift batch at 0.30 x friction).
 # Phase fit: input hash checks -> tests -> go2_mixed_prepare.py (E22 split of each source, pooled segments, pooled
 # normalizer, pooled start data; data folder write-protected) -> fit with the A3 §3 settings, fit seed 2.
-# The qualification (Q1-Q3, A4 §1) is a separate phase, written and hashed before it reads this model.
+# Phase qualify (same out dir, CPU): v6_dev_go2_d2.sh qualify logs/p2/a4_d2_1121 (Q1-Q3, A4 §1; rules in go2_d2_qualify.py).
 # Usage, from the robotic_world_model root in the container, with setsid nohup:
 #   setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d2.sh fit logs/p2/a4_d2_1121 > /tmp/a4_d2.out 2>&1 < /dev/null &
 set -uo pipefail
@@ -20,7 +20,28 @@ FIT_SEED=2
 export PYTHONUNBUFFERED=1 PYTHONPATH="/isaac-sim/kit/extscore/omni.client.lib:$PWD/../rsl_rl_rwm"
 status() { echo "$(date -u +%FT%TZ) [a4-d2 $PHASE] $*" | tee -a "$OUT/queue.log"; }
 fail() { status "FAILED: $*"; exit 1; }
-[ "$PHASE" = fit ] || { echo "phase must be fit"; exit 2; }
+PROBE=${PROBE:-logs/p2/a4_d1_1121c/probe.npz}
+PROBE_SHA=${PROBE_SHA:-ac67b6ec38cc3e4b9dac3a097f0de32ce9c576665c5fe1af6d04927cbddf796e}   # run-log 21 Nov (D1 collect)
+if [ "$PHASE" = qualify ]; then
+  # Q1-Q3 (A4 §1, §3) on data never fitted; rules fixed in analysis/go2_d2_qualify.py before the model was read.
+  WM="$OUT/wm/d2_wm_seed2.pt"; Q="$OUT/qualify"
+  [ -s "$WM" ] || { echo "no fitted model $WM"; exit 1; }
+  [ -e "$Q" ] && { echo "exists: $Q"; exit 2; }
+  [ "$(sha256sum "$PROBE" | cut -d' ' -f1)" = "$PROBE_SHA" ] || fail "probe hash differs from the run-log"
+  [ -z "${WM_SHA:-}" ] || [ "$(sha256sum "$WM" | cut -d' ' -f1)" = "$WM_SHA" ] || fail "model hash differs from WM_SHA"
+  mkdir -p "$Q"
+  { git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_d2_qualify.py; } > "$Q/git.txt"
+  CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d2_qualify.py > "$Q/tests.log" 2>&1 || fail "qualify tests ($Q/tests.log)"
+  grep -qE "[0-9]+ skipped" "$Q/tests.log" && fail "qualify tests were skipped"
+  status "qualify tests: $(tail -1 "$Q/tests.log"); model $(sha256sum "$WM" | cut -d' ' -f1)"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d2_qualify.py --wm "$WM" --norm "$OUT/data/go2_norm.npz" --round0 "$ROUND0" \
+    --r0-withheld "$OUT/data/r0/withheld.json" --probe "$PROBE" --out "$Q/run" > "$Q/qualify.log" 2>&1 \
+    || { tail -5 "$Q/qualify.log"; fail "qualification ($Q/qualify.log)"; }
+  cat "$Q/run/d2_qualify.txt" | tee -a "$OUT/queue.log"
+  status "qualified; $(sha256sum "$Q/run/d2_qualify.json")"
+  exit 0
+fi
+[ "$PHASE" = fit ] || { echo "phase must be fit or qualify"; exit 2; }
 [ -e "$OUT" ] && { echo "OUT exists: $OUT"; exit 2; }
 mkdir -p "$OUT"
 for f in "$ROUND0" "$SHIFT" "$A3_WITHHELD"; do [ -s "$f" ] || fail "missing $f"; done
