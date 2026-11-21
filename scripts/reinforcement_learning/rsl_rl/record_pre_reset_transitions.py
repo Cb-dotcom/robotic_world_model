@@ -24,6 +24,8 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--cmd_resample_s", type=float, default=10.0,
                     help="fixed command resampling time in seconds (E1 used 10)")
+parser.add_argument("--friction-scale", type=float, default=1.0,
+                    help="A4 D1: scale the ground friction (static and dynamic) by this factor; read back before stepping")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
@@ -143,6 +145,12 @@ def main(env_cfg, agent_cfg):
     if args.device is not None:
         env_cfg.sim.device = args.device
     env_cfg.events.push_robot = None
+    friction = None
+    if args.friction_scale != 1.0:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import friction_shift
+        friction = friction_shift.scale_ground(env_cfg, args.friction_scale)
+        print(f"[friction] ground friction x{args.friction_scale}: {friction}", flush=True)
     env_cfg.commands.base_velocity.resampling_time_range = (args.cmd_resample_s, args.cmd_resample_s)
     recorder_cfg = RecorderManagerBaseCfg(dataset_export_mode=DatasetExportMode.EXPORT_NONE,
                                           export_in_record_pre_reset=False)
@@ -152,6 +160,9 @@ def main(env_cfg, agent_cfg):
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     base = env.unwrapped
     try:
+        if friction is not None:
+            friction = friction_shift.verify(friction, base.scene["robot"])
+            print(f"[friction] verified in the simulator: {friction}", flush=True)
         shapes = {"system_state": 45, "system_action": 12, "system_contact": 8, "system_termination": 1}
         for name, width in shapes.items():
             if tuple(base.obs_buf[name].shape) != (args.num_envs, width):
@@ -181,6 +192,7 @@ def main(env_cfg, agent_cfg):
         git = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         meta = dict(task=args.task, robot=ROBOT["robot"], seed=agent_cfg.seed, num_envs=args.num_envs,
                     num_steps=args.num_steps, step_dt=float(base.step_dt), push_enabled=False,
+                    friction_shift=friction,
                     command_resampling_s=[args.cmd_resample_s, args.cmd_resample_s], checkpoint=str(checkpoint),
                     checkpoint_sha256=sha256(checkpoint), git_commit=git,
                     isaaclab_env_source_sha256=env_source_hash,
