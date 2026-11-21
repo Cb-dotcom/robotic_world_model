@@ -102,8 +102,12 @@ def main(argv=None):
     if a.cmd == "count":
         tr, meta = load(a.trace)
         fs = meta.get("friction_shift") or {}
-        if not fs.get("verified"):
-            raise SystemExit(f"{a.trace}: no verified friction shift in the metadata")
+        if not fs.get("verified") or "factor" not in fs:
+            raise SystemExit(f"{a.trace}: no verified friction shift with its factor in the metadata")
+        if abs(fs.get("effective_ratio_static", fs["factor"]) - fs["factor"]) > 1e-4:
+            raise SystemExit(f"{a.trace}: read-back ratio differs from the factor")
+        if a.out.resolve() == a.trace.with_suffix(".json").resolve():
+            raise SystemExit("--out would overwrite the recorder's sidecar JSON")
         c, w = count(tr)
         rec = dict(trace=str(a.trace), trace_sha256=sha256(a.trace), friction_factor=fs["factor"], seed=meta.get("seed"),
                    num_envs=meta.get("num_envs"), num_steps=meta.get("num_steps"), counts=c, recovery_windows=w,

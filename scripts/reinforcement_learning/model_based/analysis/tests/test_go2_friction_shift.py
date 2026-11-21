@@ -72,3 +72,26 @@ def test_choose_takes_the_first_level_that_meets_the_rule():
     mk = lambda f, r, ff: dict(falls=f, recoveries=r, fall_fraction=ff)
     assert d1.choose([(0.6, mk(3, 40, .01)), (0.45, mk(20, 30, .1)), (0.3, mk(60, 50, .3))]) == 0.45
     assert d1.choose([(0.6, mk(3, 40, .01)), (0.45, mk(20, 10, .1)), (0.3, mk(90, 50, .5))]) is None
+
+
+def test_verify_keeps_the_factor_and_count_reads_the_stored_record(tmp_path, monkeypatch):
+    """Regression (21 Nov): verify() returned only the read-back, so the stored record lost its factor."""
+    import json
+    rec = fs.scale_ground(cfg(), 0.6)
+    monkeypatch.setattr(fs, "read_materials", lambda: [("/World/ground/terrain/physicsMaterial", 0.6, 0.6, "multiply"),
+                                                       ("/World/envs/env_0/Robot/m", 0.8, 0.6, "average")])
+    stored = fs.verify(rec)
+    assert stored["factor"] == 0.6 and stored["nominal"]["static"] == 1.0 and stored["verified"]
+    tr = tilted()
+    meta = json.loads(str(tr["metadata"]))
+    meta.update(friction_shift=json.loads(json.dumps(stored)), seed=900, num_envs=3, num_steps=400)
+    tr["metadata"] = np.array(json.dumps(meta))
+    np.savez(tmp_path / "f0.60.npz", **tr)
+    (tmp_path / "f0.60.json").write_text("{}")                      # the recorder's sidecar
+    assert d1.main(["count", "--trace", str(tmp_path / "f0.60.npz"), "--out", str(tmp_path / "f0.60.counts.json")]) == 0
+    assert json.loads((tmp_path / "f0.60.counts.json").read_text())["friction_factor"] == 0.6
+    assert (tmp_path / "f0.60.json").read_text() == "{}"
+    with pytest.raises(SystemExit, match="sidecar"):
+        d1.main(["count", "--trace", str(tmp_path / "f0.60.npz"), "--out", str(tmp_path / "f0.60.json")])
+    assert d1.main(["count", "--trace", str(tmp_path / "f0.60.npz"), "--out", str(tmp_path / "p.json"),
+                    "--min-falls", "30"]) == 3

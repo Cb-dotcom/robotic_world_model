@@ -82,8 +82,11 @@ def read_materials(env_prefix="/World/envs/env_0"):
 
 
 def verify(record, robot=None):
-    """Read back after the environment is built; also report the robot's PhysX shape materials."""
-    rec = check(record, read_materials())
+    """Read back after the environment is built; also report the robot's PhysX shape materials.
+
+    Returns the input record (factor, nominal, scaled) extended by the read-back, so the stored provenance is complete.
+    """
+    rec = dict(record, **check(record, read_materials()))
     if robot is not None:
         try:
             m = robot.root_physx_view.get_material_properties()
