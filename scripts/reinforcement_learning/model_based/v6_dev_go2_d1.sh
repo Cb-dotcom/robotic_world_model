@@ -4,8 +4,10 @@
 # back from the simulator before stepping (friction_shift.py). Counts: analysis/go2_friction_shift.py.
 #   Phase select:  v6_dev_go2_d1.sh select <fresh out>   levels 0.60 -> 0.45 -> 0.30, 64 envs x 1000 steps, seed 900;
 #                  stops at the first level meeting the rule; writes choice.json (frozen, read-only).
-#   Phase collect: v6_dev_go2_d1.sh collect <same out>   at the frozen level: held-out probe 64 x 2000, seed 911
-#                  (minimum 30 falls and 30 recoveries, else stop and report); fitting batch 64 x 5000, seed 102.
+#   Phase collect: v6_dev_go2_d1.sh collect <same out> [level]   at the frozen level: held-out probe 64 x 2000,
+#                  seed 911 (minimum 30 falls and 30 surviving episodes, A4 §3 option A; else stop and report);
+#                  fitting batch 64 x 5000, seed 102. If no level met the selection rule, [level] must be given: it is
+#                  the level fixed by Charbel's decision (A4 §3) and is stored read-only in decision.json.
 # Count files are *.counts.json (the recorder writes its own <name>.json sidecar).
 # Run from the robotic_world_model root in the container, with setsid nohup. Development evidence (A4); A3 stays closed.
 set -uo pipefail
@@ -59,12 +61,25 @@ fi
 [ "$PHASE" = collect ] || { echo "phase must be select or collect"; exit 2; }
 [ -s "$OUT/choice.json" ] || fail "no frozen choice.json (run select first)"
 F=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; c = json.load(open(sys.argv[1]))['chosen']; print('' if c is None else f'{c:.2f}')" "$OUT/choice.json" | tail -1)
-[ -n "$F" ] || fail "choice.json has no chosen level"
+if [ -n "$F" ]; then
+  [ -z "${3:-}" ] || [ "$3" = "$F" ] || fail "level $3 differs from the frozen choice $F"
+else
+  F=${3:-}
+  [ -n "$F" ] || fail "no level met the selection rule: give the level fixed by Charbel's decision (A4 §3)"
+  [ -s "$OUT/select/f$F.counts.json" ] || fail "level $F was not in the selection ladder"
+  if [ -e "$OUT/decision.json" ]; then
+    grep -q "\"level\": $F," "$OUT/decision.json" || fail "decision.json holds another level"
+  else
+    printf '{"level": %s, "source": "Charbel 21 Nov 2026 23:26 Rome, A4 section 3 option A", "negatives": "surviving (time-out) episodes"}\n' "$F" > "$OUT/decision.json"
+    chmod a-w "$OUT/decision.json"
+  fi
+  status "level $F from the decision (decision.json)"
+fi
 [ -e "$OUT/probe.npz" ] && fail "probe.npz exists"
 record $F 911 2000 "$OUT/probe.npz"
 CUDA_VISIBLE_DEVICES="" $PY $AN/go2_friction_shift.py count --trace "$OUT/probe.npz" --out "$OUT/probe.counts.json" \
-  --min-falls 30 --min-recoveries 30 2>&1 | tee -a "$OUT/queue.log" \
-  || { chmod a-w "$OUT/probe.npz" "$OUT/probe.counts.json"; fail "probe minimum (30 falls, 30 recoveries) not met; reported; next level by Charbel (A4 §1)"; }
+  --min-falls 30 --min-time-outs 30 2>&1 | tee -a "$OUT/queue.log" \
+  || { chmod a-w "$OUT/probe.npz" "$OUT/probe.counts.json"; fail "probe minimum (30 falls, 30 surviving episodes) not met; reported; Charbel decides (A4 §3)"; }
 record $F 102 5000 "$OUT/fit_batch.npz"
 CUDA_VISIBLE_DEVICES="" $PY $AN/go2_friction_shift.py count --trace "$OUT/fit_batch.npz" --out "$OUT/fit_batch.counts.json" \
   2>&1 | tee -a "$OUT/queue.log" || fail "count fit batch"

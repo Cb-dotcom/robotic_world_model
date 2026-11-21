@@ -64,6 +64,7 @@ def test_counts_falls_recoveries_and_censoring():
     c, w = d1.count(tilted())
     assert c["falls"] == 1 and c["time_outs"] == 1 and c["ended"] == 2
     assert c["near_falls"] == 4 and c["recoveries"] == 2 and c["near_falls_before_fall"] == 1 and c["censored"] == 1
+    assert c["fall_episodes_with_near_fall"] == 1
     assert [(x["env"], x["onset"], x["lo"], x["hi"]) for x in w] == [(0, 100, 90, 150), (2, 250, 240, 300)]
     assert c["fall_fraction"] == 0.5
 
@@ -95,3 +96,7 @@ def test_verify_keeps_the_factor_and_count_reads_the_stored_record(tmp_path, mon
         d1.main(["count", "--trace", str(tmp_path / "f0.60.npz"), "--out", str(tmp_path / "f0.60.json")])
     assert d1.main(["count", "--trace", str(tmp_path / "f0.60.npz"), "--out", str(tmp_path / "p.json"),
                     "--min-falls", "30"]) == 3
+    assert d1.main(["count", "--trace", str(tmp_path / "f0.60.npz"), "--out", str(tmp_path / "q.json"),
+                    "--min-falls", "1", "--min-time-outs", "1"]) == 0
+    assert d1.main(["count", "--trace", str(tmp_path / "f0.60.npz"), "--out", str(tmp_path / "r.json"),
+                    "--min-falls", "1", "--min-time-outs", "2"]) == 3

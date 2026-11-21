@@ -49,7 +49,8 @@ def count(trace):
     g = trace["next_state"][..., 6:8]
     tilt = np.sqrt((g ** 2).sum(-1)) > TILT_XY
     term, tout = trace["terminated"], trace["time_out"]
-    c = dict(episodes=0, ended=0, falls=0, time_outs=0, near_falls=0, recoveries=0, censored=0, near_falls_before_fall=0)
+    c = dict(episodes=0, ended=0, falls=0, time_outs=0, near_falls=0, recoveries=0, censored=0, near_falls_before_fall=0,
+             fall_episodes_with_near_fall=0)
     windows = []
     for n, s, e, finished in episodes(trace["done"]):
         c["episodes"] += 1
@@ -57,18 +58,20 @@ def count(trace):
         c["ended"] += finished
         c["falls"] += fall
         c["time_outs"] += bool(finished and tout[e, n])
-        last = -10 ** 9
+        last, before = -10 ** 9, False
         for t in range(s + 1, e + 1):
             if tilt[t, n] and not tilt[t - 1, n] and t - last >= GAP:
                 last = t
                 c["near_falls"] += 1
                 if fall and e - t < RECOVER:
                     c["near_falls_before_fall"] += 1
+                    before = True
                 elif e - t < RECOVER:
                     c["censored"] += 1
                 else:
                     c["recoveries"] += 1
                     windows.append(dict(env=n, episode_first=s, onset=t, lo=max(s, t - PRE), hi=t + RECOVER))
+        c["fall_episodes_with_near_fall"] += before
     c["fall_fraction"] = c["falls"] / c["ended"] if c["ended"] else float("nan")
     return c, windows
 
@@ -95,6 +98,7 @@ def main(argv=None):
     a1.add_argument("--out", type=Path, required=True)
     a1.add_argument("--min-falls", type=int, default=None)
     a1.add_argument("--min-recoveries", type=int, default=None)
+    a1.add_argument("--min-time-outs", type=int, default=None, help="A4 §3 option A: surviving episodes")
     a2 = sub.add_parser("choose")
     a2.add_argument("--counts", type=Path, nargs="+", required=True, help="count JSONs in ladder order")
     a2.add_argument("--out", type=Path, required=True)
@@ -113,13 +117,15 @@ def main(argv=None):
                    num_envs=meta.get("num_envs"), num_steps=meta.get("num_steps"), counts=c, recovery_windows=w,
                    analysis_sha256=sha256(__file__))
         ok = True
-        if a.min_falls is not None or a.min_recoveries is not None:
-            ok = c["falls"] >= (a.min_falls or 0) and c["recoveries"] >= (a.min_recoveries or 0)
+        if a.min_falls is not None or a.min_recoveries is not None or a.min_time_outs is not None:
+            ok = (c["falls"] >= (a.min_falls or 0) and c["recoveries"] >= (a.min_recoveries or 0)
+                  and c["time_outs"] >= (a.min_time_outs or 0))
             rec["minimum_met"] = ok
         a.out.write_text(json.dumps(rec, indent=1))
         print(f"[d1] {a.trace.name}: friction x{fs['factor']}, {c['ended']} ended episodes, {c['falls']} falls "
-              f"(fraction {c['fall_fraction']:.3f}), {c['time_outs']} time-outs, {c['near_falls']} near-falls: "
-              f"{c['recoveries']} recoveries, {c['near_falls_before_fall']} before a fall, {c['censored']} censored"
+              f"(fraction {c['fall_fraction']:.3f}), {c['time_outs']} time-outs (surviving episodes), {c['near_falls']} tilt "
+              f"crossings: {c['recoveries']} with 50 rows of survival, {c['near_falls_before_fall']} before a fall "
+              f"({c['fall_episodes_with_near_fall']} fall episodes), {c['censored']} censored"
               + ("" if "minimum_met" not in rec else f"; minimum met: {ok}"), flush=True)
         return 0 if ok else 3
     results = []
