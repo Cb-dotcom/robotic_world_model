@@ -22,7 +22,10 @@ def cell(folder, episodes, exposure=640.0):
             w.writerow(dict(env=i, start=0, length=length, counted_steps=length - 1, fall=fall, censored=censored,
                             mean_speed_act=1.0, steps_since_cmd_change=since, cmd_speed_end=spd))
     falls = sum(1 for e in episodes if e[1] and not e[2])
-    (folder / "episodes_summary.json").write_text(json.dumps(dict(step_dt=0.02, exposure_s=exposure, falls=falls,
+    counted = sum(e[0] - 1 for e in episodes)
+    # the layout eval_episode_stats.py writes: settings at the top, EpisodeStats.summary() under "summary"
+    inner = dict(falls=falls, exposure_s=exposure, counted_steps=counted, speed_act_per_step=1.0)
+    (folder / "episodes_summary.json").write_text(json.dumps(dict(step_dt=0.02, episode_length_s=20.0, summary=inner,
                                                                   friction_shift=dict(factor=0.3, verified=True))))
 
 
@@ -53,7 +56,7 @@ def test_bins_cap_and_excess(tmp_path):
 def test_summary_mismatch_and_exposure_mismatch(tmp_path):
     d = make(tmp_path / "a", [(100, True, False, 100, 1.0)], [(100, False, False, 100, 1.0)])
     s = json.loads((d / "D3_cmd10_s42" / "episodes_summary.json").read_text())
-    s["falls"] = 5
+    s["summary"]["falls"] = 5
     (d / "D3_cmd10_s42" / "episodes_summary.json").write_text(json.dumps(s))
     with pytest.raises(ValueError, match="differ from the summary"):
         ft.analyse(d)
@@ -63,6 +66,21 @@ def test_summary_mismatch_and_exposure_mismatch(tmp_path):
         cell(e / f"S2_cmd10_s{t}", [(100, True, False, 100, 1.0)], exposure=320.0)
     with pytest.raises(ValueError, match="exposures differ"):
         ft.analyse(e)
+
+
+def test_flat_summary_and_distance_mismatch_refused(tmp_path):
+    d = make(tmp_path / "f", [(100, True, False, 100, 1.0)], [(100, False, False, 100, 1.0)])
+    f = d / "S2_cmd10_s43" / "episodes_summary.json"
+    s = json.loads(f.read_text())
+    f.write_text(json.dumps(dict(step_dt=0.02, **s["summary"])))          # the flat layout the first version assumed
+    with pytest.raises(ValueError, match="not in the eval_episode_stats.py format"):
+        ft.analyse(d)
+    d = make(tmp_path / "g", [(100, True, False, 100, 1.0)], [(100, False, False, 100, 1.0)])
+    f = d / "D3_cmd10_s43" / "episodes_summary.json"
+    s = json.loads(f.read_text()); s["summary"]["speed_act_per_step"] = 2.0
+    f.write_text(json.dumps(s))
+    with pytest.raises(ValueError, match="differs from the summary"):
+        ft.analyse(d)
 
 
 def test_right_closed_bins():
@@ -76,3 +94,41 @@ def test_main_writes_once(tmp_path):
     assert json.loads((tmp_path / "o" / "d3_fall_timing.json").read_text())["D3"]["pooled"]["falls"] == 2
     with pytest.raises(FileExistsError):
         ft.main(["--eval", str(d), "--out", str(tmp_path / "o")])
+
+
+def real_cell(folder, fall_at, seed):
+    """A cell written exactly as eval_episode_stats.py writes it: EpisodeStats episodes -> csv.DictWriter, and the
+    summary wrapper with the same top-level keys."""
+    from episode_stats import EpisodeStats
+    n, steps = 2, 600
+    st = EpisodeStats(n, 0.02, 20.0, std=0.5)
+    g = np.random.default_rng(seed)
+    for t in range(steps):
+        cmd = np.array([[1.0 if t < 250 else 0.4, 0.0], [0.6, 0.0]])
+        act = cmd + g.normal(0, 0.05, (n, 2))
+        done = np.array([t in fall_at, t == 499])
+        st.step(cmd, act, done, np.array([False, t == 499]))
+    st.finish()
+    folder.mkdir(parents=True)
+    with open(folder / "episodes.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(st.episodes[0].keys()))
+        w.writeheader()
+        for e in st.episodes:
+            w.writerow(e)
+    with open(folder / "episodes_summary.json", "w") as f:
+        json.dump({"checkpoint": "x.pt", "task": "t", "num_envs": n, "num_steps": steps, "no_push": False,
+                   "cmd_resample_s": 10.0, "friction_shift": {"factor": 0.3, "verified": True}, "seed": seed, "std": 0.5,
+                   "step_dt": 0.02, "episode_length_s": 20.0, "command_resampling_time_range_s": [10.0, 10.0],
+                   "push_robot": None, "summary": st.summary(), "old_logs": {}}, f, indent=1)
+
+
+def test_real_writer_format(tmp_path):
+    for s in (42, 43):
+        real_cell(tmp_path / f"D3_cmd10_s{s}", {99, 399}, s)
+        real_cell(tmp_path / f"S2_cmd10_s{s}", {399}, s)
+    r = ft.analyse(tmp_path)
+    p = r["D3"]["pooled"]
+    assert p["falls"] == 4 and r["S2"]["pooled"]["falls"] == 2
+    assert p["within_cap"] == 2 and p["reset_counts"][1] == 2          # length 100 = 2 s; length 300 = 6 s
+    assert p["before_any_change"] == 2                                   # the fall at row 399 comes after the change at 250
+    assert r["excess_D3_minus_S2"]["falls"] == 2 and p["distance_m"] > 0

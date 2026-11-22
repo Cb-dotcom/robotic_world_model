@@ -59,8 +59,12 @@ def hist(x, edges, right=False):
 
 
 def read_cell(folder):
+    """episodes_summary.json as eval_episode_stats.py writes it: run settings at the top level (step_dt,
+    friction_shift, ...) and EpisodeStats.summary() under "summary" (falls, exposure_s, counted_steps, ...)."""
     folder = Path(folder)
     summ = json.loads((folder / "episodes_summary.json").read_text())
+    if "summary" not in summ or "step_dt" not in summ:
+        raise ValueError(f"{folder}: episodes_summary.json is not in the eval_episode_stats.py format")
     with open(folder / "episodes.csv", newline="") as f:
         rows = list(csv.DictReader(f))
     ep = dict(length=np.array([int(r["length"]) for r in rows]),
@@ -75,15 +79,19 @@ def read_cell(folder):
 
 def stats(summ, ep):
     dt = float(summ["step_dt"])
-    exposure = float(summ["exposure_s"])
+    inner = summ["summary"]
+    exposure = float(inner["exposure_s"])
     f = ep["fall"] & ~ep["censored"]
     t_reset = ep["length"][f] * dt
     t_cmd = ep["since_cmd"][f] * dt
     dist_m = float(np.nansum(np.nan_to_num(ep["speed_act"], nan=0.0) * ep["counted"]) * dt)
+    ref = float(inner["speed_act_per_step"]) * float(inner["counted_steps"]) * dt     # the evaluator's own aggregate
+    if not np.isclose(dist_m, ref, rtol=1e-6, atol=1e-6):
+        raise ValueError(f"distance from episodes.csv {dist_m:.3f} m differs from the summary's {ref:.3f} m")
     n = int(f.sum())
     rate, lo, hi = falls_per_1000s(n, exposure)
     return dict(falls=n, completed=int((~ep["censored"]).sum()), exposure_s=exposure, step_dt=dt,
-                falls_per_1000s=[rate, lo, hi], falls_in_summary=int(summ["falls"]),
+                falls_per_1000s=[rate, lo, hi], falls_in_summary=int(inner["falls"]),
                 reset_counts=hist(t_reset, RESET_BINS, right=True), within_cap=int((t_reset <= CAP_S + 1e-9).sum()),
                 cmd_counts=hist(t_cmd, CMD_BINS, right=True), before_any_change=int((ep["since_cmd"][f] == ep["length"][f]).sum()),
                 speed_counts=hist(ep["cmd_end"][f], SPEED_BINS), distance_m=dist_m,
