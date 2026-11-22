@@ -34,6 +34,8 @@ parser.add_argument("--std", type=float, default=0.5, help="Tracking sigma (Isaa
 parser.add_argument("--no_push", action="store_true", default=False, help="Disable the push_robot interval event (diagnosis).")
 parser.add_argument("--cmd_resample_s", type=float, default=None, help="Set the command resampling time (s), e.g. 30 = never within a 20 s episode.")
 parser.add_argument("--out_csv", type=str, default=None, help="Per-episode CSV (default: next to checkpoint).")
+parser.add_argument("--friction-scale", type=float, default=1.0,
+                    help="A4 D3: scale the ground friction by this factor; read back from the simulator before stepping")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -74,6 +76,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
+    friction = None
+    if args_cli.friction_scale != 1.0:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import friction_shift
+        friction = friction_shift.scale_ground(env_cfg, args_cli.friction_scale)
+        print(f"[friction] ground friction x{args_cli.friction_scale}: {friction}", flush=True)
     if args_cli.no_push:
         env_cfg.events.push_robot = None
         print("[eval_ep] push_robot event DISABLED")
@@ -94,6 +102,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     device = env.unwrapped.device
     base = env.unwrapped
+    if friction is not None:
+        friction = friction_shift.verify(friction, base.scene["robot"])
+        print(f"[friction] verified in the simulator: {friction}", flush=True)
 
     runner_cls = getattr(rsl_runners, agent_cfg.class_name)
     runner = runner_cls(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -183,7 +194,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     with open(os.path.splitext(out_csv)[0] + "_summary.json", "w") as f:
         json.dump({"checkpoint": resume_path, "task": args_cli.task, "num_envs": args_cli.num_envs,
                    "num_steps": args_cli.num_steps, "no_push": args_cli.no_push,
-                   "cmd_resample_s": args_cli.cmd_resample_s,
+                   "cmd_resample_s": args_cli.cmd_resample_s, "friction_shift": friction,
                    "seed": int(env_cfg.seed) if env_cfg.seed is not None else None,
                    "std": args_cli.std, "step_dt": step_dt, "episode_length_s": ep_len_s,
                    "command_resampling_time_range_s": command_resampling_s,

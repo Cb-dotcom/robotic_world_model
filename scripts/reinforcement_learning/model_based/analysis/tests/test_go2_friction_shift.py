@@ -7,11 +7,15 @@ import numpy as np
 import pytest
 
 MB = Path(__file__).resolve().parents[2]
-for p in (str(MB / "analysis"), str(MB.parent / "rsl_rl"), str(Path(__file__).resolve().parent)):
+for p in (str(MB / "analysis"), str(Path(__file__).resolve().parent)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import friction_shift as fs  # noqa: E402
+# load rsl_rl/friction_shift.py by path: putting rsl_rl/ on sys.path would shadow model_based/train.py for other tests
+import importlib.util  # noqa: E402
+_spec = importlib.util.spec_from_file_location("friction_shift", MB.parent / "rsl_rl" / "friction_shift.py")
+fs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(fs)
 import go2_friction_shift as d1  # noqa: E402
 from test_c0_battery import random_trace  # noqa: E402
 
