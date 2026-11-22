@@ -94,7 +94,8 @@ fi
 if [ "$PHASE" = c0 ]; then
   # A4 Go2 C0 check (review 22 Nov): exact PPO signal, endpoint 10 rows before impact, matched surviving windows,
   # recorded vs model-generated history; both probes (seeds 911, 912). Read-only, CPU.
-  WM="$OUT/wm/d2_wm_seed2.pt"; G="$OUT/go2_c0"
+  # C0_DIR: a new folder for a rerun (22 Nov: paired bootstrap fix; the first run's folder stays as it is)
+  WM="$OUT/wm/d2_wm_seed2.pt"; G=${C0_DIR:-$OUT/go2_c0}
   WM_SHA=${WM_SHA:-080f353d7b6015b97dd7ca96d822b02dfc99f5c959184ae4d50dd7e9d2b50da4}
   PROBE2=${PROBE2:-logs/p2/a4_d1_probe2/probe.npz}
   PROBE2_SHA=${PROBE2_SHA:-ece45ba5151da9a752d3ed018f990fb74da61c04bfaf2f7adc48cff9a60d1257}   # run-log 22 Nov

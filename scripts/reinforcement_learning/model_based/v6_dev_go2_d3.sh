@@ -7,6 +7,10 @@
 # policy and for unchanged s2. Development evidence (A4); A3 stays closed.
 # Usage, from the robotic_world_model root in the container:
 #   setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d3.sh logs/p2/a4_d3_1122 > /tmp/a4_d3.out 2>&1 < /dev/null &
+# Recovery (22 Nov): the trainer continues s2's saved iteration counter, so the first launcher's completion guard
+# ('Learning iteration 299/') failed after a complete run. 'resume-eval' verifies the saved run and runs only the
+# evaluations and the gate:
+#   setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d3.sh logs/p2/a4_d3_1122 resume-eval > /tmp/a4_d3_eval.out 2>&1 < /dev/null &
 set -uo pipefail
 OUT=${1:?out dir}
 MODE=${2:-run}
@@ -64,11 +68,14 @@ CHECK_S2
 ) || fail "could not verify s2 hash and starting iteration"
 [[ "$START_ITER" =~ ^[0-9]+$ ]] || fail "invalid s2 iteration: $START_ITER"
 
+# code and tests are recorded in both modes (resume-eval runs newer code than the training run: own files)
+SFX=""; [ "$MODE" = resume-eval ] && SFX="_resume"
+{ git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_d3_gate.py; } > "$OUT/git$SFX.txt"
+CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d3_gate.py $AN/tests/test_go2_g0.py > "$OUT/tests$SFX.log" 2>&1 || fail "tests (tests$SFX.log)"
+grep -qE "[0-9]+ skipped" "$OUT/tests$SFX.log" && fail "tests were skipped (tests$SFX.log)"
+status "$MODE tests: $(tail -1 "$OUT/tests$SFX.log"); s2 $CK (${S2_SHA:0:12}), saved iteration $START_ITER"
+
 if [ "$MODE" = run ]; then
-  { git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_d3_gate.py; } > "$OUT/git.txt"
-  CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d3_gate.py $AN/tests/test_go2_g0.py > "$OUT/tests.log" 2>&1 || fail "tests (tests.log)"
-  grep -qE "[0-9]+ skipped" "$OUT/tests.log" && fail "tests were skipped (tests.log)"
-  status "tests: $(tail -1 "$OUT/tests.log"); s2 $CK (${S2_SHA:0:12})"
 
   # ---- 1. one short update from s2 in the qualified model
   gpu_wait 12288 "training"
