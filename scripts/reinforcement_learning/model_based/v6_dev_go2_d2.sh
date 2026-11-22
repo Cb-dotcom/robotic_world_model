@@ -71,7 +71,27 @@ if [ "$PHASE" = calibrate ]; then
   status "calibrated and qualified once; $(sha256sum "$C/qualify/d2_qualify.json")"
   exit 0
 fi
-[ "$PHASE" = fit ] || { echo "phase must be fit, qualify or calibrate"; exit 2; }
+if [ "$PHASE" = breakdown ]; then
+  # A4 D2 option B breakdown (Charbel, 22 Nov): descriptive; which falls are missed and whether all heads miss them.
+  WM="$OUT/wm/d2_wm_seed2.pt"; B="$OUT/breakdown"
+  WM_SHA=${WM_SHA:-080f353d7b6015b97dd7ca96d822b02dfc99f5c959184ae4d50dd7e9d2b50da4}
+  [ -e "$B" ] && { echo "exists: $B"; exit 2; }
+  [ "$(sha256sum "$WM" | cut -d' ' -f1)" = "$WM_SHA" ] || fail "model hash differs from the run-log"
+  [ "$(sha256sum "$PROBE" | cut -d' ' -f1)" = "$PROBE_SHA" ] || fail "probe hash differs from the run-log"
+  [ "$(sha256sum "$SHIFT" | cut -d' ' -f1)" = "$SHIFT_SHA" ] || fail "D1 fitting-batch hash differs from the run-log"
+  mkdir -p "$B"
+  { git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_d2_breakdown.py; } > "$B/git.txt"
+  CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d2_breakdown.py > "$B/tests.log" 2>&1 || fail "breakdown tests ($B/tests.log)"
+  grep -qE "[0-9]+ skipped" "$B/tests.log" && fail "breakdown tests were skipped"
+  status "breakdown tests: $(tail -1 "$B/tests.log")"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d2_breakdown.py --wm "$WM" --norm "$OUT/data/go2_norm.npz" --probe "$PROBE" \
+    --shift "$SHIFT" --shift-withheld "$OUT/data/shift/withheld.json" --out "$B/run" > "$B/breakdown.log" 2>&1 \
+    || { tail -5 "$B/breakdown.log"; fail "breakdown ($B/breakdown.log)"; }
+  cat "$B/run/d2_breakdown.txt" | tee -a "$OUT/queue.log"
+  status "breakdown done; $(sha256sum "$B/run/d2_breakdown.json")"
+  exit 0
+fi
+[ "$PHASE" = fit ] || { echo "phase must be fit, qualify, calibrate or breakdown"; exit 2; }
 [ -e "$OUT" ] && { echo "OUT exists: $OUT"; exit 2; }
 mkdir -p "$OUT"
 for f in "$ROUND0" "$SHIFT" "$A3_WITHHELD"; do [ -s "$f" ] || fail "missing $f"; done

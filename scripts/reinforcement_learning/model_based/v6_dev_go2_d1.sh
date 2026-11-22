@@ -4,6 +4,7 @@
 # back from the simulator before stepping (friction_shift.py). Counts: analysis/go2_friction_shift.py.
 #   Phase select:  v6_dev_go2_d1.sh select <fresh out>   levels 0.60 -> 0.45 -> 0.30, 64 envs x 1000 steps, seed 900;
 #                  stops at the first level meeting the rule; writes choice.json (frozen, read-only).
+#   Phase probe:   v6_dev_go2_d1.sh probe <fresh out> <level> <seed>   a fresh held-out probe only (64 x 2000).
 #   Phase collect: v6_dev_go2_d1.sh collect <same out> [level]   at the frozen level: held-out probe 64 x 2000,
 #                  seed 911 (minimum 30 falls and 30 surviving episodes, A4 §3 option A; else stop and report);
 #                  fitting batch 64 x 5000, seed 102. If no level met the selection rule, [level] must be given: it is
@@ -58,7 +59,21 @@ if [ "$PHASE" = select ]; then
   fail "no level meets the rule (choice.json); reported; Charbel decides (A4 §1)"
 fi
 
-[ "$PHASE" = collect ] || { echo "phase must be select or collect"; exit 2; }
+if [ "$PHASE" = probe ]; then
+  # A4 (22 Nov, Charbel: "learn now, then repeat to check"): a FRESH held-out probe at a decided level and seed,
+  # 64 x 2000. Recorded and counted only; analysed after the predictions are written to the run-log.
+  F=${3:?level}; SEED=${4:?seed}
+  [ -e "$OUT" ] && { echo "OUT exists: $OUT"; exit 2; }
+  mkdir -p "$OUT"
+  { git rev-parse HEAD; git status --short | grep -v '^??'; } > "$OUT/git.txt"
+  record $F $SEED 2000 "$OUT/probe.npz"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_friction_shift.py count --trace "$OUT/probe.npz" --out "$OUT/probe.counts.json" \
+    --min-falls 30 --min-time-outs 30 2>&1 | tee -a "$OUT/queue.log" || status "probe minimum (30 falls, 30 surviving) not met; reported"
+  chmod a-w "$OUT/probe.npz" "$OUT/probe.counts.json"
+  status "done; $(sha256sum "$OUT/probe.npz")"
+  exit 0
+fi
+[ "$PHASE" = collect ] || { echo "phase must be select, collect or probe"; exit 2; }
 [ -s "$OUT/choice.json" ] || fail "no frozen choice.json (run select first)"
 F=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; c = json.load(open(sys.argv[1]))['chosen']; print('' if c is None else f'{c:.2f}')" "$OUT/choice.json" | tail -1)
 if [ -n "$F" ]; then
