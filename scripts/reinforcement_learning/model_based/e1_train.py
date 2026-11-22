@@ -61,6 +61,10 @@ def main(argv=None):
     pre.add_argument("--start-data", type=Path, default=None, help="A3: imagination start-data folder (go2_flat)")
     pre.add_argument("--init-policy-checkpoint", type=Path, default=None,
                      help="A3: initial actor/critic (later rounds); the optimizer is new")
+    pre.add_argument("--startup-resets", type=Path, default=None,
+                     help="A4 D6: reset_states.npz (recorded physical reset states); needs --startup-share and a _warm mode")
+    pre.add_argument("--startup-share", type=float, default=None,
+                     help="A4 D6: share of imagination resets that start from a recorded reset state with zero memory")
     pre.add_argument("--max-iterations", type=int, default=None,
                      help="development checks only (A4): stop PPO after this many iterations (default: the recipe's)")
     known, rest = pre.parse_known_args(argv)
@@ -76,6 +80,10 @@ def main(argv=None):
         raise SystemExit("--reward-contract s2 needs --asset-trace")
     if known.init_policy_checkpoint is not None and not known.init_policy_checkpoint.is_file():
         raise SystemExit(f"initial policy not found: {known.init_policy_checkpoint}")
+    if (known.startup_resets is None) != (known.startup_share is None):
+        raise SystemExit("--startup-resets and --startup-share go together")
+    if known.startup_share is not None and not (0.0 < known.startup_share <= 1.0):
+        raise SystemExit("--startup-share must be in (0, 1]")
     import train as T
     import p15_train
 
@@ -111,6 +119,17 @@ def main(argv=None):
                 raise SystemExit("--max-iterations must be >= 1")
             cfg.policy_training_config.max_iterations = int(known.max_iterations)
             print(f"[dev] max_iterations = {known.max_iterations} (development check, not the paper recipe)", flush=True)
+        if known.startup_resets is not None:
+            import numpy as np
+            import go2_study
+            from envs.base import BaseEnv
+            if not BaseEnv.warm_start_resets:
+                raise SystemExit("--startup-resets needs a _warm mode (startup resets replace warm resets)")
+            with np.load(known.startup_resets) as z:
+                BaseEnv.startup_reset_raw = (np.asarray(z["state"], np.float32), np.asarray(z["previous_action"], np.float32))
+            BaseEnv.startup_reset_share = float(known.startup_share)
+            print(f"[d6] startup resets: share {known.startup_share}, {len(BaseEnv.startup_reset_raw[0])} recorded reset "
+                  f"states, {known.startup_resets} sha256 {go2_study.sha256(known.startup_resets)}", flush=True)
         if known.init_policy_checkpoint is not None:
             import go2_study
             T.args_cli.init_policy_checkpoint = str(known.init_policy_checkpoint.resolve())

@@ -116,7 +116,7 @@ def write_checkpoint(wm, out, layer_sets, w, provenance):
         torch.save(ck, f)
 
 
-def run(wm, norm_path, seg_root, calibration, out, device="cpu", steps=STEPS, weights=WEIGHTS):
+def run(wm, norm_path, seg_root, calibration, out, device="cpu", steps=STEPS, weights=WEIGHTS, model_name="d2s_wm_seed2.pt"):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
     t0 = time.time()
@@ -146,7 +146,7 @@ def run(wm, norm_path, seg_root, calibration, out, device="cpu", steps=STEPS, we
                unchanged_model_on_calibration=base, candidates=results, chosen_w=None if best is None else best["w"],
                analysis_sha256=sha256(__file__))
     if best is not None:
-        path = out / "d2s_wm_seed2.pt"
+        path = out / model_name
         write_checkpoint(wm, path, trained[best["w"]], best["w"],
                          dict(stop_retrain="A4 option 1 (22 Nov 2026)", stop_retrain_from_sha256=sha256(wm),
                               stop_retrain_calibration_sha256=sha256(calibration)))
@@ -168,8 +168,9 @@ def main(argv=None):
     p.add_argument("--calibration", type=Path, required=True, help="the independent calibration recording (seed 914)")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--model-name", default="d2s_wm_seed2.pt", help="file name of the retrained model in --out")
     a = p.parse_args(argv)
-    rec = run(a.wm, a.norm, a.segments, a.calibration, a.out, a.device)
+    rec = run(a.wm, a.norm, a.segments, a.calibration, a.out, a.device, model_name=a.model_name)
     return 0 if rec["chosen_w"] is not None else 6
 
 

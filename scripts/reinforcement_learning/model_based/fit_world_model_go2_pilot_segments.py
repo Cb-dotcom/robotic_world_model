@@ -24,6 +24,7 @@ Optional (all default to the original behaviour):
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import random
@@ -319,6 +320,49 @@ def set_state_loss(model, kind):
     return model
 
 
+def build_startup_groups(segs, names, state_dim, action_dim, history_horizon, forecast_horizon, device,
+                         s_mean, s_std, a_mean, a_std, normalize=True):
+    """A4 D6 (22 Nov 2026): startup windows from each listed segment's first row (a physical reset row).
+
+    For a segment of n rows and h = 1 .. min(history_horizon - 1, n - 1): history = rows 0 .. h-1 (real rows from
+    the reset; the GRU starts from zero memory, as after a physical reset), forecast f = min(forecast_horizon, n - h),
+    so an episode shorter than the standard window still gives every transition, its terminal one included, as a
+    target. Windows are grouped by shape (h, f): one shape per minibatch, so no padding and no masking.
+    Returns {(h, f): LazyWindows over the normalized prefix rows}, sorted by shape.
+    """
+    names = set(names)
+    s_mean, s_std, a_mean, a_std = (t.to(device) for t in (s_mean, s_std, a_mean, a_std))
+    flats, starts, offset, seen = [], {}, 0, set()
+    for name, steps, data_np, num_envs in segs:
+        if name not in names:
+            continue
+        if num_envs != 1:
+            raise RuntimeError(f"{name}: startup windows need one episode per segment")
+        seen.add(name)
+        n = int(data_np.shape[0])
+        keep = min(n, history_horizon - 1 + forecast_horizon)
+        x = torch.from_numpy(data_np[:keep].copy()).to(device)
+        if normalize:
+            x[:, 0:state_dim] = (x[:, 0:state_dim] - s_mean) / s_std
+            x[:, state_dim:state_dim + action_dim] = (x[:, state_dim:state_dim + action_dim] - a_mean) / a_std
+        for h in range(1, min(history_horizon - 1, n - 1) + 1):
+            f = min(forecast_horizon, n - h)
+            starts.setdefault((h, f), []).append(offset)
+        flats.append(x)
+        offset += keep
+    missing = names - seen
+    if missing:
+        raise RuntimeError(f"startup segments not in --data: {sorted(missing)[:5]}")
+    if not flats:
+        raise RuntimeError("no startup segment")
+    flat = torch.cat(flats, dim=0).contiguous()
+    groups = {k: LazyWindows(flat, torch.tensor(v, device=device, dtype=torch.long), k[0] + k[1])
+              for k, v in sorted(starts.items())}
+    print(f"[startup] {len(seen)} segments -> {sum(g.shape[0] for g in groups.values())} startup windows in "
+          f"{len(groups)} shapes (h, f); flat rows {tuple(flat.shape)}")
+    return groups
+
+
 def main():
     p = argparse.ArgumentParser(description="Boundary-aware Go2 pilot world-model fit.")
     p.add_argument("--data", required=True, help="segments_clean_terms directory containing manifest.csv")
@@ -350,6 +394,10 @@ def main():
     p.add_argument("--seed", type=int, default=None, help="seed python/numpy/torch(+cuda) before model construction; default: unseeded")
     p.add_argument("--norm_stats", type=str, default=None, help=".npz with state_mean/state_std/action_mean/action_std (std incl. eps); default: compute from --data")
     p.add_argument("--lazy_windows", action="store_true", help="gather windows on the fly (identical batches, far less memory)")
+    p.add_argument("--startup_segments", type=str, default=None,
+                   help="A4 D6: JSON {'segments': [...]} of segments whose first row is a physical reset row; adds "
+                        "startup windows (real history h = 1..H-1 from the reset, forecast min(F, rest)), one shape "
+                        "per minibatch, drawn with probability = startup windows / all windows")
     p.add_argument("--state_loss", choices=STATE_LOSSES, default="mse",
                    help="state regression loss: mse (default) or ETH's gaussian_nll branch (plan v6 C5)")
     args = p.parse_args()
@@ -487,6 +535,18 @@ def main():
     Nw = all_windows.shape[0]
     seq_len = history_horizon + forecast_horizon
 
+    startup_groups, startup_p, startup_shapes, startup_sizes = None, 0.0, [], None
+    if args.startup_segments is not None:
+        startup_names = json.loads(Path(args.startup_segments).read_text())["segments"]
+        startup_groups = build_startup_groups(segs, startup_names, state_dim, action_dim, history_horizon,
+                                              forecast_horizon, device, s_mean, s_std, a_mean, a_std,
+                                              normalize=(not args.no_normalize))
+        startup_shapes = list(startup_groups)
+        startup_sizes = torch.tensor([startup_groups[k].shape[0] for k in startup_shapes], dtype=torch.float, device=device)
+        S = int(startup_sizes.sum().item())
+        startup_p = S / (S + Nw)
+        print(f"[startup] {S} startup windows vs {Nw} standard windows -> startup minibatch probability {startup_p:.5f}")
+
     pos_w_val = args.termination_pos_weight if args.termination_pos_weight > 0 else (total_rows - total_terms) / max(total_terms, 1)
     pos_w = torch.tensor([pos_w_val], device=device)
     print(f"[fit] transition-level termination pos_weight={pos_w_val:.1f}")
@@ -520,6 +580,10 @@ def main():
         "total_rows": int(total_rows),
         "total_real_terms": int(total_terms),
         "num_windows": int(Nw),
+        "startup": (None if startup_groups is None else {
+            "segments_json": os.path.abspath(args.startup_segments),
+            "segments_json_sha256": sha256_file(args.startup_segments),
+            "windows": int(startup_sizes.sum().item()), "shapes": len(startup_shapes), "probability": float(startup_p)}),
         "skipped_short_segments": list(short_segments or []),
         "seq_len": int(seq_len),
         "termination_pos_weight_used": float(pos_w_val),
@@ -555,16 +619,24 @@ def main():
     c0 = e0 + ext_dim
     t0 = c0 + contact_dim
 
+    n_startup = 0
     for it in range(args.iterations):
         sums = {k: 0.0 for k in keys}
         nb = 0
 
         for _ in range(args.num_mini_batches):
-            ids = torch.randint(0, Nw, (args.mini_batch_size,), device=device)
+            store, hist = all_windows, history_horizon
+            if startup_groups is not None and torch.rand(1, device=device).item() < startup_p:
+                g = int(torch.multinomial(startup_sizes, 1).item())
+                hist, _f = startup_shapes[g]
+                store = startup_groups[startup_shapes[g]]
+                n_startup += 1
+            ids = torch.randint(0, store.shape[0], (args.mini_batch_size,), device=device)
+            sd.history_horizon = hist                   # one window shape per minibatch (D6 startup windows)
             chunks = max(args.grad_accum_chunks, 1)
             optimizer.zero_grad()
             for chunk_ids in ids.chunk(chunks):
-                batch = all_windows[chunk_ids]
+                batch = store[chunk_ids]
 
                 s_b = batch[:, :, s0:a0]
                 a_b = batch[:, :, a0:e0]
@@ -596,6 +668,7 @@ def main():
                     + w(loss_weights["termination"], termination_loss)
                 )
                 (loss / chunks).backward()
+            sd.history_horizon = history_horizon
             nn.utils.clip_grad_norm_(sd.parameters(), args.max_grad_norm)
             optimizer.step()
 
@@ -618,6 +691,7 @@ def main():
                 f"state={m['state']:.4f} seq={m['sequence']:.4f} "
                 f"contact={m['contact']:.4f} term={m['termination']:.4f} "
                 f"kl={m['kl']:.4f} ({(time.time()-t_start)/(it+1):.2f}s/it)"
+                + (f" startup_minibatches={n_startup}" if startup_groups is not None else "")
             )
 
         if (it + 1) % args.save_interval == 0 or (it + 1) == args.iterations:

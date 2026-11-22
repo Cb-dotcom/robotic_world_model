@@ -108,13 +108,55 @@ class BaseEnv:
         state_new = torch.cat([state_history_init, state_history_random], dim=0)
         action_new = torch.cat([action_history_init, action_history_random], dim=0)
         if getattr(self, "warm_start_resets", False) and self.common_step_counter > 0:
+            startup = self._startup_mask(len(env_ids))
+            if startup is not None and bool(startup.any()):
+                # A4 D6 (opt-in): these envs start from a recorded physical reset state with ZERO memory (reset_partial
+                # in _reset_idx already zeroed it) and the recorded previous action, as a physical episode starts and
+                # as the fitter's startup windows (history = the reset row only) were trained.
+                rs, ra = self._startup_sample(int(startup.sum()))
+                state_new = state_new.clone()
+                action_new = action_new.clone()
+                state_new[startup, -1] = rs
+                action_new[startup, -1] = ra
+            keep = slice(None) if startup is None else ~startup
             # B7 fix (opt-in): the next step feeds only the last state, so rebuild the GRU memory of the
             # reset envs from the full sampled history. Then the first prediction after a reset sees the
             # same 32-step context as the very first imagination step (and as WM training).
-            self._warm_memory(env_ids, state_new, action_new)
+            if startup is None or bool(keep.any()):
+                self._warm_memory(env_ids[keep], state_new[keep], action_new[keep])
         state_history[env_ids] = state_new[:, -state_history.shape[1]:]
         action_history[env_ids] = action_new[:, -action_history.shape[1]:]
         return state_history, action_history
+
+    # A4 D6 (22 Nov 2026): startup resets. Off unless startup_reset_share > 0 and startup_reset_raw is set (raw recorded
+    # reset states [R, 45] and previous actions [R, 12]); used only with warm_start_resets after the first step.
+    startup_reset_share = 0.0
+    startup_reset_raw = None
+
+    def _startup_mask(self, n):
+        q = float(getattr(self, "startup_reset_share", 0.0) or 0.0)
+        if q <= 0.0:
+            return None
+        if getattr(self, "startup_reset_raw", None) is None:
+            raise ValueError("startup_reset_share > 0 needs startup_reset_raw (recorded reset states)")
+        m = torch.rand(n, device=self.device) < q
+        log = self.extras.setdefault("log", {}) if hasattr(self, "extras") else {}
+        log["startup_reset_fraction"] = float(m.float().mean()) if n else 0.0
+        self.startup_reset_count = int(getattr(self, "startup_reset_count", 0)) + int(m.sum())
+        return m
+
+    def _startup_sample(self, k):
+        if getattr(self, "_startup_norm", None) is None:
+            st, pa = self.startup_reset_raw
+            st = torch.as_tensor(st, dtype=torch.float32, device=self.device)
+            pa = torch.as_tensor(pa, dtype=torch.float32, device=self.device)
+            if st.ndim != 2 or st.shape[0] == 0 or st.shape[0] != pa.shape[0]:
+                raise ValueError("startup_reset_raw must be two arrays [R, 45] and [R, 12] with R > 0")
+            ns, na = self.dataset.normalize(st, pa)
+            self._startup_norm = (ns.reshape(st.shape[0], -1), na.reshape(pa.shape[0], -1))
+        st, pa = self._startup_norm
+        idx = torch.randint(0, st.shape[0], (k,), device=self.device)
+        return st[idx], pa[idx]
 
     def _warm_memory(self, env_ids, state_new, action_new):
         """Set the GRU memory of env_ids to what a zero-start pass over the sampled history leaves.
