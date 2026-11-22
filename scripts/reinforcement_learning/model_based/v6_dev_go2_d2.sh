@@ -113,7 +113,42 @@ if [ "$PHASE" = c0 ]; then
   status "Go2 C0 done; $(sha256sum "$G/run/go2_c0.json")"
   exit 0
 fi
-[ "$PHASE" = fit ] || { echo "phase must be fit, qualify, calibrate, breakdown or c0"; exit 2; }
+if [ "$PHASE" = option1 ]; then
+  # A4 option 1 (Charbel, 22 Nov): retrain only the stop layers on the frozen auxiliary trunk; weight chosen on the
+  # calibration recording (seed 914); then Q1-Q3 ONCE on the fresh probe (seed 913) with the unchanged qualifier.
+  WM="$OUT/wm/d2_wm_seed2.pt"; O="$OUT/option1"
+  WM_SHA=${WM_SHA:-080f353d7b6015b97dd7ca96d822b02dfc99f5c959184ae4d50dd7e9d2b50da4}
+  CAL=${CAL:-logs/p2/a4_d1_cal3/probe.npz}
+  CAL_SHA=${CAL_SHA:-62e204297c5c08ed5692242ce2a4ee85598fb4a50a1913551eb3b6d0ff8b7db2}       # run-log 22 Nov
+  PROBE3=${PROBE3:-logs/p2/a4_d1_probe3/probe.npz}
+  PROBE3_SHA=${PROBE3_SHA:-0acfd1b153f025073e30cdfe0373da4931292054301857b85666c3089e899284}  # run-log 22 Nov
+  [ -e "$O" ] && { echo "exists: $O"; exit 2; }
+  [ "$(sha256sum "$WM" | cut -d' ' -f1)" = "$WM_SHA" ] || fail "model hash differs from the run-log"
+  [ "$(sha256sum "$CAL" | cut -d' ' -f1)" = "$CAL_SHA" ] || fail "calibration hash differs from the run-log"
+  [ "$(sha256sum "$PROBE3" | cut -d' ' -f1)" = "$PROBE3_SHA" ] || fail "probe 913 hash differs from the run-log"
+  mkdir -p "$O"
+  { git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_stop_retrain.py $AN/go2_d2_qualify.py; } > "$O/git.txt"
+  CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_stop_retrain.py $AN/tests/test_go2_d2_qualify.py > "$O/tests.log" 2>&1 \
+    || fail "option 1 tests ($O/tests.log)"
+  grep -qE "[0-9]+ skipped" "$O/tests.log" && fail "option 1 tests were skipped"
+  status "option 1 tests: $(tail -1 "$O/tests.log")"
+  until [ "$(nvidia-smi --id=0 --query-gpu=memory.free --format=csv,noheader,nounits)" -ge 4096 ]; do
+    status "waiting for 4 GiB GPU"; sleep 120; done
+  CUDA_VISIBLE_DEVICES=0 $PY $AN/go2_stop_retrain.py --wm "$WM" --norm "$OUT/data/go2_norm.npz" --segments "$OUT/data/segments" \
+    --calibration "$CAL" --out "$O/run" --device cuda:0 > "$O/retrain.log" 2>&1
+  RC=$?
+  grep "^\[option1\]" "$O/retrain.log" | tee -a "$OUT/queue.log"
+  if [ $RC -eq 6 ]; then status "no candidate meets false stops <= 0.10: option 1 fails (A4 §3)"; exit 0; fi
+  [ $RC -eq 0 ] || { tail -5 "$O/retrain.log"; fail "stop retraining ($O/retrain.log)"; }
+  status "retrained model $(sha256sum "$O/run/d2s_wm_seed2.pt" | cut -d' ' -f1)"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d2_qualify.py --wm "$O/run/d2s_wm_seed2.pt" --norm "$OUT/data/go2_norm.npz" \
+    --round0 "$ROUND0" --r0-withheld "$OUT/data/r0/withheld.json" --probe "$PROBE3" --out "$O/qualify" > "$O/qualify.log" 2>&1 \
+    || { tail -5 "$O/qualify.log"; fail "qualification on probe 913 ($O/qualify.log)"; }
+  cat "$O/qualify/d2_qualify.txt" | tee -a "$OUT/queue.log"
+  status "option 1 qualified once on probe 913; $(sha256sum "$O/qualify/d2_qualify.json")"
+  exit 0
+fi
+[ "$PHASE" = fit ] || { echo "phase must be fit, qualify, calibrate, breakdown, c0 or option1"; exit 2; }
 [ -e "$OUT" ] && { echo "OUT exists: $OUT"; exit 2; }
 mkdir -p "$OUT"
 for f in "$ROUND0" "$SHIFT" "$A3_WITHHELD"; do [ -s "$f" ] || fail "missing $f"; done
