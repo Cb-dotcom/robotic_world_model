@@ -3,6 +3,7 @@
 # Phase fit: input hash checks -> tests -> go2_mixed_prepare.py (E22 split of each source, pooled segments, pooled
 # normalizer, pooled start data; data folder write-protected) -> fit with the A3 §3 settings, fit seed 2.
 # Phase qualify (same out dir, CPU): v6_dev_go2_d2.sh qualify logs/p2/a4_d2_1121 (Q1-Q3, A4 §1; rules in go2_d2_qualify.py).
+# Phase calibrate (same out dir, CPU): v6_dev_go2_d2.sh calibrate logs/p2/a4_d2_1121 (A4 §3 option B).
 # Usage, from the robotic_world_model root in the container, with setsid nohup:
 #   setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d2.sh fit logs/p2/a4_d2_1121 > /tmp/a4_d2.out 2>&1 < /dev/null &
 set -uo pipefail
@@ -41,7 +42,36 @@ if [ "$PHASE" = qualify ]; then
   status "qualified; $(sha256sum "$Q/run/d2_qualify.json")"
   exit 0
 fi
-[ "$PHASE" = fit ] || { echo "phase must be fit or qualify"; exit 2; }
+if [ "$PHASE" = calibrate ]; then
+  # A4 D2 option B (Charbel, 22 Nov): one termination-logit offset chosen on the withheld D1 fitting-batch episodes
+  # (rule in analysis/go2_d2_calibrate.py), then Q1-Q3 ONCE on the calibrated model with the unchanged qualifier.
+  WM="$OUT/wm/d2_wm_seed2.pt"; C="$OUT/calibrate"
+  WM_SHA=${WM_SHA:-080f353d7b6015b97dd7ca96d822b02dfc99f5c959184ae4d50dd7e9d2b50da4}   # run-log 22 Nov (D2 fit)
+  [ -e "$C" ] && { echo "exists: $C"; exit 2; }
+  [ "$(sha256sum "$WM" | cut -d' ' -f1)" = "$WM_SHA" ] || fail "model hash differs from the run-log"
+  [ "$(sha256sum "$SHIFT" | cut -d' ' -f1)" = "$SHIFT_SHA" ] || fail "D1 fitting-batch hash differs from the run-log"
+  [ "$(sha256sum "$PROBE" | cut -d' ' -f1)" = "$PROBE_SHA" ] || fail "probe hash differs from the run-log"
+  mkdir -p "$C"
+  { git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_d2_calibrate.py $AN/go2_d2_qualify.py; } > "$C/git.txt"
+  CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d2_calibrate.py $AN/tests/test_go2_d2_qualify.py > "$C/tests.log" 2>&1 \
+    || fail "calibration tests ($C/tests.log)"
+  grep -qE "[0-9]+ skipped" "$C/tests.log" && fail "calibration tests were skipped"
+  status "calibration tests: $(tail -1 "$C/tests.log")"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d2_calibrate.py --wm "$WM" --norm "$OUT/data/go2_norm.npz" --shift "$SHIFT" \
+    --shift-withheld "$OUT/data/shift/withheld.json" --out "$C/cal" > "$C/calibrate.log" 2>&1
+  RC=$?
+  grep "^\[d2-cal\]" "$C/calibrate.log" | tee -a "$OUT/queue.log"
+  if [ $RC -eq 5 ]; then status "no valid offset: D2 closes as FAIL (A4 §3)"; exit 0; fi
+  [ $RC -eq 0 ] || { tail -5 "$C/calibrate.log"; fail "calibration ($C/calibrate.log)"; }
+  status "calibrated model $(sha256sum "$C/cal/d2c_wm_seed2.pt" | cut -d' ' -f1)"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d2_qualify.py --wm "$C/cal/d2c_wm_seed2.pt" --norm "$OUT/data/go2_norm.npz" \
+    --round0 "$ROUND0" --r0-withheld "$OUT/data/r0/withheld.json" --probe "$PROBE" --out "$C/qualify" > "$C/qualify.log" 2>&1 \
+    || { tail -5 "$C/qualify.log"; fail "qualification of the calibrated model ($C/qualify.log)"; }
+  cat "$C/qualify/d2_qualify.txt" | tee -a "$OUT/queue.log"
+  status "calibrated and qualified once; $(sha256sum "$C/qualify/d2_qualify.json")"
+  exit 0
+fi
+[ "$PHASE" = fit ] || { echo "phase must be fit, qualify or calibrate"; exit 2; }
 [ -e "$OUT" ] && { echo "OUT exists: $OUT"; exit 2; }
 mkdir -p "$OUT"
 for f in "$ROUND0" "$SHIFT" "$A3_WITHHELD"; do [ -s "$f" ] || fail "missing $f"; done

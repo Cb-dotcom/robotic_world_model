@@ -131,13 +131,16 @@ def windowed(sd, eps, rows, k, device, last_action=None, batch=2048):
 
 
 @torch.no_grad()
-def episode_context(sd, ep, device):
-    """Teacher forced with memory from the episode start: [E, L] stop probabilities and errors (NaN at row 0)."""
+def episode_context(sd, ep, device, return_logits=False):
+    """Teacher forced with memory from the episode start: [E, L] stop probabilities and errors (NaN at row 0).
+
+    return_logits: also return the raw termination logits [E, L] (NaN at row 0)."""
     E = len(sd.state_heads)
     P = np.full((E, ep.L), np.nan, np.float32)
     ERR = np.full((E, ep.L), np.nan, np.float32)
+    LG = np.full((E, ep.L), np.nan, np.float32)
     if ep.L < 2:
-        return P, ERR
+        return (P, ERR, LG) if return_logits else (P, ERR)
     xs = torch.from_numpy(ep.S[:-1]).to(device)
     x = torch.cat([xs, torch.from_numpy(ep.A[1:]).to(device)], dim=-1).unsqueeze(0)
     base, _ = sd.state_base.memory.rnn(x)
@@ -148,7 +151,8 @@ def episode_context(sd, ep, device):
     tgt = torch.from_numpy(ep.S[1:]).to(device)
     P[:, 1:] = torch.sigmoid(logits).cpu().numpy()
     ERR[:, 1:] = ((means - tgt) ** 2).mean(-1).cpu().numpy()
-    return P, ERR
+    LG[:, 1:] = logits.cpu().numpy()
+    return (P, ERR, LG) if return_logits else (P, ERR)
 
 
 @torch.no_grad()
