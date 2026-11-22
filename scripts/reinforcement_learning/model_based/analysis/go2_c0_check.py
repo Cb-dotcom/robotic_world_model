@@ -40,7 +40,7 @@ for p in (str(HERE), str(MB)):
         sys.path.insert(0, p)
 
 import go2_g0_replay as rp  # noqa: E402
-from c0_battery import c0_verdict, ci  # noqa: E402
+from c0_battery import c0_verdict, ci, pair_bootstrap  # noqa: E402
 from pre_reset_transitions import sha256, validate_trace  # noqa: E402
 
 H_CTX, DEPTH, SURVIVE, STRIDE = 32, 25, 25, 5
@@ -143,22 +143,11 @@ def auroc(pos, neg):
 
 
 def bootstrap(vf, vs, cf, cs, sf, ss, n_boot=10_000, seed=0):
-    """Paired cluster bootstrap (episodes), stratified by probe: H_fall*, H_surv* per resample."""
-    g = np.random.default_rng(seed)
-    def groups(c, s):
-        out = []
-        for stratum in sorted(set(s)):
-            cl = sorted({c[i] for i in range(len(c)) if s[i] == stratum})
-            out.append([np.array([i for i in range(len(c)) if c[i] == k]) for k in cl])
-        return out
-    gf, gs = groups(cf, sf), groups(cs, ss)
-    def draw(v, gr):
-        idx = np.concatenate([grp[k] for grp in gr for k in g.choice(len(grp), len(grp))])
-        return -float(np.mean(v[idx]))
-    out_f, out_s = np.empty(n_boot), np.empty(n_boot)
-    for b in range(n_boot):
-        out_f[b], out_s[b] = draw(vf, gf), draw(vs, gs)
-    return out_f, out_s
+    """Resample matched pairs together, clustering pairs that share an episode."""
+    if not np.array_equal(sf, ss):
+        raise ValueError("matched fall and survivor windows must come from the same probe")
+    return pair_bootstrap(-np.asarray(vf), -np.asarray(vs), sf, cf, cs, n_boot, seed)
+
 
 
 def analyse(sd, eps, k, device, n_boot, seed=0):
@@ -182,6 +171,7 @@ def analyse(sd, eps, k, device, n_boot, seed=0):
                        vals["fall"][2], vals["surviving"][2], n_boot, seed)
     res["verdict"] = c0_verdict(res["fall"]["H"], bf, res["surviving"]["H"], bs)
     res["H_fall_ci"], res["H_surv_ci"] = ci(bf), ci(bs)
+    res["resampling"] = "matched pairs, episode components, stratified by probe"
     uf, us = np.array(res["fall"]["u_ctx"]), np.array(res["surviving"]["u_ctx"])
     vf, vs = np.array(res["fall"]["u_imag_mean_over_heads"]), np.array(res["surviving"]["u_imag_mean_over_heads"])
     res["warning_ratio"] = dict(recorded=float(np.exp(np.log(uf).mean() - np.log(us).mean())),

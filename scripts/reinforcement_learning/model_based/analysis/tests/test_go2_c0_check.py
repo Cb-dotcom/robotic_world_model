@@ -75,6 +75,16 @@ def test_auroc():
     assert c0.auroc(np.array([1.0, 1.0]), np.array([1.0, 1.0])) == 0.5
 
 
+def test_bootstrap_keeps_the_matched_windows_together():
+    log_ratios = np.array([-1.0, -2.0, -6.0])
+    fall_clusters = ["p/f1", "p/f2", "p/f3"]
+    survivor_clusters = ["p/s1", "p/s1", "p/s2"]
+    strata = ["p"] * len(log_ratios)
+    fall, surviving = c0.bootstrap(log_ratios, log_ratios, fall_clusters, survivor_clusters, strata, strata, n_boot=100)
+    np.testing.assert_array_equal(fall, surviving)
+    assert len(np.unique(fall)) > 1
+
+
 def test_c0_end_to_end(tmp_path):
     probes = []
     from test_c0_battery import random_trace
