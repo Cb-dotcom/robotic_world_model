@@ -91,7 +91,29 @@ if [ "$PHASE" = breakdown ]; then
   status "breakdown done; $(sha256sum "$B/run/d2_breakdown.json")"
   exit 0
 fi
-[ "$PHASE" = fit ] || { echo "phase must be fit, qualify, calibrate or breakdown"; exit 2; }
+if [ "$PHASE" = c0 ]; then
+  # A4 Go2 C0 check (review 22 Nov): exact PPO signal, endpoint 10 rows before impact, matched surviving windows,
+  # recorded vs model-generated history; both probes (seeds 911, 912). Read-only, CPU.
+  WM="$OUT/wm/d2_wm_seed2.pt"; G="$OUT/go2_c0"
+  WM_SHA=${WM_SHA:-080f353d7b6015b97dd7ca96d822b02dfc99f5c959184ae4d50dd7e9d2b50da4}
+  PROBE2=${PROBE2:-logs/p2/a4_d1_probe2/probe.npz}
+  PROBE2_SHA=${PROBE2_SHA:-ece45ba5151da9a752d3ed018f990fb74da61c04bfaf2f7adc48cff9a60d1257}   # run-log 22 Nov
+  [ -e "$G" ] && { echo "exists: $G"; exit 2; }
+  [ "$(sha256sum "$WM" | cut -d' ' -f1)" = "$WM_SHA" ] || fail "model hash differs from the run-log"
+  [ "$(sha256sum "$PROBE" | cut -d' ' -f1)" = "$PROBE_SHA" ] || fail "probe 911 hash differs from the run-log"
+  [ "$(sha256sum "$PROBE2" | cut -d' ' -f1)" = "$PROBE2_SHA" ] || fail "probe 912 hash differs from the run-log"
+  mkdir -p "$G"
+  { git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_c0_check.py; } > "$G/git.txt"
+  CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_c0_check.py > "$G/tests.log" 2>&1 || fail "C0 tests ($G/tests.log)"
+  grep -qE "[0-9]+ skipped" "$G/tests.log" && fail "C0 tests were skipped"
+  status "C0 tests: $(tail -1 "$G/tests.log")"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_c0_check.py --wm "$WM" --norm "$OUT/data/go2_norm.npz" --probe "p911=$PROBE" \
+    --probe "p912=$PROBE2" --out "$G/run" > "$G/c0.log" 2>&1 || { tail -5 "$G/c0.log"; fail "Go2 C0 check ($G/c0.log)"; }
+  cat "$G/run/go2_c0.txt" | tee -a "$OUT/queue.log"
+  status "Go2 C0 done; $(sha256sum "$G/run/go2_c0.json")"
+  exit 0
+fi
+[ "$PHASE" = fit ] || { echo "phase must be fit, qualify, calibrate, breakdown or c0"; exit 2; }
 [ -e "$OUT" ] && { echo "OUT exists: $OUT"; exit 2; }
 mkdir -p "$OUT"
 for f in "$ROUND0" "$SHIFT" "$A3_WITHHELD"; do [ -s "$f" ] || fail "missing $f"; done
