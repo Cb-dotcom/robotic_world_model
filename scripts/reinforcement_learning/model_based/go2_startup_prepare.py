@@ -23,6 +23,11 @@ Output (fresh folder):
                  terminal target in standard windows / startup windows), mean training-episode length,
                  startup_reset_share q = min(0.5, 256 / mean length), hashes, the rule
 The normalizer is not computed here: D6 uses D2's frozen go2_norm.npz.
+
+Reset-row torque (23 Nov 2026, D6b): the recorder's pre-action torque block (state dims 33..44) after an earlier episode
+is that episode's last torque (the simulator has not recomputed it). reset_torque="zero" (D6b) writes 0 N m there, in
+the segments and in reset_states.npz: before the first action no actuator torque has been applied. "recorded" (D6)
+keeps the recorded value.
 """
 from __future__ import annotations
 
@@ -45,12 +50,25 @@ IMAGINED_EPISODE_STEPS = 256
 Q_CAP = 0.5
 
 
-def reset_row(trace, n, s):
-    return np.concatenate([trace["state"][s, n], trace["previous_action"][s, n],
+TORQUE = slice(33, 45)
+RESET_TORQUE = ("recorded", "zero")
+
+
+def reset_state(trace, n, s, reset_torque="recorded"):
+    st = trace["state"][s, n].astype(np.float32).copy()
+    if reset_torque == "zero":
+        st[TORQUE] = 0.0
+    elif reset_torque != "recorded":
+        raise ValueError(f"reset_torque must be one of {RESET_TORQUE}")
+    return st
+
+
+def reset_row(trace, n, s, reset_torque="recorded"):
+    return np.concatenate([reset_state(trace, n, s, reset_torque), trace["previous_action"][s, n],
                            np.zeros(prep.CONTACT, np.float32), np.zeros(prep.TERM, np.float32)]).astype(np.float32)
 
 
-def prepare_source(trace_path, out, tag, frac=0.1, seed=101):
+def prepare_source(trace_path, out, tag, frac=0.1, seed=101, reset_torque="recorded"):
     """One source: segments, start blocks, reset states and withheld.json in `out` (fresh)."""
     out = Path(out)
     out.mkdir(parents=True)
@@ -87,8 +105,8 @@ def prepare_source(trace_path, out, tag, frac=0.1, seed=101):
         rows = prep.rows_of(trace, n, s, e)
         has_reset = int(step[s, n]) == 1
         if has_reset:
-            rows = np.concatenate([reset_row(trace, n, s)[None], rows], axis=0)
-            resets.append((trace["state"][s, n], trace["previous_action"][s, n], n, s))
+            rows = np.concatenate([reset_row(trace, n, s, reset_torque)[None], rows], axis=0)
+            resets.append((reset_state(trace, n, s, reset_torque), trace["previous_action"][s, n], n, s))
             c["with_reset_row"] += 1
         else:
             c["without_reset_row"] += 1
@@ -126,13 +144,15 @@ def prepare_source(trace_path, out, tag, frac=0.1, seed=101):
                             row=np.array([r[3] for r in resets], np.int32)))
 
 
-def prepare_startup(r0_trace, shift_trace, out, frac=0.1, seed=101, d2_data=None):
+def prepare_startup(r0_trace, shift_trace, out, frac=0.1, seed=101, d2_data=None, reset_torque="recorded"):
     out = Path(out)
     if out.exists():
         raise FileExistsError(f"{out} exists")
     out.mkdir(parents=True)
-    src = {"r0": prepare_source(r0_trace, out / "r0", "r0", frac, seed),
-           "sh": prepare_source(shift_trace, out / "shift", "sh", frac, seed)}
+    if reset_torque not in RESET_TORQUE:
+        raise ValueError(f"reset_torque must be one of {RESET_TORQUE}")
+    src = {"r0": prepare_source(r0_trace, out / "r0", "r0", frac, seed, reset_torque),
+           "sh": prepare_source(shift_trace, out / "shift", "sh", frac, seed, reset_torque)}
     if d2_data is not None:
         for tag, sub in (("r0", "r0"), ("sh", "shift")):
             if (out / sub / "withheld.json").read_text() != (Path(d2_data) / sub / "withheld.json").read_text():
@@ -176,7 +196,7 @@ def prepare_startup(r0_trace, shift_trace, out, frac=0.1, seed=101, d2_data=None
               "no padding; D2's normalizer is used unchanged" % (frac, seed)),
         sources={t: dict(path=s["source"], sha256=s["source_sha256"], checkpoint_sha256=s["checkpoint_sha256"],
                          counts=s["counts"]) for t, s in src.items()},
-        segments=len(lines) - 1, startup_segments=len(startup), reset_states=int(len(r["env"])),
+        reset_torque=reset_torque, segments=len(lines) - 1, startup_segments=len(startup), reset_states=int(len(r["env"])),
         mean_training_episode_rows=mean_len, startup_reset_share=q,
         startup_reset_share_rule=f"q = min({Q_CAP}, {IMAGINED_EPISODE_STEPS} / mean training-episode rows)",
         outputs=dict(segments_manifest_sha256=sha256(seg / "manifest.csv"), startup_json_sha256=sha256(out / "startup.json"),
@@ -195,15 +215,17 @@ def main(argv=None):
     p.add_argument("--shift", type=Path, required=True, help="the D1 fitting batch")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--d2-data", type=Path, default=None, help="D2's data folder: the withheld lists must be equal")
+    p.add_argument("--reset-torque", choices=RESET_TORQUE, default="recorded",
+                   help="reset-row torque block: as recorded (D6) or 0 N m (D6b)")
     a = p.parse_args(argv)
-    r = prepare_startup(a.round0, a.shift, a.out, d2_data=a.d2_data)
+    r = prepare_startup(a.round0, a.shift, a.out, d2_data=a.d2_data, reset_torque=a.reset_torque)
     for t, s in r["sources"].items():
         c = s["counts"]
         print(f"[d6] {t}: {c['training']} training episodes ({c['training_falls']} falls), {c['with_reset_row']} with a "
               f"reset row, {c['without_reset_row']} without; segments {c['segments']} ({c['short_segments']} shorter than "
               f"the 40-row window); falls with a terminal target: standard windows {c['falls_in_standard_windows']}, "
               f"startup windows {c['falls_in_startup_windows']}")
-    print(f"[d6] {r['segments']} segments, {r['startup_segments']} with a reset row; reset states {r['reset_states']}; "
+    print(f"[d6] reset-row torque: {r['reset_torque']}; {r['segments']} segments, {r['startup_segments']} with a reset row; reset states {r['reset_states']}; "
           f"mean training episode {r['mean_training_episode_rows']:.1f} rows -> startup reset share q = "
           f"{r['startup_reset_share']:.4f}")
     return 0

@@ -19,6 +19,8 @@ Measured:
                caught = a stop at one of the last 11 transitions; first stop: the earliest stop at any step, reported as
                steps before the terminal one, and the share that stopped before the last 11 transitions; falls with
                26..40 rows reported the same way
+Reset-row torque (23 Nov, D6b): --reset-torque zero starts from the reset state with its torque block at 0 N m, the
+convention of D6b's data; the default keeps the recorded value (D6).
 Rule (Q4): on each rule source, velocity RMSE at step 25 <= 0.25 m/s, tilt RMSE at step 25 <= 5 deg and false stops
 <= 0.10, each on >= 20 episodes (fewer -> the source cannot pass). Q4 passes if both rule sources pass.
 """
@@ -48,16 +50,17 @@ BARS = dict(vxy=0.25, tilt=5.0, false_stop=0.10)
 
 
 class StartEp:
-    def __init__(self, trace, n, s, e, kind, norm):
+    def __init__(self, trace, n, s, e, kind, norm, reset_torque="recorded"):
+        from go2_startup_prepare import reset_state
         nz = lambda x, m, sd: ((x - norm[m]) / norm[sd]).astype(np.float32)
-        self.R = nz(trace["state"][s, n], "state_mean", "state_std")
+        self.R = nz(reset_state(trace, n, s, reset_torque), "state_mean", "state_std")
         self.S = nz(trace["next_state"][s:e + 1, n], "state_mean", "state_std")
         self.A = nz(trace["action"][s:e + 1, n], "action_mean", "action_std")
         self.raw = trace["next_state"][s:e + 1, n].astype(np.float32)
         self.L, self.kind, self.env, self.first = e - s + 1, kind, n, s
 
 
-def start_episodes(trace, norm, only=None):
+def start_episodes(trace, norm, only=None, reset_torque="recorded"):
     """Finished episodes that began at a physical reset; `only` = {(env, first)} restricts to a withheld list."""
     import go2_round0_prepare as prep
     out = []
@@ -65,7 +68,7 @@ def start_episodes(trace, norm, only=None):
         if not fin or int(trace["episode_step"][s, n]) != 1 or (only is not None and (n, s) not in only):
             continue
         kind = "fall" if (trace["terminated"][e, n] and not trace["time_out"][e, n]) else "time_out"
-        out.append(StartEp(trace, n, s, e, kind, norm))
+        out.append(StartEp(trace, n, s, e, kind, norm, reset_torque))
     return out
 
 
@@ -163,7 +166,7 @@ def verdict(r):
     return dict(**{k: bool(v) for k, v in ok.items()}, passed=bool(all(ok.values())))
 
 
-def run(wm, norm_path, rule_sources, descriptive, out, device="cpu"):
+def run(wm, norm_path, rule_sources, descriptive, out, device="cpu", reset_torque="recorded"):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
     t0 = time.time()
@@ -172,7 +175,7 @@ def run(wm, norm_path, rule_sources, descriptive, out, device="cpu"):
     res, meta = {}, {}
     for name, (path, only) in list(rule_sources.items()) + list(descriptive.items()):
         tr, m = load(path)
-        eps = start_episodes(tr, norm, only)
+        eps = start_episodes(tr, norm, only, reset_torque)
         res[name] = score(sd, eps, norm, device)
         if name in rule_sources:
             res[name]["verdict"] = verdict(res[name])
@@ -181,7 +184,7 @@ def run(wm, norm_path, rule_sources, descriptive, out, device="cpu"):
     q4 = all(res[n]["verdict"]["passed"] for n in rule_sources)
     rep = dict(protocol="A4 D6 Q4 startup check (rules fixed before the D6 model existed)", wm=str(wm), wm_sha256=sha256(wm),
                normalizer_sha256=sha256(norm_path), normalizer_max_diff=diff, sources=meta, results=res, bars=BARS,
-               min_episodes=MIN_N, q4_pass=q4, analysis_sha256=sha256(__file__), wall_s=time.time() - t0)
+               min_episodes=MIN_N, q4_pass=q4, reset_torque=reset_torque, analysis_sha256=sha256(__file__), wall_s=time.time() - t0)
     (out / "startup_check.json").write_text(json.dumps(rep, indent=1, default=float))
     t = text(rep)
     (out / "startup_check.txt").write_text(t)
@@ -190,7 +193,8 @@ def run(wm, norm_path, rule_sources, descriptive, out, device="cpu"):
 
 
 def text(rep):
-    L = [f"A4 D6 Q4 startup check (from the physical reset, zero memory, recorded actions); model {rep['wm_sha256'][:12]}"]
+    L = [f"A4 D6 Q4 startup check (from the physical reset, zero memory, recorded actions; reset-row torque "
+         f"{rep.get('reset_torque', 'recorded')}); model {rep['wm_sha256'][:12]}"]
     for name, r in rep["results"].items():
         f25, f10 = r["fidelity_step25"], r["fidelity_step10"]
         L.append(f"[{name}] {r['episodes']} episodes from a reset ({r['falls']} falls)")
@@ -220,6 +224,7 @@ def main(argv=None):
                    help="rule source name=trace:withheld.json (only the listed withheld episodes)")
     p.add_argument("--descriptive", action="append", default=[], help="name=path, reported without a rule")
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--reset-torque", choices=("recorded", "zero"), default="recorded")
     a = p.parse_args(argv)
     rule = {s.split("=", 1)[0]: (Path(s.split("=", 1)[1]), None) for s in a.probe}
     for s in a.withheld:
@@ -230,7 +235,7 @@ def main(argv=None):
     desc = {s.split("=", 1)[0]: (Path(s.split("=", 1)[1]), None) for s in a.descriptive}
     if not rule:
         raise SystemExit("at least one rule source")
-    return 0 if run(a.wm, a.norm, rule, desc, a.out)["q4_pass"] else 7
+    return 0 if run(a.wm, a.norm, rule, desc, a.out, reset_torque=a.reset_torque)["q4_pass"] else 7
 
 
 if __name__ == "__main__":

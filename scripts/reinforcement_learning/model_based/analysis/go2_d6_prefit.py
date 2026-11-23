@@ -49,6 +49,8 @@ def _close(a, b):
 
 def check_first_transition(data, traces, norm):
     from fit_world_model_go2_pilot_segments import build_startup_groups, read_segments
+    from go2_startup_prepare import reset_state
+    rt = json.loads((data / "manifest.json").read_text()).get("reset_torque", "recorded")
     startup = json.loads((data / "startup.json").read_text())["segments"]
     segs, _, _ = read_segments(data / "segments", 45, 12, 0, 8, 1)
     by = {name: d for name, _, d, _ in segs}
@@ -56,7 +58,7 @@ def check_first_transition(data, traces, norm):
     for name in startup:
         tag, env, row = name[:2], int(name[6:9]), int(name[11:])
         tr, x = traces[tag], by[name]
-        ok = (_close(x[0, :45], tr["state"][row, env]) and _close(x[0, 45:57], tr["previous_action"][row, env])
+        ok = (_close(x[0, :45], reset_state(tr, env, row, rt)) and _close(x[0, 45:57], tr["previous_action"][row, env])
               and not x[0, 57:].any() and _close(x[1, :45], tr["next_state"][row, env])
               and _close(x[1, 45:57], tr["action"][row, env]))
         if not ok:
@@ -79,8 +81,10 @@ def check_first_transition(data, traces, norm):
         want[:, :45] = (want[:, :45] - norm["state_mean"]) / norm["state_std"]
         want[:, 45:57] = (want[:, 45:57] - norm["action_mean"]) / norm["action_std"]
         w_bad += not np.allclose(got, want, rtol=1e-5, atol=1e-5)
-    ok = not bad and n_h1 == len(names) and w_bad == 0
-    return dict(ok=ok, startup_segments=len(startup), mismatched_rows=bad[:10], mismatched_count=len(bad),
+    with np.load(data / "reset_states.npz") as z:
+        rs_torque_ok = rt == "recorded" or bool(np.all(z["state"][:, 33:45] == 0.0))
+    ok = not bad and n_h1 == len(names) and w_bad == 0 and rs_torque_ok
+    return dict(ok=ok, reset_torque=rt, reset_states_torque_ok=rs_torque_ok, startup_segments=len(startup), mismatched_rows=bad[:10], mismatched_count=len(bad),
                 history1_windows=n_h1, history1_missing=w_bad)
 
 
@@ -189,7 +193,7 @@ def run(data, round0, shift, wm, norm_path, out):
     a, b, c, d = (res[k] for k in ("a_first_transition", "b_terminal_targets", "c_sampler", "d_reset_rows"))
     lines = [
         "A4 D6 pre-fit verifications (prepared data, before the fit)",
-        f"(a) first transition: {a['startup_segments']} startup segments, mismatches {a['mismatched_count']}, history-1 "
+        f"(a) first transition (reset-row torque {a['reset_torque']}): {a['startup_segments']} startup segments, mismatches {a['mismatched_count']}, history-1 "
         f"windows {a['history1_windows']} (missing {a['history1_missing']}) -> {'PASS' if a['ok'] else 'FAIL'}",
         f"(b) terminal targets: {b['training_falls']} training falls: {b['in_standard_windows']} in standard windows, "
         f"{b['in_startup_windows']} in startup windows, {b['without_target_count']} without a target, "

@@ -15,7 +15,7 @@ MB=scripts/reinforcement_learning/model_based
 AN=$MB/analysis
 EVAL=scripts/reinforcement_learning/rsl_rl/eval_episode_stats.py
 TASK=Template-Isaac-Velocity-Flat-Unitree-Go2-Start-v0
-D6=${D6:-logs/p2/a4_d6_1122}
+D6=${D6:-logs/p2/a4_d6_1122}   # D6b: D6=logs/p2/a4_d6b_1123
 WM=$D6/option1/run/d6s_wm_seed2.pt
 START=$D6/data/start_data
 RESETS=$D6/data/reset_states.npz
@@ -42,6 +42,9 @@ for f in "$E16" "$ROUND0" "$START/start_data.json" "$RESETS" "$D6/data/manifest.
 [ "$(sha256sum $AN/go2_d3_gate.py | cut -d' ' -f1)" = "$GATE_SHA" ] || fail "the D3 gate code changed"
 Q=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; print(json.load(open(sys.argv[1]))['startup_reset_share'])" "$D6/data/manifest.json" | tail -1)
 [[ "$Q" =~ ^0\.[0-9]+$|^1(\.0+)?$ ]] || fail "invalid startup share from the D6 manifest: $Q"
+RT=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; print('RT', json.load(open(sys.argv[1])).get('reset_torque', 'recorded'))" "$D6/data/manifest.json" | grep '^RT ' | tail -1)
+[[ "$RT" =~ ^RT\ (recorded|zero)$ ]] || fail "invalid reset-row torque in the D6 manifest: $RT"
+status "D6 data: reset-row torque ${RT#RT }, startup share $Q"
 CK=$(CUDA_VISIBLE_DEVICES="" "$PY" -c "import json, sys, numpy as np; print(json.loads(str(np.load(sys.argv[1])['metadata']))['checkpoint'])" "$ROUND0" 2>/dev/null | tail -1) \
   || fail "could not read s2 checkpoint from the round-0 trace"
 [ -s "$CK" ] || fail "s2 checkpoint not found: $CK"

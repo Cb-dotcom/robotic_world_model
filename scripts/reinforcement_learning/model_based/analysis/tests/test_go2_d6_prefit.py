@@ -75,3 +75,14 @@ def test_wrong_recording_is_refused(prepared):
     tmp, r0, sh, wm = prepared
     with pytest.raises(ValueError, match="not the recording"):
         pf.run(tmp / "d6", sh, r0, wm, tmp / "n.npz", tmp / "pre")
+
+
+def test_prefit_passes_with_zero_reset_torque(tmp_path):
+    r0 = save(tmp_path / "r0.npz", startup_trace())
+    sh = save(tmp_path / "sh.npz", startup_trace(seed=7))
+    sp.prepare_startup(r0, sh, tmp_path / "d6b", frac=0.1, seed=101, reset_torque="zero")
+    np.savez(tmp_path / "n.npz", **ID)
+    wm = fake_go2_wm(tmp_path / "wm.pt", ID)
+    res = pf.run(tmp_path / "d6b", r0, sh, wm, tmp_path / "n.npz", tmp_path / "pre")
+    assert res["pass"] and res["a_first_transition"]["reset_torque"] == "zero"
+    assert res["a_first_transition"]["reset_states_torque_ok"]

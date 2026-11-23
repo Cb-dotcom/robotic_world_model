@@ -11,8 +11,9 @@
 #   verdict  CPU  writes the VERDICT D6 line from the saved Q1-Q4 outputs (23 Nov: /isaac-sim/python.sh turns every
 #                 non-zero exit into 1, so verdicts are read from the output files, never from exit codes; bug 15q)
 #   followup CPU  descriptive: Q4 on D2's model (did the startup coverage help?) and the stale-torque sensitivity
-# Example:
-#   setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d6.sh all logs/p2/a4_d6_1122 > /tmp/a4_d6.out 2>&1 < /dev/null &
+# RESET_TORQUE=zero (D6b, 23 Nov): the reset row's torque block is 0 N m in the data, the reset states and Q4's starts;
+# the default "recorded" is D6. Example (D6b):
+#   RESET_TORQUE=zero setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d6.sh all logs/p2/a4_d6b_1123 > /tmp/a4_d6b.out 2>&1 < /dev/null &
 set -uo pipefail
 PHASE=${1:?phase: all, prepare, prefit, fit, retrain, qualify, verdict or followup}
 OUT=${2:?out dir}
@@ -34,6 +35,8 @@ PROBE3_SHA=${PROBE3_SHA:-0acfd1b153f025073e30cdfe0373da4931292054301857b85666c30
 D3PROBE=${D3PROBE:-logs/p2/a4_d4_1122/rec/probe.npz}
 D3PROBE_SHA=${D3PROBE_SHA:-3893daac560c18cfdd4c599d2dfe44d76cd46f86f91250203677e96086fa9405}    # run-log 22 Nov (D4)
 FIT_SEED=2
+RESET_TORQUE=${RESET_TORQUE:-recorded}
+[ "$RESET_TORQUE" = recorded ] || [ "$RESET_TORQUE" = zero ] || { echo "RESET_TORQUE must be recorded or zero"; exit 2; }
 WM=$OUT/wm/d6_wm_seed2.pt
 WMS=$OUT/option1/run/d6s_wm_seed2.pt
 export PYTHONUNBUFFERED=1 PYTHONPATH="/isaac-sim/kit/extscore/omni.client.lib:$PWD/../rsl_rl_rwm"
@@ -56,7 +59,7 @@ phase_prepare() {
   grep -qE "[0-9]+ skipped" "$OUT/tests.log" && fail "tests were skipped (tests.log)"
   status "tests: $(tail -1 "$OUT/tests.log")"
   CUDA_VISIBLE_DEVICES="" $PY $MB/go2_startup_prepare.py --round0 "$ROUND0" --shift "$SHIFT" --out "$OUT/data" \
-    --d2-data "$D2/data" > "$OUT/prepare.log" 2>&1 || { tail -5 "$OUT/prepare.log"; fail "prepare (prepare.log)"; }
+    --d2-data "$D2/data" --reset-torque "$RESET_TORQUE" > "$OUT/prepare.log" 2>&1 || { tail -5 "$OUT/prepare.log"; fail "prepare (prepare.log)"; }
   grep "^\[d6\]" "$OUT/prepare.log" | tee -a "$OUT/queue.log"
   chmod -R a-w "$OUT/data"
   status "data ready, write-protected; manifest $(sha256sum "$OUT/data/manifest.json" | cut -c1-12)"
@@ -64,6 +67,7 @@ phase_prepare() {
 phase_prefit() {
   [ -e "$OUT/prefit" ] && { status "exists: $OUT/prefit"; exit 2; }
   [ -s "$OUT/data/manifest.json" ] || fail "no prepared data"
+  grep -q "\"reset_torque\": \"$RESET_TORQUE\"" "$OUT/data/manifest.json" || fail "the data's reset-row torque differs from RESET_TORQUE=$RESET_TORQUE"
   sha_ok "$D2WM" "$D2WM_SHA"
   CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_prefit.py --data "$OUT/data" --round0 "$ROUND0" --shift "$SHIFT" --wm "$D2WM" \
     --norm "$NORM" --out "$OUT/prefit" > "$OUT/prefit.log" 2>&1
@@ -117,7 +121,7 @@ phase_qualify() {
   cat "$OUT/qualify/d2_qualify.txt" | tee -a "$OUT/queue.log"
   CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_startup_check.py --wm "$WMS" --norm "$NORM" --probe "s2_913=$PROBE3" \
     --withheld "r0_withheld=$ROUND0:$OUT/data/r0/withheld.json" --descriptive "d3_915=$D3PROBE" \
-    --out "$OUT/startup" > "$OUT/startup.log" 2>&1
+    --out "$OUT/startup" --reset-torque "$RESET_TORQUE" > "$OUT/startup.log" 2>&1
   [ -s "$OUT/startup/startup_check.json" ] || { tail -5 "$OUT/startup.log"; fail "Q4 wrote no result ($OUT/startup.log)"; }
   cat "$OUT/startup/startup_check.txt" | tee -a "$OUT/queue.log"
   phase_verdict
@@ -146,7 +150,7 @@ phase_followup() {
   grep -qE "[0-9]+ skipped" "$OUT/followup/tests.log" && fail "tests were skipped (followup/tests.log)"
   status "followup tests: $(tail -1 "$OUT/followup/tests.log")"
   SRC=(--probe "s2_913=$PROBE3" --withheld "r0_withheld=$ROUND0:$OUT/data/r0/withheld.json" --descriptive "d3_915=$D3PROBE")
-  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_startup_check.py --wm "$D2WM" --norm "$NORM" "${SRC[@]}" \
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_startup_check.py --wm "$D2WM" --norm "$NORM" "${SRC[@]}" --reset-torque "$RESET_TORQUE" \
     --out "$OUT/followup/startup_d2model" > "$OUT/followup/startup_d2model.log" 2>&1
   [ -s "$OUT/followup/startup_d2model/startup_check.txt" ] || { tail -5 "$OUT/followup/startup_d2model.log"; fail "Q4 on D2's model"; }
   status "Q4 statistics on D2's model (descriptive; D2 never fitted startup windows):"

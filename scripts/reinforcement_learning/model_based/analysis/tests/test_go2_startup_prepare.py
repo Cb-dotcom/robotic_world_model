@@ -107,3 +107,24 @@ def test_recording_without_episode_step_is_refused(tmp_path):
     src = save(tmp_path / "r0.npz", tr)
     with pytest.raises(ValueError, match="episode_step"):
         sp.prepare_startup(src, src, tmp_path / "d6")
+
+
+def test_zero_reset_torque_convention(tmp_path):
+    """D6b (23 Nov): the reset row's torque block is 0 N m in the segments and in reset_states.npz; nothing else
+    changes."""
+    tr = startup_trace()
+    src = save(tmp_path / "r0.npz", tr)
+    sh = save(tmp_path / "sh.npz", startup_trace(seed=7))
+    r = sp.prepare_startup(src, sh, tmp_path / "z", frac=0.0, seed=101, reset_torque="zero")
+    rec = sp.prepare_startup(src, sh, tmp_path / "r", frac=0.0, seed=101)
+    assert r["reset_torque"] == "zero" and rec["reset_torque"] == "recorded"
+    name = next(n for n in json.loads((tmp_path / "z" / "startup.json").read_text())["segments"] if n.startswith("r0_"))
+    z = np.loadtxt(tmp_path / "z" / "segments" / f"{name}.csv", delimiter=",", ndmin=2)
+    o = np.loadtxt(tmp_path / "r" / "segments" / f"{name}.csv", delimiter=",", ndmin=2)
+    assert np.all(z[0, 33:45] == 0) and not np.all(o[0, 33:45] == 0)
+    np.testing.assert_array_equal(z[0, :33], o[0, :33])
+    np.testing.assert_array_equal(z[1:], o[1:])
+    with np.load(tmp_path / "z" / "reset_states.npz") as a:
+        assert np.all(a["state"][:, 33:45] == 0)
+    with pytest.raises(ValueError, match="reset_torque"):
+        sp.prepare_startup(src, sh, tmp_path / "bad", reset_torque="stale")

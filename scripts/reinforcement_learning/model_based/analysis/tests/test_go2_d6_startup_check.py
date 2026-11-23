@@ -109,3 +109,11 @@ def test_no_episode_gives_empty_results(tmp_path):
     assert pf.shape[0] == pr.shape[0] == pred.shape[0] == 0
     r = sc.score(sd, [], NORM, "cpu")
     assert r["episodes"] == 0 and r["fidelity_step25"]["n"] == 0 and not sc.verdict(r)["passed"]
+
+
+def test_zero_reset_torque_start_states():
+    tr = startup_trace()
+    a = sc.start_episodes(tr, NORM)
+    b = sc.start_episodes(tr, NORM, reset_torque="zero")
+    for x, y in zip(a, b):
+        assert np.all(y.R[33:45] == 0.0) and np.array_equal(x.R[:33], y.R[:33]) and np.array_equal(x.S, y.S)
