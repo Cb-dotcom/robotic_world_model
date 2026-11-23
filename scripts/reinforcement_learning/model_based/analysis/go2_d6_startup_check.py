@@ -74,6 +74,8 @@ def startup_rollouts(sd, eps, device="cpu", steps=K):
     """Both arms from the reset state with zero memory. Returns p_free [n, E, steps], p_rec [n, E, steps],
     pred_free [n, E, steps, 45] (normalized; rows beyond an episode's end are padding and must be ignored)."""
     E, n = len(sd.state_heads), len(eps)
+    if n == 0:                                    # no episode from a reset (e.g. a small withheld list): empty results
+        return np.zeros((0, E, steps)), np.zeros((0, E, steps)), np.zeros((0, E, steps, 45), np.float32)
     A = np.zeros((n, steps, 12), np.float32)
     S = np.zeros((n, steps, 45), np.float32)
     for i, ep in enumerate(eps):

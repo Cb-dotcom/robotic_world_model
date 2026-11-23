@@ -8,10 +8,13 @@
 #                 D2's frozen normalizer) + startup windows; about 160 min (D2's fit time; estimate)
 #   retrain  GPU  option 1 (stop layers only; w chosen on calibration recording 914 as in D2)
 #   qualify  CPU  Q1-Q3 (go2_d2_qualify.py, probe 913, round-0 withheld) and Q4 (go2_d6_startup_check.py)
+#   verdict  CPU  writes the VERDICT D6 line from the saved Q1-Q4 outputs (23 Nov: /isaac-sim/python.sh turns every
+#                 non-zero exit into 1, so verdicts are read from the output files, never from exit codes; bug 15q)
+#   followup CPU  descriptive: Q4 on D2's model (did the startup coverage help?) and the stale-torque sensitivity
 # Example:
 #   setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d6.sh all logs/p2/a4_d6_1122 > /tmp/a4_d6.out 2>&1 < /dev/null &
 set -uo pipefail
-PHASE=${1:?phase: all, prepare, prefit, fit, retrain or qualify}
+PHASE=${1:?phase: all, prepare, prefit, fit, retrain, qualify, verdict or followup}
 OUT=${2:?out dir}
 PY=${PY:-/isaac-sim/python.sh}
 MB=scripts/reinforcement_learning/model_based
@@ -64,10 +67,9 @@ phase_prefit() {
   sha_ok "$D2WM" "$D2WM_SHA"
   CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_prefit.py --data "$OUT/data" --round0 "$ROUND0" --shift "$SHIFT" --wm "$D2WM" \
     --norm "$NORM" --out "$OUT/prefit" > "$OUT/prefit.log" 2>&1
-  RC=$?
-  [ -s "$OUT/prefit/prefit.txt" ] && cat "$OUT/prefit/prefit.txt" | tee -a "$OUT/queue.log"
-  [ $RC -eq 5 ] && fail "pre-fit verification failed: the fit does not start"
-  [ $RC -eq 0 ] || { tail -5 "$OUT/prefit.log"; fail "pre-fit verification (prefit.log)"; }
+  [ -s "$OUT/prefit/prefit.txt" ] || { tail -5 "$OUT/prefit.log"; fail "pre-fit verification wrote no result (prefit.log)"; }
+  cat "$OUT/prefit/prefit.txt" | tee -a "$OUT/queue.log"
+  grep -q "^PRE-FIT: PASS" "$OUT/prefit/prefit.txt" || fail "pre-fit verification failed: the fit does not start"
 }
 phase_fit() {
   [ -e "$WM" ] && { status "exists: $WM"; exit 2; }
@@ -100,10 +102,9 @@ phase_retrain() {
   gpu_wait 4096 "the stop-layer retrain"
   CUDA_VISIBLE_DEVICES=0 $PY $AN/go2_stop_retrain.py --wm "$WM" --norm "$NORM" --segments "$OUT/data/segments" \
     --calibration "$CAL" --out "$OUT/option1/run" --device cuda:0 --model-name d6s_wm_seed2.pt > "$OUT/option1/retrain.log" 2>&1
-  RC=$?
   grep "^\[option1\]" "$OUT/option1/retrain.log" | tee -a "$OUT/queue.log"
-  [ $RC -eq 6 ] && fail "no stop-layer candidate meets false stops <= 0.10: D6 fails (A4 §3)"
-  [ $RC -eq 0 ] || { tail -5 "$OUT/option1/retrain.log"; fail "stop retraining (option1/retrain.log)"; }
+  [ -s "$OUT/option1/run/option1.json" ] || { tail -5 "$OUT/option1/retrain.log"; fail "stop retraining wrote no result"; }
+  [ -s "$WMS" ] || fail "no stop-layer candidate meets false stops <= 0.10: D6 fails (A4 §3)"
   status "retrained model $(sha256sum "$WMS" | cut -d' ' -f1)"
 }
 phase_qualify() {
@@ -117,16 +118,44 @@ phase_qualify() {
   CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_startup_check.py --wm "$WMS" --norm "$NORM" --probe "s2_913=$PROBE3" \
     --withheld "r0_withheld=$ROUND0:$OUT/data/r0/withheld.json" --descriptive "d3_915=$D3PROBE" \
     --out "$OUT/startup" > "$OUT/startup.log" 2>&1
-  RC=$?
-  [ -s "$OUT/startup/startup_check.txt" ] && cat "$OUT/startup/startup_check.txt" | tee -a "$OUT/queue.log"
-  [ $RC -eq 0 ] || [ $RC -eq 7 ] || { tail -5 "$OUT/startup.log"; fail "Q4 ($OUT/startup.log)"; }
-  Q13=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; print(json.load(open(sys.argv[1]))['D2_pass'])" "$OUT/qualify/d2_qualify.json" | tail -1)
-  if [ "$Q13" = True ] && [ $RC -eq 0 ]; then V=PASS; else V=FAIL; fi
-  status "VERDICT D6: $V (Q1-Q3 $Q13, Q4 $([ $RC -eq 0 ] && echo PASS || echo FAIL)); model $(sha256sum "$WMS" | cut -d' ' -f1)"
+  [ -s "$OUT/startup/startup_check.json" ] || { tail -5 "$OUT/startup.log"; fail "Q4 wrote no result ($OUT/startup.log)"; }
+  cat "$OUT/startup/startup_check.txt" | tee -a "$OUT/queue.log"
+  phase_verdict
+}
+phase_verdict() {
+  [ -s "$OUT/qualify/d2_qualify.json" ] && [ -s "$OUT/startup/startup_check.json" ] || fail "no Q1-Q4 results"
+  grep -q "VERDICT D6:" "$OUT/queue.log" && { status "a VERDICT D6 line exists already"; exit 2; }
+  R=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; q = json.load(open(sys.argv[1]))['D2_pass']; \
+s = json.load(open(sys.argv[2]))['q4_pass']; print(f'{q} {s}')" "$OUT/qualify/d2_qualify.json" "$OUT/startup/startup_check.json" | tail -1)
+  set -- $R
+  [ "$1" = True ] && [ "$2" = True ] && V=PASS || V=FAIL
+  status "VERDICT D6: $V (Q1-Q3 $1, Q4 $2); model $(sha256sum "$WMS" | cut -d' ' -f1)"
+}
+phase_followup() {
+  [ -e "$OUT/followup" ] && { status "exists: $OUT/followup"; exit 2; }
+  [ -s "$WMS" ] || fail "no retrained model"
+  sha_ok "$D2WM" "$D2WM_SHA"; sha_ok "$PROBE3" "$PROBE3_SHA"; sha_ok "$D3PROBE" "$D3PROBE_SHA"
+  mkdir -p "$OUT/followup"
+  CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d6_torque_sensitivity.py $AN/tests/test_go2_d6_startup_check.py \
+    > "$OUT/followup/tests.log" 2>&1 || fail "tests (followup/tests.log)"
+  grep -qE "[0-9]+ skipped" "$OUT/followup/tests.log" && fail "tests were skipped (followup/tests.log)"
+  status "followup tests: $(tail -1 "$OUT/followup/tests.log")"
+  SRC=(--probe "s2_913=$PROBE3" --withheld "r0_withheld=$ROUND0:$OUT/data/r0/withheld.json" --descriptive "d3_915=$D3PROBE")
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_startup_check.py --wm "$D2WM" --norm "$NORM" "${SRC[@]}" \
+    --out "$OUT/followup/startup_d2model" > "$OUT/followup/startup_d2model.log" 2>&1
+  [ -s "$OUT/followup/startup_d2model/startup_check.txt" ] || { tail -5 "$OUT/followup/startup_d2model.log"; fail "Q4 on D2's model"; }
+  status "Q4 statistics on D2's model (descriptive; D2 never fitted startup windows):"
+  cat "$OUT/followup/startup_d2model/startup_check.txt" | tee -a "$OUT/queue.log"
+  CUDA_VISIBLE_DEVICES="" $PY $AN/go2_d6_torque_sensitivity.py --wm "$WMS" --norm "$NORM" "${SRC[@]}" \
+    --out "$OUT/followup/torque" > "$OUT/followup/torque.log" 2>&1
+  [ -s "$OUT/followup/torque/torque_sensitivity.txt" ] || { tail -5 "$OUT/followup/torque.log"; fail "torque sensitivity"; }
+  cat "$OUT/followup/torque/torque_sensitivity.txt" | tee -a "$OUT/queue.log"
+  status "followup done"
 }
 
 case "$PHASE" in
 all) phase_prepare; phase_prefit; phase_fit; phase_retrain; phase_qualify ;;
 prepare) phase_prepare ;; prefit) phase_prefit ;; fit) phase_fit ;; retrain) phase_retrain ;; qualify) phase_qualify ;;
-*) echo "phase must be all, prepare, prefit, fit, retrain or qualify"; exit 2 ;;
+verdict) phase_verdict ;; followup) phase_followup ;;
+*) echo "phase must be all, prepare, prefit, fit, retrain, qualify, verdict or followup"; exit 2 ;;
 esac

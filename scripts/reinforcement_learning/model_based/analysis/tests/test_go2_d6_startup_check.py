@@ -101,3 +101,11 @@ def test_end_to_end(tmp_path):
     assert rep["results"]["r0_withheld"]["episodes"] == 1
     assert rep["q4_pass"] is False                                    # too few episodes on these fixtures
     assert (tmp_path / "out" / "startup_check.txt").read_text().rstrip().endswith("Q4: FAIL")
+
+
+def test_no_episode_gives_empty_results(tmp_path):
+    sd = model(tmp_path)
+    pf, pr, pred = sc.startup_rollouts(sd, [], steps=5)
+    assert pf.shape[0] == pr.shape[0] == pred.shape[0] == 0
+    r = sc.score(sd, [], NORM, "cpu")
+    assert r["episodes"] == 0 and r["fidelity_step25"]["n"] == 0 and not sc.verdict(r)["passed"]
