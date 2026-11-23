@@ -123,13 +123,18 @@ phase_qualify() {
   phase_verdict
 }
 phase_verdict() {
+  # 23 Nov (bug 15r): the qualifier's verdict is results.rules.D2_pass; the parsed pair must be exactly two booleans,
+  # or nothing is written. The LAST "VERDICT D6:" line in queue.log counts (D7 reads that one), so a recomputed line
+  # replaces an earlier malformed one without editing the log.
   [ -s "$OUT/qualify/d2_qualify.json" ] && [ -s "$OUT/startup/startup_check.json" ] || fail "no Q1-Q4 results"
-  grep -q "VERDICT D6:" "$OUT/queue.log" && { status "a VERDICT D6 line exists already"; exit 2; }
-  R=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; q = json.load(open(sys.argv[1]))['D2_pass']; \
-s = json.load(open(sys.argv[2]))['q4_pass']; print(f'{q} {s}')" "$OUT/qualify/d2_qualify.json" "$OUT/startup/startup_check.json" | tail -1)
+  R=$(CUDA_VISIBLE_DEVICES="" $PY -c "import json, sys; q = json.load(open(sys.argv[1]))['results']['rules']['D2_pass']; \
+s = json.load(open(sys.argv[2]))['q4_pass']; print(f'VERDICT-PAIR {q} {s}')" "$OUT/qualify/d2_qualify.json" "$OUT/startup/startup_check.json" \
+    | grep '^VERDICT-PAIR ' | tail -1)
+  [[ "$R" =~ ^VERDICT-PAIR\ (True|False)\ (True|False)$ ]] || fail "could not read the Q1-Q3 and Q4 verdicts: '$R'"
   set -- $R
-  [ "$1" = True ] && [ "$2" = True ] && V=PASS || V=FAIL
-  status "VERDICT D6: $V (Q1-Q3 $1, Q4 $2); model $(sha256sum "$WMS" | cut -d' ' -f1)"
+  [ "$2" = True ] && [ "$3" = True ] && V=PASS || V=FAIL
+  N=$(grep -c "VERDICT D6:" "$OUT/queue.log")
+  status "VERDICT D6: $V (Q1-Q3 $2, Q4 $3); model $(sha256sum "$WMS" | cut -d' ' -f1)$([ "$N" -gt 0 ] && echo " [recomputed; replaces the $N earlier VERDICT D6 line(s)]")"
 }
 phase_followup() {
   [ -e "$OUT/followup" ] && { status "exists: $OUT/followup"; exit 2; }

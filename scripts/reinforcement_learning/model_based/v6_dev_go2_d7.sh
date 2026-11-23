@@ -33,9 +33,10 @@ gpu_wait() { until [ "$(nvidia-smi --id=0 --query-gpu=memory.free --format=csv,n
   status "waiting for $(( $1 / 1024 )) GiB GPU before $2"; sleep 300; done; }
 
 # ---- 0. D6 must have passed; its model hash comes from the verdict line
-VLINE=$(grep "VERDICT D6: PASS" "$D6/queue.log" | tail -1)
-[ -n "$VLINE" ] || fail "D6 has no PASS verdict in $D6/queue.log: D7 does not run"
-WM_SHA=$(echo "$VLINE" | awk '{print $NF}')
+VLINE=$(grep "VERDICT D6:" "$D6/queue.log" | tail -1)          # the LAST verdict line counts (bug 15r)
+[[ "$VLINE" == *"VERDICT D6: PASS"* ]] || fail "D6's last verdict is not PASS in $D6/queue.log: D7 does not run"
+WM_SHA=$(echo "$VLINE" | grep -oE "model [0-9a-f]{64}" | awk '{print $2}')
+[ -n "$WM_SHA" ] || fail "no model hash on D6's verdict line"
 [ "$(sha256sum "$WM" | cut -d' ' -f1)" = "$WM_SHA" ] || fail "D6 model hash differs from its verdict line"
 for f in "$E16" "$ROUND0" "$START/start_data.json" "$RESETS" "$D6/data/manifest.json"; do [ -s "$f" ] || fail "missing $f"; done
 [ "$(sha256sum $AN/go2_d3_gate.py | cut -d' ' -f1)" = "$GATE_SHA" ] || fail "the D3 gate code changed"
