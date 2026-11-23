@@ -218,6 +218,10 @@ class PolicyTraining:
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
 
+        # 23 Nov 2026 (bug 15s): the per-key episode info was built but never printed, so train.log had no
+        # "Mean episode <key>:" lines (rsl_rl's OnPolicyRunner prints them). Print-only change; training is unchanged.
+        log_string += ep_string
+
         log_string += (
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""

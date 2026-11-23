@@ -7,7 +7,9 @@
 # gate: D3's unchanged all-falls gate (analysis/go2_d3_gate.py, a3584a16...) on a view where D7's folders carry the
 # gate's policy tag; startup risk reported separately (go2_startup_hazard.py; go2_d3_fall_timing.py).
 # Usage, from the robotic_world_model root in the container:
-#   setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d7.sh logs/p2/a4_d7_1122 > /tmp/a4_d7.out 2>&1 < /dev/null &
+#   D6=logs/p2/a4_d6b_1123 setsid nohup scripts/reinforcement_learning/model_based/v6_dev_go2_d7.sh logs/p2/a4_d7_1123b > /tmp/a4_d7.out 2>&1 < /dev/null &
+# 23 Nov: the first D7 attempt (logs/p2/a4_d7_1123) stopped at a log check after training (bug 15s); its policy was never
+# evaluated. The repeat trains again with the same recipe and seed in a new folder.
 set -uo pipefail
 OUT=${1:?out dir}
 PY=${PY:-/isaac-sim/python.sh}
@@ -66,7 +68,7 @@ CHECK_S2
 [[ "$START_ITER" =~ ^[0-9]+$ ]] || fail "invalid s2 iteration: $START_ITER"
 
 { git rev-parse HEAD; git status --short | grep -v '^??'; sha256sum $AN/go2_d3_gate.py $AN/go2_startup_hazard.py $MB/envs/base.py $MB/e1_train.py; } > "$OUT/git.txt"
-CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d3_gate.py $AN/tests/test_go2_g0.py $AN/tests/test_go2_startup_resets.py \
+CUDA_VISIBLE_DEVICES="" $PY -m pytest -q $AN/tests/test_go2_d3_gate.py $AN/tests/test_go2_g0.py $AN/tests/test_go2_startup_resets.py $AN/tests/test_policy_training_log.py \
   $AN/tests/test_go2_startup_hazard.py $AN/tests/test_go2_d3_fall_timing.py $AN/tests/test_warm_resets.py > "$OUT/tests.log" 2>&1 || fail "tests (tests.log)"
 grep -qE "[0-9]+ skipped" "$OUT/tests.log" && fail "tests were skipped (tests.log)"
 status "tests: $(tail -1 "$OUT/tests.log"); D6 model ${WM_SHA:0:12}; startup share $Q; s2 $CK (${S2_SHA:0:12}), saved iteration $START_ITER"
@@ -109,6 +111,22 @@ CHECK_TRAINING
 ) || fail "could not verify completed D7 training"
 [ -s "$P" ] || fail "missing final trained policy $P"
 status "verified $ITERS PPO iterations starting at $START_ITER; $P $(sha256sum "$P" | cut -c1-12)"
+# 23 Nov (bug 15s): the startup resets must have happened in training at about the share q. Rule fixed before the run:
+# the mean of the printed per-iteration fractions is within 0.05 of q, over at least half of the iterations.
+SF=$(CUDA_VISIBLE_DEVICES="" "$PY" - "$OUT/train.log" "$Q" "$ITERS" <<'CHECK_STARTUP' | grep '^STARTUP ' | tail -1
+import re
+import sys
+from pathlib import Path
+
+log, q, iters = Path(sys.argv[1]).read_text(), float(sys.argv[2]), int(sys.argv[3])
+v = [float(x) for x in re.findall(r"Mean episode startup_reset_fraction:\s*([-+0-9.eE]+)", log)]
+m = sum(v) / len(v) if v else float("nan")
+ok = len(v) >= iters / 2 and abs(m - q) <= 0.05
+print(f"STARTUP {len(v)} {m:.4f} {'ok' if ok else 'bad'}")
+CHECK_STARTUP
+)
+[[ "$SF" =~ ^STARTUP\ [0-9]+\ [0-9.]+\ ok$ ]] || fail "startup resets in training do not match q = $Q: '$SF'"
+status "startup resets in training: ${SF#STARTUP } (logged iterations, mean fraction; q $Q)"
 grep -E "Mean reward|Mean episode length|Mean episode startup_reset_fraction" "$OUT/train.log" | tail -3 | tee -a "$OUT/queue.log"
 
 # ---- 2. physics evaluation under the friction shift: D7 and unchanged s2
