@@ -152,6 +152,11 @@ def test_trainer_wiring_sets_the_startup_share(tmp_path, monkeypatch):
     e1_train.main(args + ["--startup-resets", str(tmp_path / "d6" / "reset_states.npz"), "--startup-share", "0.25",
                           "paper_warm", "3002", "go2_flat", "--seed", "1000"])
     assert BaseEnv.startup_reset_share == 0.25 and BaseEnv.startup_reset_raw[0].shape[1] == 45
+    # A4 D8: the reset bank and the share are recorded in the train.py args that run_args.json stores
+    from pre_reset_transitions import sha256
+    assert T.args_cli.startup_reset_share == 0.25
+    assert T.args_cli.startup_resets_sha256 == sha256(tmp_path / "d6" / "reset_states.npz")
+    assert Path(T.args_cli.startup_resets) == (tmp_path / "d6" / "reset_states.npz").resolve()
     assert Path(seen["cfg"].data_config.dataset_root) == (tmp_path / "d6").resolve()
     with pytest.raises(SystemExit, match="_warm mode"):
         e1_train.main(args + ["--startup-resets", str(tmp_path / "d6" / "reset_states.npz"), "--startup-share", "0.25",

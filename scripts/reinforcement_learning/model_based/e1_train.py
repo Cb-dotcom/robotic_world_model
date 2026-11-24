@@ -128,6 +128,11 @@ def main(argv=None):
             with np.load(known.startup_resets) as z:
                 BaseEnv.startup_reset_raw = (np.asarray(z["state"], np.float32), np.asarray(z["previous_action"], np.float32))
             BaseEnv.startup_reset_share = float(known.startup_share)
+            # A4 D8 (24 Nov): the reset bank and share also land in run_args.json ("args"), so each lane's provenance
+            # file names every imagination start input; before, they were only in the training log.
+            T.args_cli.startup_resets = str(Path(known.startup_resets).resolve())
+            T.args_cli.startup_resets_sha256 = go2_study.sha256(known.startup_resets)
+            T.args_cli.startup_reset_share = float(known.startup_share)
             print(f"[d6] startup resets: share {known.startup_share}, {len(BaseEnv.startup_reset_raw[0])} recorded reset "
                   f"states, {known.startup_resets} sha256 {go2_study.sha256(known.startup_resets)}", flush=True)
         if known.init_policy_checkpoint is not None:
