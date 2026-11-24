@@ -44,3 +44,21 @@ def test_gate_stops_on_a_changed_report(tmp_path, monkeypatch):
     rc = fig.main(["--windows", str(src / "c0_windows.npz"), "--report", str(bad), "--out", str(tmp_path / "x"),
                    "--n-boot", "300"])
     assert rc == 3 and not (tmp_path / "x").exists()
+
+
+def test_redraw_reuses_the_gate_passed_curves(tmp_path, monkeypatch):
+    src = c0_run(tmp_path, monkeypatch, n_boot=300)
+    res = fig.run(src / "c0_windows.npz", src / "c0_report.json", tmp_path / "figs", n_boot=300)
+    rc = fig.main(["--redraw-from", str(tmp_path / "figs"), "--out", str(tmp_path / "re")])
+    assert rc == 0
+    for name in ("fig_c0_disagreement.pdf", "fig_c0_disagreement.png", "fig_c0_healing.pdf", "fig_c0_healing.png"):
+        assert (tmp_path / "re" / name).stat().st_size > 0
+    meta = json.loads((tmp_path / "re" / "redraw.json").read_text())
+    assert meta["source_sha256"] == fig.sup.sha256(tmp_path / "figs" / "c0_figures.json")
+    assert json.loads((tmp_path / "figs" / "c0_figures.json").read_text())["curves"] == res["curves"]
+    bad = json.loads((tmp_path / "figs" / "c0_figures.json").read_text())
+    bad["gate"]["check"]["reproduced"] = False
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "c0_figures.json").write_text(json.dumps(bad))
+    assert fig.main(["--redraw-from", str(tmp_path / "bad"), "--out", str(tmp_path / "x")]) == 3
+    assert not (tmp_path / "x").exists()

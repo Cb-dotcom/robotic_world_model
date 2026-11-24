@@ -12,13 +12,18 @@ values. Otherwise the script stops and draws nothing.
 For every depth d = 0..25 (d = imagined states fed back; d = 25 is the simulator's terminal transition), pooled over
 sources, every window weight 1, as registered:
   geometric-mean disagreement with recorded context, exp(mean log u_ctx), and on the imagined path,
-  exp(mean over windows and driving heads of log u_imag), for falls and matched walking windows;
+  exp(mean over windows and driving heads of log u_imag), for falls and matched non-fall windows (not always
+  upright walking: doubt E20);
   H(d) = mean log u_ctx - mean log u_imag (= the registered -mean LR, up to float32 rounding);
 95 % bands from the same episode-cluster pair bootstrap as the registered rule (pair components, stratified by
 source, seed 0). The bands at d other than 25 are descriptive.
 
 Outputs: fig_c0_disagreement.{pdf,png} (Fig. 1), fig_c0_healing.{pdf,png} (Fig. 2), c0_curves.csv (the table view
 of both), c0_figures.json (the gate and the numbers drawn). IEEE single column (3.5 in), 8 pt.
+
+Redraw (--redraw-from DIR): draws the same figures again from DIR/c0_figures.json of a run whose gate passed, with no
+new statistic (s52: labels "matched non-fall" instead of "walking"). It refuses a JSON whose gate did not
+reproduce the registered numbers. It writes the figures and redraw.json (source file and its sha256).
 """
 from __future__ import annotations
 
@@ -123,8 +128,8 @@ def draw(rows, g, out):
     fig, ax = plt.subplots(figsize=(3.5, 2.3))
     _style(ax)
     series = [("fall", "u_ctx", FALL, "-", "falls, recorded context"), ("fall", "u_imag", FALL, "--", "falls, imagined"),
-              ("nonfall", "u_ctx", WALK, "-", "walking, recorded context"),
-              ("nonfall", "u_imag", WALK, "--", "walking, imagined")]
+              ("nonfall", "u_ctx", WALK, "-", "matched non-fall, recorded context"),
+              ("nonfall", "u_imag", WALK, "--", "matched non-fall, imagined")]
     for kind, key, color, ls, label in series:
         lo, hi = band(kind, key + "_ci")
         ax.fill_between(d, lo, hi, color=color, alpha=0.14, linewidth=0)
@@ -143,10 +148,10 @@ def draw(rows, g, out):
         fig.savefig(out / f"fig_c0_disagreement.{ext}", dpi=300)
     plt.close(fig)
 
-    # Fig. 2: healing deficit H(d), falls vs matched walking windows
+    # Fig. 2: healing deficit H(d), falls vs matched non-fall windows
     fig, ax = plt.subplots(figsize=(3.5, 2.2))
     _style(ax)
-    for kind, color, label in (("fall", FALL, "falls"), ("nonfall", WALK, "matched walking")):
+    for kind, color, label in (("fall", FALL, "falls"), ("nonfall", WALK, "matched non-fall")):
         lo, hi = band(kind, "H_ci")
         ax.fill_between(d, lo, hi, color=color, alpha=0.14, linewidth=0)
         ax.plot(d, get(kind, "H"), color=color, linewidth=1.4, label=label)
@@ -178,24 +183,48 @@ def run(windows, report, out, n_boot=10_000):
     return res
 
 
+def redraw(source_dir, out):
+    """Figures again from a gate-passed c0_figures.json; no statistic is recomputed."""
+    src = Path(source_dir) / "c0_figures.json"
+    res = json.loads(src.read_text())
+    g = res["gate"]
+    if not g["check"]["reproduced"]:
+        raise GateFailed(f"{src}: the source run did not reproduce the registered C0 numbers")
+    rows = res["curves"]
+    if [r["d"] for r in rows] != list(range(DEPTH_MAX + 1)):
+        raise GateFailed(f"{src}: curves must cover d = 0..{DEPTH_MAX}")
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=False)
+    draw(rows, g, out)
+    meta = dict(source=str(src), source_sha256=sup.sha256(src), analysis_sha256=sup.sha256(__file__),
+                note="redraw only: curves and gate copied from the source; labels per this script")
+    (out / "redraw.json").write_text(json.dumps(meta, indent=1))
+    return res
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--windows", type=Path, required=True)
-    p.add_argument("--report", type=Path, required=True)
+    p.add_argument("--windows", type=Path)
+    p.add_argument("--report", type=Path)
+    p.add_argument("--redraw-from", type=Path, help="a gate-passed output folder: redraw only")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--n-boot", type=int, default=10_000)
     a = p.parse_args(argv)
+    if (a.redraw_from is None) == (a.windows is None or a.report is None):
+        p.error("give --windows and --report, or --redraw-from")
     try:
-        res = run(a.windows, a.report, a.out, a.n_boot)
+        res = redraw(a.redraw_from, a.out) if a.redraw_from else run(a.windows, a.report, a.out, a.n_boot)
     except GateFailed as e:
         print(f"GATE: FAIL - {e}")
         return 3
     r25 = res["curves"][DEPTH_MAX]
-    print(f"GATE: PASS (registered C0 reproduced, max rel diff {res['gate']['check']['max_rel_diff']:.1e})")
+    how = "copied from the source run's c0_figures.json; " if a.redraw_from else ""
+    print(f"GATE: PASS ({how}registered C0 reproduced, max rel diff {res['gate']['check']['max_rel_diff']:.1e})")
     print(f"d25 falls: u_ctx {r25['fall']['u_ctx']:.2f}, u_imag {r25['fall']['u_imag']:.2f}, H {r25['fall']['H']:.3f}; "
-          f"walking: u_ctx {r25['nonfall']['u_ctx']:.2f}, u_imag {r25['nonfall']['u_imag']:.2f}, "
+          f"matched non-fall: u_ctx {r25['nonfall']['u_ctx']:.2f}, u_imag {r25['nonfall']['u_imag']:.2f}, "
           f"H {r25['nonfall']['H']:.3f}")
-    print(f"wrote {a.out}/fig_c0_disagreement.pdf, fig_c0_healing.pdf, c0_curves.csv, c0_figures.json")
+    extra = "redraw.json" if a.redraw_from else "c0_curves.csv, c0_figures.json"
+    print(f"wrote {a.out}/fig_c0_disagreement.pdf, fig_c0_healing.pdf, {extra}")
     return 0
 
 
