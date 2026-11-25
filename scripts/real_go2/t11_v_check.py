@@ -19,8 +19,9 @@ found in step 1 and are for orientation only.
 This script measures. It does not decide. Without --max-rel-err it prints no
 PASS/FAIL: the V-gate pass bar is Charbel's decision (CLAUDE.md rule 8).
 
-Runs are given as a CSV (header: bag,tape_start_m,tape_end_m[,note]) or with
-repeated --run BAG START_M END_M.
+Runs are given as a CSV (header: bag,tape_start_m,tape_end_m[,note,lat_start_m,lat_end_m])
+or with repeated --run BAG START_M END_M. lat_* = signed sideways offset (m, left +) of the
+reading point from the tape line; tape displacement = hypot(along, lat_end - lat_start).
 """
 from __future__ import annotations
 
@@ -72,10 +73,13 @@ def disp_xy(p0, p1) -> float:
     return float(np.hypot(*(np.asarray(p1)[:2] - np.asarray(p0)[:2])))
 
 
-def analyse_run(bag: str, tape_start: float, tape_end: float, args) -> dict:
-    out: dict = {"bag": str(bag), "tape_start_m": tape_start, "tape_end_m": tape_end}
-    tape = abs(tape_end - tape_start)
-    out["tape_m"] = tape
+def analyse_run(bag: str, tape_start: float, tape_end: float, args, lat_start: float = 0.0,
+                lat_end: float = 0.0) -> dict:
+    out: dict = {"bag": str(bag), "tape_start_m": tape_start, "tape_end_m": tape_end,
+                 "lat_start_m": lat_start, "lat_end_m": lat_end}
+    along, lateral = abs(tape_end - tape_start), lat_end - lat_start
+    tape = float(np.hypot(along, lateral))  # true straight-line displacement of the reading point
+    out.update(tape_along_m=along, tape_lateral_m=lateral, tape_m=tape)
     sp = go2_bag.read_topic(bag, SPORT, stride=args.stride)
     t = sp.t
     vel_b = sp.cols["velocity"]
@@ -133,7 +137,12 @@ def analyse_run(bag: str, tape_start: float, tape_end: float, args) -> dict:
     return out
 
 
-def load_runs(args) -> list[tuple[str, float, float, str]]:
+def _f(r, k):
+    v = (r.get(k) or "").strip()
+    return float(v) if v else 0.0
+
+
+def load_runs(args) -> list[tuple]:
     runs = []
     if args.runs_csv:
         base = Path(args.runs_csv).resolve().parent
@@ -141,9 +150,9 @@ def load_runs(args) -> list[tuple[str, float, float, str]]:
             for r in csv.DictReader(f):
                 b = Path(r["bag"])
                 runs.append((str(b if b.is_absolute() else base / b), float(r["tape_start_m"]),
-                             float(r["tape_end_m"]), r.get("note", "")))
+                             float(r["tape_end_m"]), r.get("note", ""), _f(r, "lat_start_m"), _f(r, "lat_end_m")))
     for b, a, z in args.run or []:
-        runs.append((b, float(a), float(z), ""))
+        runs.append((b, float(a), float(z), "", 0.0, 0.0))
     if not runs:
         raise SystemExit("give --runs-csv or at least one --run BAG START_M END_M")
     return runs
@@ -189,9 +198,9 @@ def main(argv=None) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rows = []
-    for bag, a, z, note in load_runs(args):
+    for bag, a, z, note, la, lz in load_runs(args):
         try:
-            r = analyse_run(bag, a, z, args)
+            r = analyse_run(bag, a, z, args, la, lz)
         except Exception as ex:  # one bad run must not hide the others
             r = {"bag": bag, "error": f"{type(ex).__name__}: {ex}"}
         r["note"] = note
@@ -204,7 +213,8 @@ def main(argv=None) -> int:
             continue
         src = "  ".join(f"{k}={v['ratio']:.3f}" for k, v in r["sources"].items())
         lines.append(
-            f"{Path(r['bag']).name}: tape {r['tape_m']:.3f} m in {r['walk_s']:.2f} s "
+            f"{Path(r['bag']).name}: tape {r['tape_m']:.3f} m (along {r['tape_along_m']:.3f}, "
+            f"lateral {r['tape_lateral_m']:+.3f}) in {r['walk_s']:.2f} s "
             f"({r['tape_speed_mps']:.3f} m/s), cmd vx {r.get('cmd_vx_median', float('nan')):.2f}, "
             f"est vx {r['mean_vx_body_mps']:.3f}, yaw drift {r['yaw_drift_deg']:+.1f} deg | ratio {src}"
         )

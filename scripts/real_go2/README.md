@@ -14,9 +14,9 @@ Tests (synthetic bags with known answers): `python -m pytest -q scripts/real_go2
 
 ## V test runs file
 
-`runs.csv` beside the bags, one line per walk, tape readings of the head front edge in metres:
+`runs.csv` beside the bags, one line per walk, readings at the front-centre of the head in metres (along the tape, and sideways from the tape line, left +; empty lateral = 0):
 ```
-bag,tape_start_m,tape_end_m,note
-w045_1,0.20,5.13,teleop 0.45
+bag,tape_start_m,tape_end_m,note,lat_start_m,lat_end_m
+w045_1,0.20,5.13,teleop 0.45,0.00,-0.08
 ```
 The robot must stand still at least 0.5 s before and after each walk (still-pose window).
