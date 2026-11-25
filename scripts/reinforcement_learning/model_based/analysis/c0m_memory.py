@@ -34,10 +34,9 @@ Readings (the rule text is a DRAFT until Charbel freezes it in A4 §3; --rule-re
               SURVIVES       H_src,fall / H_src,nonfall >= 1.5, ratio CI lower bound > 1, H_src,fall CI lower > 0;
               NOT SUPPORTED  ratio CI upper < 1.5, or H_src,fall CI upper <= 0;
               INCONCLUSIVE   every other case.
-            If the H_src,nonfall CI includes 0 the ratio has an unstable denominator: the flag is set and the
-            paired difference dH_src = H_src,fall - H_src,nonfall is reported with its CI. How the flag interacts
-            with SURVIVES is an open choice in the decision list (rule_variant "flag-forces-inconclusive" or
-            "as-written"); the reading names the variant it used.
+            Checked FIRST (Charbel, 25 Nov 2026 01:02, decision 5): if the H_src,nonfall CI includes 0 the ratio has
+            an unstable denominator and the verdict is INCONCLUSIVE, before any ratio rule is applied. The paired
+            difference dH_src = H_src,fall - H_src,nonfall is always reported with its CI.
   secondary d = 16; per source; absolute geometric-mean disagreement of each arm; the prediction error of each arm
             (normalized units, mean over dims; base velocity in m/s); the share of H in H_src.
 The registered C0 result and its files are read only; this script writes a fresh folder.
@@ -47,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 from types import SimpleNamespace
 
@@ -64,8 +64,8 @@ from pre_reset_transitions import sha256  # noqa: E402
 DEPTHS = (25, 16)
 PRIMARY_DEPTH = 25
 PARITY_RTOL = 1e-5
+DATED = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S")
 RATIO_BAR = 1.5
-RULE_VARIANTS = ("flag-forces-inconclusive", "as-written")
 
 
 class GateFailed(RuntimeError):
@@ -161,17 +161,15 @@ def decompose(logs, strata, clusters, n_boot=10_000, seed=0, depths=DEPTHS):
     return res
 
 
-def src_verdict(row, variant):
-    """The draft C0 rule on H_src (draft §1). `variant` decides whether an unstable denominator forces INCONCLUSIVE
-    (open choice, decision list)."""
-    if variant not in RULE_VARIANTS:
-        raise ValueError(f"rule variant must be one of {RULE_VARIANTS}")
+def src_verdict(row):
+    """The C0 rule on H_src (draft §1 with decision 5 of 25 Nov 2026): an unstable denominator (the H_src,nonfall CI
+    includes 0) gives INCONCLUSIVE before any ratio rule is read."""
+    if row["unstable_denominator"]:
+        return "INCONCLUSIVE"
     r, (rlo, rhi) = row["src_ratio"]["ratio"], row["src_ratio"]["ratio_ci"]
     flo, fhi = row["fall"]["H_src_ci"]
     if rhi < RATIO_BAR or fhi <= 0:
         return "NOT SUPPORTED"
-    if row["unstable_denominator"] and variant == "flag-forces-inconclusive":
-        return "INCONCLUSIVE"
     if r >= RATIO_BAR and rlo > 1 and flo > 0:
         return "SURVIVES"
     return "INCONCLUSIVE"
@@ -270,7 +268,7 @@ def _registered(report_path):
     return rep
 
 
-def run(windows, report, out, wm=None, trace_overrides=None, n_boot=10_000, seed=0, rule_variant=None, rule_record=None):
+def run(windows, report, out, wm=None, trace_overrides=None, n_boot=10_000, seed=0, rule_record=None):
     """windows / report: the registered c0_windows.npz and c0_report.json. wm: the model (default: the report's).
     trace_overrides: {source: path} when the traces moved (the sha256 must still match)."""
     out = Path(out)
@@ -352,9 +350,11 @@ def run(windows, report, out, wm=None, trace_overrides=None, n_boot=10_000, seed
                                     {k: clusters[k][sl] for k in clusters}, n_boot, seed)
         off += w
     reading = None
-    if rule_variant is not None:
-        reading = dict(endpoint=f"d{PRIMARY_DEPTH}", rule_variant=rule_variant, rule_record=rule_record,
-                       verdict=src_verdict(pooled[f"d{PRIMARY_DEPTH}"], rule_variant))
+    if rule_record is not None:
+        reading = dict(endpoint=f"d{PRIMARY_DEPTH}", rule_record=rule_record,
+                       verdict=src_verdict(pooled[f"d{PRIMARY_DEPTH}"]),
+                       paired_dH_src=pooled[f"d{PRIMARY_DEPTH}"]["difference"]["dH_src"],
+                       paired_dH_src_ci=pooled[f"d{PRIMARY_DEPTH}"]["difference"]["dH_src_ci"])
     payload = dict(protocol="C0-M (E29): memory schedule held fixed; draft rules 24 Nov 2026", gates=gates,
                    pooled=pooled, by_source=by_source, errors_by_depth=errors, reading=reading,
                    inputs=dict(windows=str(windows), windows_sha256=sha256(windows), report=str(report),
@@ -396,8 +396,8 @@ def text_report(p):
         lines.append(f"  paired dH_src {df['dH_src']:.3f} {_ci(df['dH_src_ci'])}; dH_mem {df['dH_mem']:.3f} "
                      f"{_ci(df['dH_mem_ci'])}; dH {df['dH']:.3f}")
     if p["reading"]:
-        lines.append(f"READING (d{PRIMARY_DEPTH}, rule variant {p['reading']['rule_variant']}, record "
-                     f"{p['reading']['rule_record']}): {p['reading']['verdict']}")
+        lines.append(f"READING (d{PRIMARY_DEPTH}, record {p['reading']['rule_record']}): {p['reading']['verdict']}; "
+                     f"paired dH_src {p['reading']['paired_dH_src']:.3f} {_ci(p['reading']['paired_dH_src_ci'])}")
     else:
         lines.append("READING: not made (no frozen rule record given); components only")
     return "\n".join(lines) + "\n"
@@ -416,14 +416,14 @@ def main(argv=None):
     p.add_argument("--trace", action="append", default=[], metavar="SOURCE=PATH", help="moved trace (hash-checked)")
     p.add_argument("--n-boot", type=int, default=10_000)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--rule-variant", choices=RULE_VARIANTS, default=None)
-    p.add_argument("--rule-record", default=None, help="the dated A4 §3 / decisions-log entry that froze the rule")
+    p.add_argument("--rule-record", default=None,
+                   help="the dated A4 §3 / decisions-log entry that froze the rule, e.g. '2026-11-25 01:02 CPU rules'")
     a = p.parse_args(argv)
-    if (a.rule_variant is None) != (a.rule_record is None):
-        p.error("--rule-variant and --rule-record go together (the reading needs the frozen record)")
+    if a.rule_record is not None and not DATED.match(a.rule_record):
+        p.error("--rule-record must start with the record's date and time: 'YYYY-MM-DD HH:MM ...'")
     over = dict(s.split("=", 1) for s in a.trace)
     try:
-        run(a.windows, a.report, a.out, a.wm, over, a.n_boot, a.seed, a.rule_variant, a.rule_record)
+        run(a.windows, a.report, a.out, a.wm, over, a.n_boot, a.seed, a.rule_record)
     except GateFailed as e:
         print(f"[c0m] STOP: {e}", flush=True)
         return 3

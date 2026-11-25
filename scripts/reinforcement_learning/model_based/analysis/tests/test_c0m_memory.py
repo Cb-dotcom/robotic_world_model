@@ -83,17 +83,19 @@ def _row(ratio, rci, fci, nci):
                 unstable_denominator=nci[0] <= 0 <= nci[1])
 
 
-def test_src_rule_readings_and_the_open_variant():
-    v = "flag-forces-inconclusive"
-    assert cm.src_verdict(_row(2.0, [1.2, 3.0], [.2, .5], [.05, .2]), v) == "SURVIVES"
-    assert cm.src_verdict(_row(1.2, [0.9, 1.4], [.2, .5], [.1, .3]), v) == "NOT SUPPORTED"
-    assert cm.src_verdict(_row(2.0, [1.2, 9.0], [-.1, 0.0], [.05, .2]), v) == "NOT SUPPORTED"
-    assert cm.src_verdict(_row(2.0, [0.8, 3.0], [.2, .5], [.05, .2]), v) == "INCONCLUSIVE"
-    unstable = _row(3.0, [1.3, 40.0], [.2, .5], [-.01, .2])
-    assert cm.src_verdict(unstable, "flag-forces-inconclusive") == "INCONCLUSIVE"
-    assert cm.src_verdict(unstable, "as-written") == "SURVIVES"
-    with pytest.raises(ValueError):
-        cm.src_verdict(unstable, "other")
+def test_src_rule_readings():
+    assert cm.src_verdict(_row(2.0, [1.2, 3.0], [.2, .5], [.05, .2])) == "SURVIVES"
+    assert cm.src_verdict(_row(1.2, [0.9, 1.4], [.2, .5], [.1, .3])) == "NOT SUPPORTED"
+    assert cm.src_verdict(_row(2.0, [1.2, 9.0], [-.1, 0.0], [.05, .2])) == "NOT SUPPORTED"
+    assert cm.src_verdict(_row(2.0, [0.8, 3.0], [.2, .5], [.05, .2])) == "INCONCLUSIVE"
+    assert cm.src_verdict(_row(3.0, [1.3, 40.0], [.2, .5], [-.01, .2])) == "INCONCLUSIVE"
+
+
+def test_zero_crossing_denominator_is_inconclusive_before_any_ratio_rule():
+    """Regression (decision 5, 25 Nov 2026): s53 returned NOT SUPPORTED here because it read the ratio bar first.
+    A non-fall H_src interval that includes 0 makes the ratio unusable, whatever the ratio interval says."""
+    assert cm.src_verdict(_row(1.0, [-5.0, 1.2], [.2, .5], [-.1, .3])) == "INCONCLUSIVE"     # ratio CI < 1.5
+    assert cm.src_verdict(_row(-2.0, [-9.0, 9.0], [-.3, -.1], [-.2, .1])) == "INCONCLUSIVE"   # fall CI <= 0 too
 
 
 def test_end_to_end_on_registered_style_windows(tmp_path, monkeypatch):
@@ -139,13 +141,13 @@ def test_gates_stop_before_any_reading(tmp_path, monkeypatch):
         cm.run(out / "c0_windows.npz", out / "c0_report.json", tmp_path / "g3", n_boot=300)
 
 
-def test_cli_requires_the_frozen_record_for_a_reading(tmp_path, monkeypatch):
+def test_cli_requires_a_dated_record_for_a_reading(tmp_path, monkeypatch):
     out = c0_run(tmp_path, monkeypatch, n_boot=300)
     with pytest.raises(SystemExit):
         cm.main(["--windows", str(out / "c0_windows.npz"), "--report", str(out / "c0_report.json"),
-                 "--out", str(tmp_path / "x"), "--rule-variant", "as-written"])
+                 "--out", str(tmp_path / "x"), "--rule-record", "frozen somewhere"])
     assert cm.main(["--windows", str(out / "c0_windows.npz"), "--report", str(out / "c0_report.json"),
-                    "--out", str(tmp_path / "y"), "--n-boot", "300", "--rule-variant", "as-written",
-                    "--rule-record", "test"]) == 0
+                    "--out", str(tmp_path / "y"), "--n-boot", "300", "--rule-record", "2026-11-25 01:02 CPU rules"]) == 0
     p = json.loads((tmp_path / "y" / "c0m.json").read_text())
     assert p["reading"]["verdict"] in ("SURVIVES", "NOT SUPPORTED", "INCONCLUSIVE")
+    assert len(p["reading"]["paired_dH_src_ci"]) == 2

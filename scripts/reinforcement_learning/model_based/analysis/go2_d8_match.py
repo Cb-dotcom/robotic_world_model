@@ -9,6 +9,7 @@ Reads both lanes' run_args.json (run_provenance.write_run_args) and checks:
            (top level and in args), the world-model identity (world_model_checkpoint.*, args.wm_checkpoint,
            resolved_config.model_architecture_config.resume_path); start_state_files hashes are compared too
   models   F8's world-model sha256 = D6b's; U8's = the updated model's; the two differ
+  runtime  both lanes ran the launch's rsl_rl_rwm revision (runtime.rsl_rl.git.commit), clean
 Exit 0 and "MATCH: True" only if every check passes. Pure Python, CPU.
 """
 from __future__ import annotations
@@ -62,6 +63,10 @@ def check(f8, u8, expect):
             same = (v is not None and abs(float(v) - float(want)) <= 1e-12) if isinstance(want, float) else v == want
             if not same:
                 problems.append(f"{name}: {k} = {v!r}, expected {want!r}")
+        rg = ((r.get("runtime") or {}).get("rsl_rl") or {}).get("git") or {}
+        if "rsl_rl_commit" in expect and (rg.get("commit") != expect["rsl_rl_commit"] or rg.get("dirty") is not False):
+            problems.append(f"{name}: rsl_rl_rwm {rg.get('commit')} (dirty {rg.get('dirty')}) != launch revision "
+                            f"{expect['rsl_rl_commit']}")
     a, b = flatten(f8), flatten(u8)
     diff = sorted(k for k in set(a) | set(b) if not allowed(k) and a.get(k, "<absent>") != b.get(k, "<absent>"))
     if diff:

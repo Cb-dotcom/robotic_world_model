@@ -40,6 +40,7 @@ import csv
 import json
 import math
 from pathlib import Path
+import re
 import sys
 
 import numpy as np
@@ -247,6 +248,8 @@ def main(argv=None):
     a = pa.parse_args(argv)
     if (a.rules is None) != (a.rule_record is None):
         pa.error("--rules and --rule-record go together")
+    if a.rule_record is not None and not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S", a.rule_record):
+        pa.error("--rule-record must start with 'YYYY-MM-DD HH:MM'")
     try:
         p = score(a.new, a.ref, a.friction, a.cmd, a.envs, a.steps)
     except CellInvalid as e:

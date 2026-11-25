@@ -30,6 +30,17 @@ def repo(tmp_path):
         paths[name] = str(p)
     (root / "logs" / "d7eval").mkdir()
     paths["d7_eval"] = str(root / "logs" / "d7eval")
+    rsl = tmp_path / "rsl_rl_rwm"                       # the sibling checkout training imports
+    (rsl / "rsl_rl").mkdir(parents=True)
+    (rsl / "rsl_rl" / "__init__.py").write_text("\n")
+    for c in (["init", "-q"], ["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
+              ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rsl"]):
+        subprocess.run(["git", *c], cwd=rsl, check=True)
+    log = tmp_path / "decisions-log.ai.md"
+    log.write_text("| Date | Decision | Why | Who | Source |\n|---|---|---|---|---|\n"
+                   "| 2026-11-25 decision | **D8 rules 1-7** (Charbel, 01:02 Rome) | x | Charbel | chat |\n"
+                   "| 2026-11-26 decision | **D8 launch approved** (Charbel, 10:15 Rome): preflight green | x | Charbel | chat |\n")
+    paths["_log"] = str(log)
     return root, paths
 
 
@@ -38,8 +49,15 @@ def no_prefixes(monkeypatch):
     monkeypatch.setattr(L, "INPUTS", {k: (None, None) for k in L.INPUTS})
 
 
-def init(root, paths, approval="decisions-log 2026-11-26 D8", **kw):
-    return L.Launch.init(root / "d8", approval, paths, kw.pop("q_rule", "recompute"), kw.pop("eval_30", False),
+APPROVAL = lambda paths: dict(log=paths["_log"], date="2026-11-26", time="10:15")
+RULES = dict(rules="proposed-2026-11-25", rule_record="2026-11-25 01:02 D8 rules 1-7")
+
+
+def init(root, paths, approval="default", **kw):
+    approval = APPROVAL(paths) if approval == "default" else approval
+    if approval is not None:
+        kw = dict(RULES, **kw)
+    return L.Launch.init(root / "d8", approval, paths, kw.pop("q_rule", "d6b"), kw.pop("eval_30", False),
                          root=root, **kw)
 
 
@@ -47,23 +65,60 @@ def test_init_records_head_and_refuses_unsafe_starts(tmp_path, no_prefixes, monk
     root, paths = repo(tmp_path)
     man = init(root, paths)
     assert man["head"] == L.git("rev-parse", "HEAD", cwd=root) and man["gpu_allowed"]
+    assert "D8 launch approved" in man["approval"]["row"] and man["rsl_rl_rwm"]["head"]
     assert (root / "d8" / "inputs.sha256").read_text().count("\n") == len(L.CODE)
     with pytest.raises(L.StageError, match="fresh folder"):
         init(root, paths)
     (root / L.CODE[0]).write_text("changed\n")                               # a tracked change
     with pytest.raises(L.StageError, match="not clean"):
-        L.Launch.init(root / "d8b", "x", paths, "d6b", False, root=root)
+        L.Launch.init(root / "d8b", None, paths, "d6b", False, root=root)
     subprocess.run(["git", "checkout", "-q", "--", L.CODE[0]], cwd=root, check=True)
     (root / "scripts" / "stray.py").write_text("x\n")                         # an untracked code file
     with pytest.raises(L.StageError, match="not clean"):
-        L.Launch.init(root / "d8c", "x", paths, "d6b", False, root=root)
+        L.Launch.init(root / "d8c", None, paths, "d6b", False, root=root)
     (root / "scripts" / "stray.py").unlink()
     (root / "logs" / "offline" / "go2_flat" / "2026-12-01_10-00-00_4004").mkdir(parents=True)
     with pytest.raises(L.StageError, match="run IDs already used"):
-        L.Launch.init(root / "d8d", "x", paths, "d6b", False, root=root)
+        L.Launch.init(root / "d8d", None, paths, "d6b", False, root=root)
     monkeypatch.setattr(L, "INPUTS", dict(L.INPUTS, d2_norm=(None, "a3a5c954")))
     with pytest.raises(L.StageError, match="does not start with a3a5c954"):
-        L.Launch.init(root / "d8e", "x", paths, "d6b", False, root=root)
+        L.Launch.init(root / "d8e", None, paths, "d6b", False, root=root)
+
+
+def test_approval_must_be_a_dated_row_and_rules_frozen(tmp_path, no_prefixes):
+    root, paths = repo(tmp_path)
+    with pytest.raises(L.StageError, match="expected one row"):
+        L.Launch.init(root / "a", dict(log=paths["_log"], date="2026-11-26", time="10:16"), paths, "d6b", False,
+                      root=root, **RULES)
+    with pytest.raises(L.StageError, match="YYYY-MM-DD"):
+        L.Launch.init(root / "b", dict(log=paths["_log"], date="26 Nov", time="10:15"), paths, "d6b", False, root=root, **RULES)
+    with pytest.raises(L.StageError, match="frozen readout"):
+        L.Launch.init(root / "c", APPROVAL(paths), paths, "d6b", False, root=root)
+    # the row is re-checked before each GPU stage
+    init(root, paths)
+    launch, calls = L.Launch(root / "d8", root=root), []
+    Path(paths["_log"]).write_text(Path(paths["_log"]).read_text().replace("D8 launch approved", "D8 launch held"))
+    with pytest.raises(L.StageError, match="expected one row"):
+        launch.run(stages=fake_stages(calls))
+    assert calls == ["preflight"]
+
+
+def test_inputs_and_rsl_revision_are_checked_when_consumed(tmp_path, no_prefixes):
+    root, paths = repo(tmp_path)
+    init(root, paths)
+    launch, calls = L.Launch(root / "d8", root=root), []
+    assert launch.run(stages=fake_stages(calls), until="preflight") == "stopped"
+    Path(paths["d6b_model"]).write_bytes(b"another model")
+    with pytest.raises(L.StageError, match="input d6b_model changed"):
+        launch.run(stages=fake_stages(calls))
+    Path(paths["d6b_model"]).write_bytes(b"d6b_model")
+    rsl = tmp_path / "rsl_rl_rwm"
+    (rsl / "rsl_rl" / "__init__.py").write_text("# edited\n")
+    with pytest.raises(L.StageError, match="rsl_rl_rwm has tracked changes"):
+        launch.run(stages=fake_stages(calls))
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "x"], cwd=rsl, check=True)
+    with pytest.raises(L.StageError, match="rsl_rl_rwm HEAD changed"):
+        launch.run(stages=fake_stages(calls))
 
 
 def fake_stages(calls, fail=None, gate=None):
@@ -113,7 +168,7 @@ def test_gate_result_ends_the_run_and_is_not_retried(tmp_path, no_prefixes):
 
 def test_gpu_stages_need_an_approval_record(tmp_path, no_prefixes):
     root, paths = repo(tmp_path)
-    init(root, paths, approval="none")
+    init(root, paths, approval=None)
     calls = []
     assert L.Launch(root / "d8", root=root).run(stages=fake_stages(calls)) == "needs_approval:record"
     assert calls == ["preflight"]
@@ -183,7 +238,7 @@ def test_qualify_gates_on_q1_q3_only(tmp_path, no_prefixes):
 
 def test_commands_follow_the_draft(tmp_path, no_prefixes):
     root, paths = repo(tmp_path)
-    init(root, paths, eval_30=True, rules="proposed-2026-11-25", rule_record="decisions-log 2026-11-26")
+    init(root, paths, eval_30=True)
     c = L.Launch(root / "d8", root=root).commands()
     j = lambda cmd: " ".join(cmd)
     probe, batch = c["record"]
@@ -204,7 +259,8 @@ def test_commands_follow_the_draft(tmp_path, no_prefixes):
     assert sum("cmd10" in x for x in ev) == 4 and sum("cmd30" in x for x in ev) == 8     # F8, U8 at 10 s; all four at 30 s
     assert all("--num_envs 32 --num_steps 10000" in x for x in ev)
     assert "--rules proposed-2026-11-25" in j(c["score"][0]) and "--also-cmd 30" in j(c["score"][0])
-    assert "--q-rule recompute" in j(c["prepare"][0])
+    assert "--q-rule d6b" in j(c["prepare"][0])
+    assert "--rule-record 2026-11-25 01:02 D8 rules 1-7" in j(c["score"][0])
 
 
 def test_fit_provenance_is_read_from_the_checkpoint(tmp_path):
@@ -216,3 +272,32 @@ def test_fit_provenance_is_read_from_the_checkpoint(tmp_path):
                                               seed=2, startup_windows_positive=True)
     torch.save(dict(iter=500, normalized=True, provenance=dict(init_mode="scratch", seed=2)), p)
     assert L.Launch.fit_provenance(p)["init_mode"] == "scratch" and L.Launch.fit_provenance(p)["b3_reset_per_head"] is None
+
+
+def test_realized_share_is_checked_in_each_training_log(tmp_path, no_prefixes):
+    root, paths = repo(tmp_path)
+    init(root, paths)
+    out = root / "d8"
+    (out / "prepare" / "data").mkdir(parents=True)
+    (out / "prepare" / "data" / "manifest.json").write_text(json.dumps(dict(startup_reset_share=0.12)))
+    (out / "train").mkdir()
+
+    def runner(share):
+        def run(cmd, log, gpu):
+            run_n = cmd[cmd.index("paper_warm") + 1]
+            d = root / "logs" / "offline" / "go2_flat" / f"2026-12-01_00-00-00_{run_n}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "policy_4598.pt").write_bytes(b"p")
+            lines = ["[go2] reward contract s2: 16 terms", "[d6] startup resets: share 0.12, 10 states", "warm_start_resets= True"]
+            for i in range(4299, 4599):
+                lines += [f"Learning iteration {i}/4599", f"Mean episode startup_reset_fraction: {share}"]
+            lines.append(f"Training completed. Policy saved to logs/offline/go2_flat/{d.name}.")
+            Path(log).write_text("\n".join(lines) + "\n")
+            return 0
+        return run
+    good = L.Launch(out, root=root, runner=runner(0.13), gpu_free_mb=lambda: 10 ** 6)
+    outs, note = good.stage_train()
+    assert json.loads((out / "train" / "U8.json").read_text())["realized_startup_share"] == pytest.approx(0.13)
+    bad = L.Launch(out, root=root, runner=runner(0.30), gpu_free_mb=lambda: 10 ** 6)
+    with pytest.raises(L.StageError, match="realized startup-reset share"):
+        bad.stage_train()

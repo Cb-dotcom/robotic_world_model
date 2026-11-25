@@ -2,10 +2,14 @@
 """A4 D8 staged launcher (draft 24 Nov 2026; nothing runs on the GPU without a dated approval record).
 
 Run from the robotic_world_model root inside the container. Subcommands:
-  init   OUT --approval TEXT|none ...   fresh OUT; checks the clean tree, records HEAD, the code hashes (inputs.sha256),
-                                        every input file's sha256 against the expected prefix, that runs 4003 and 4004
-                                        are free, and the launch settings (launch_manifest.json). With --approval none
-                                        only CPU stages can run.
+  init   OUT --approval-log LOG --approval-date D --approval-time T ...   (or --approval-log none)
+                                        fresh OUT; checks the clean tree of this repo AND of ../rsl_rl_rwm, records both
+                                        HEADs, the code hashes (inputs.sha256), every input's sha256 against the
+                                        expected prefix, that runs 4003 and 4004 are free, and the launch settings.
+                                        GPU stages need the dated approval row: LOG is a copy of the vault's
+                                        decisions-log.ai.md; it must hold a row "| D decision | ... D8 launch approved
+                                        ... (Charbel, T Rome) ..."; the row and the file's sha256 are recorded and the
+                                        row is re-checked before every GPU stage. A plain text flag is not accepted.
   plan   OUT                            prints every stage's exact commands (nothing runs)
   run    OUT [--until STAGE] [--retry STAGE]
                                         runs the stages in order, one at a time (GPU stages strictly sequential)
@@ -29,7 +33,11 @@ Stages (CPU / GPU):
 Outcomes per stage: done | gate_failed (a valid failed gate: the run ends, logs kept, no retry) | error (an
 implementation or infrastructure failure: logs kept; `run --retry STAGE` moves the stage folder to STAGE.attemptN and
 reruns it). /isaac-sim/python.sh turns any non-zero exit into 1 (bug 15q), so outcomes are read from output files.
-Before every stage: HEAD = the launch HEAD, no tracked change, code hashes = inputs.sha256.
+Before every stage: HEAD = the launch HEAD, no tracked change, code hashes = inputs.sha256, rsl_rl_rwm HEAD = the
+launch revision and clean, every input file's sha256 = the manifest's (hashes are checked when consumed). The score
+stage also re-hashes the saved D7 / s2 cells against the preflight record.
+Decisions of 25 Nov 2026 01:02 (Charbel; A4 §3): q = D6b's value exactly (q rule "d6b"), 10 s commands only, the
+proposed-2026-11-25 readout rules; the realized startup-reset share is checked in BOTH training logs.
 """
 from __future__ import annotations
 
@@ -79,7 +87,23 @@ INPUTS = {
 }
 SETTINGS = dict(friction=0.30, probe_seed=916, probe_steps=2000, batch_seed=104, batch_steps=5000, envs_record=64,
                 fit_seed=2, fit_iterations=500, fit_lr=1e-4, ppo_iterations=300, ppo_seed=1000, runs=dict(F8=4003, U8=4004),
-                eval_seeds=[42, 43], eval_envs=32, eval_steps=10000, penalty_weight=-1.0, d7_falls_10s=306, s2_falls_10s=219)
+                eval_seeds=[42, 43], eval_envs=32, eval_steps=10000, penalty_weight=-1.0, d7_falls_10s=306, s2_falls_10s=219,
+                startup_share_tolerance=0.05)
+RULES = "proposed-2026-11-25"
+DATED = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S")
+
+
+def approval_row(log, date, time_):
+    """The decisions-log row that approves the D8 launch: first cell '<date> decision', the text 'D8 launch approved'
+    and '(Charbel, <time> Rome'. Returns the row; raises StageError otherwise."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date or "") or not re.fullmatch(r"\d{2}:\d{2}", time_ or ""):
+        raise StageError("approval date / time must be YYYY-MM-DD and HH:MM")
+    rows = [l for l in Path(log).read_text().splitlines()
+            if l.startswith(f"| {date} decision |") and "D8 launch approved" in l and f"(Charbel, {time_} Rome" in l]
+    if len(rows) != 1:
+        raise StageError(f"{log}: expected one row '| {date} decision | ... D8 launch approved ... (Charbel, {time_} "
+                         f"Rome ...', found {len(rows)}")
+    return rows[0]
 
 
 class StageGate(Exception):
@@ -115,6 +139,18 @@ def tree_state(root="."):
     return head, tracked, untracked
 
 
+def rsl_state(rsl_root):
+    """HEAD of the rsl_rl_rwm checkout that training imports; it must be a clean git checkout."""
+    rsl_root = Path(rsl_root)
+    if not (rsl_root / "rsl_rl").is_dir():
+        raise StageError(f"rsl_rl_rwm not found at {rsl_root}")
+    head = git("rev-parse", "HEAD", cwd=rsl_root)
+    dirty = [l for l in git("status", "--porcelain", "--untracked-files=no", cwd=rsl_root).splitlines() if l.strip()]
+    if dirty:
+        raise StageError(f"rsl_rl_rwm has tracked changes: {dirty[:3]}")
+    return head
+
+
 class Launch:
     def __init__(self, out, root=".", runner=None, gpu_free_mb=None, sleep=time.sleep):
         self.out, self.root = Path(out), Path(root)
@@ -125,15 +161,25 @@ class Launch:
 
     # ------------------------------------------------------------ init
     @staticmethod
-    def init(out, approval, paths, q_rule, eval_30, rules=None, rule_record=None, root="."):
+    def init(out, approval, paths, q_rule, eval_30, rules=None, rule_record=None, root=".", rsl_root=None):
+        """approval: None (CPU stages only) or dict(log=path, date=YYYY-MM-DD, time=HH:MM)."""
         out, root = Path(out), Path(root)
+        rsl_root = Path(rsl_root) if rsl_root else (root / ".." / "rsl_rl_rwm")
         if out.exists():
             raise StageError(f"{out} exists: a D8 launch always starts in a fresh folder")
         head, tracked, untracked = tree_state(root)
         if tracked or untracked:
             raise StageError(f"the tree is not clean (tracked {tracked[:3]}, untracked code {untracked[:3]})")
+        rsl = rsl_state(rsl_root)
         if q_rule not in ("d6b", "recompute"):
             raise StageError("--q-rule must be d6b or recompute (fixed before recording)")
+        approved = None
+        if approval is not None:
+            row = approval_row(approval["log"], approval["date"], approval["time"])
+            approved = dict(log=str(approval["log"]), log_sha256=sha256(approval["log"]), row=row,
+                            date=approval["date"], time=approval["time"])
+            if rules != RULES or not (rule_record and DATED.match(rule_record)):
+                raise StageError(f"a GPU launch needs the frozen readout: --rules {RULES} and a dated --rule-record")
         inputs = {}
         for name, (default, prefix) in INPUTS.items():
             p = Path(paths.get(name) or default or "")
@@ -157,8 +203,9 @@ class Launch:
         out.mkdir(parents=True)
         (out / "status").mkdir()
         (out / "inputs.sha256").write_text("".join(f"{v}  {k}\n" for k, v in code.items()))
-        man = dict(protocol="A4 D8 launch (draft 24 Nov 2026)", created_utc=now(), head=head, approval=approval,
-                   gpu_allowed=approval not in (None, "", "none"), inputs=inputs, d7_eval=str(refs), code_sha256=code,
+        man = dict(protocol="A4 D8 launch (rules of 25 Nov 2026 01:02)", created_utc=now(), head=head, approval=approved,
+                   gpu_allowed=approved is not None, rsl_rl_rwm=dict(path=str(rsl_root.resolve()), head=rsl),
+                   inputs=inputs, d7_eval=str(refs), code_sha256=code,
                    settings=dict(SETTINGS, q_rule=q_rule, eval_30=bool(eval_30), rules=rules, rule_record=rule_record))
         (out / "launch_manifest.json").write_text(json.dumps(man, indent=1))
         return man
@@ -173,6 +220,18 @@ class Launch:
         for rel, digest in self.manifest["code_sha256"].items():
             if sha256(self.root / rel) != digest:
                 raise StageError(f"code file changed since launch: {rel}")
+        if rsl_state(self.manifest["rsl_rl_rwm"]["path"]) != self.manifest["rsl_rl_rwm"]["head"]:
+            raise StageError("rsl_rl_rwm HEAD changed since launch")
+        for name, rec in self.manifest["inputs"].items():
+            if sha256(rec["path"]) != rec["sha256"]:
+                raise StageError(f"input {name} changed since launch: {rec['path']}")
+
+    def check_approval(self):
+        a = self.manifest["approval"]
+        if a is None:
+            raise StageError("no approval record")
+        if approval_row(a["log"], a["date"], a["time"]) != a["row"]:
+            raise StageError("the approval row changed since launch")
 
     def status_path(self, stage):
         return self.out / "status" / f"{stage}.json"
@@ -223,6 +282,8 @@ class Launch:
             if kinds[name] == "gpu" and not self.manifest["gpu_allowed"]:
                 return f"needs_approval:{name}"
             self.guard()
+            if kinds[name] == "gpu":
+                self.check_approval()
             (self.out / name).mkdir(exist_ok=True)
             t0 = time.time()
             self._write_status(name, dict(stage=name, state="running", started_utc=now(), head=self.manifest["head"]))
@@ -502,12 +563,19 @@ class Launch:
                         r"warm_start_resets= True"):
                 if not re.search(pat, text):
                     raise StageError(f"{arm}: train log lacks '{pat}'")
+            frac = [float(x) for x in re.findall(r"Mean episode startup_reset_fraction:\s*([-+0-9.eE]+)", text)]
+            mean = sum(frac) / len(frac) if frac else float("nan")
+            tol = self.S("startup_share_tolerance")
+            if len(frac) < self.S("ppo_iterations") / 2 or not abs(mean - q) <= tol:
+                raise StageError(f"{arm}: realized startup-reset share {mean:.4f} over {len(frac)} logged iterations is "
+                                 f"not within {tol} of q = {q}")
             run_dir = self.root / done[0]
             pol = run_dir / f"policy_{its[-1]}.pt"
             if not pol.is_file():
                 raise StageError(f"{arm}: final policy {pol} missing")
-            (self.out / "train" / f"{arm}.json").write_text(json.dumps(dict(run_dir=str(run_dir), policy=str(pol),
-                                                                              policy_sha256=sha256(pol)), indent=1))
+            (self.out / "train" / f"{arm}.json").write_text(json.dumps(dict(
+                run_dir=str(run_dir), policy=str(pol), policy_sha256=sha256(pol), realized_startup_share=mean,
+                logged_iterations=len(frac), q=q), indent=1))
             outs += [self.out / "train" / f"{arm}.json", log]
         return outs, "F8 then U8 trained"
 
@@ -519,7 +587,7 @@ class Launch:
                       startup_resets_sha256=sha256(self.out / "prepare" / "data" / "reset_states.npz"),
                       startup_reset_share=self._q(), max_iterations=self.S("ppo_iterations"),
                       penalty_weight=self.S("penalty_weight"), wm_f8_sha256=self.manifest["inputs"]["d6b_model"]["sha256"],
-                      wm_u8_sha256=sha256(wms))
+                      wm_u8_sha256=sha256(wms), rsl_rl_commit=self.manifest["rsl_rl_rwm"]["head"])
         (self.out / "match" / "expect.json").write_text(json.dumps(expect, indent=1))
         cmd = [x.replace("{F8_run_args}", str(Path(tr["F8"]["run_dir"]) / "run_args.json"))
                 .replace("{U8_run_args}", str(Path(tr["U8"]["run_dir"]) / "run_args.json")) for x in self.commands()["match"][0]]
@@ -546,6 +614,13 @@ class Launch:
         return outs, f"{len(outs) // 2} cells"
 
     def stage_score(self):
+        refs = json.loads((self.out / "preflight" / "references.json").read_text())
+        for t, pol in refs["schedules"]["10"]["policies"].items():
+            for row in pol["per_seed"]:
+                cell = Path(self.manifest["d7_eval"]) / f"{t}_cmd10_s{row['seed']}"
+                if sha256(cell / "episodes_summary.json") != row["episodes_summary_sha256"] or \
+                        sha256(cell / "episodes.csv") != row["episodes_csv_sha256"]:
+                    raise StageError(f"saved reference cell changed since preflight: {cell}")
         self.call("score", "score", self.commands()["score"][0])
         p = self.out / "score" / "d8_score.json"
         if not p.is_file():
@@ -558,8 +633,12 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     i = sub.add_parser("init")
     i.add_argument("out", type=Path)
-    i.add_argument("--approval", required=True, help="the dated decisions-log entry approving the GPU stages, or 'none'")
-    i.add_argument("--q-rule", required=True, choices=("d6b", "recompute"))
+    i.add_argument("--approval-log", required=True,
+                   help="copy of the vault's decisions-log.ai.md holding the dated 'D8 launch approved' row, or 'none'")
+    i.add_argument("--approval-date", default=None, help="YYYY-MM-DD of that row")
+    i.add_argument("--approval-time", default=None, help="HH:MM (Rome) of that row")
+    i.add_argument("--rsl-root", default=None, help="the rsl_rl_rwm checkout (default ../rsl_rl_rwm)")
+    i.add_argument("--q-rule", default="d6b", choices=("d6b", "recompute"), help="decision 3 (25 Nov): d6b")
     i.add_argument("--eval-30", action="store_true", help="also evaluate all four policies at 30 s commands")
     i.add_argument("--rules", default=None)
     i.add_argument("--rule-record", default=None)
@@ -577,7 +656,8 @@ def main(argv=None):
             if (a.rules is None) != (a.rule_record is None):
                 p.error("--rules and --rule-record go together")
             paths = {k: getattr(a, k) for k in list(INPUTS) + ["d7_eval"]}
-            man = Launch.init(a.out, a.approval, paths, a.q_rule, a.eval_30, a.rules, a.rule_record)
+            appr = None if a.approval_log == "none" else dict(log=a.approval_log, date=a.approval_date, time=a.approval_time)
+            man = Launch.init(a.out, appr, paths, a.q_rule, a.eval_30, a.rules, a.rule_record, rsl_root=a.rsl_root)
             print(f"[d8] launch folder {a.out}; HEAD {man['head']}; GPU stages {'allowed' if man['gpu_allowed'] else 'NOT allowed (no approval)'}")
             return 0
         L = Launch(a.out)

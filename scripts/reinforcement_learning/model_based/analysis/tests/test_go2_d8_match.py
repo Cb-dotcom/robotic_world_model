@@ -23,12 +23,13 @@ def lane(wm_sha, run):
                                 "environment_config": {"uncertainty_penalty_weight": -1.0},
                                 "data_config": {"dataset_root": "/d8/start"}},
             "start_state_files": [{"path": "/d8/start/state_action_data_0.csv", "sha256": "s" * 64}],
-            "runtime": {"gpu": "RTX 6000 Ada", "torch": "2.7.0"}}
+            "runtime": {"gpu": "RTX 6000 Ada", "torch": "2.7.0",
+                        "rsl_rl": {"path": "/w/rsl_rl_rwm/rsl_rl", "git": {"commit": "c" * 40, "dirty": False}}}}
 
 
 EXPECT = dict(head=HEAD, seed=1000, task="go2_flat", mode="paper_warm", init_policy_sha256="p" * 64,
               startup_resets_sha256="r" * 64, startup_reset_share=0.12, max_iterations=300, penalty_weight=-1.0,
-              wm_f8_sha256="f" * 64, wm_u8_sha256="u" * 64)
+              wm_f8_sha256="f" * 64, wm_u8_sha256="u" * 64, rsl_rl_commit="c" * 40)
 
 
 def test_matched_lanes_pass():
@@ -45,6 +46,7 @@ def test_each_difference_is_caught():
     x = copy.deepcopy(u); x["resolved_config"]["policy_training_config"]["max_iterations"] = 299; cases.append((x, "max_iterations"))
     x = copy.deepcopy(u); x["world_model_checkpoint"]["sha256"] = "f" * 64; cases.append((x, "same world model"))
     x = copy.deepcopy(u); x["runtime"]["gpu"] = "other"; cases.append((x, "outside the world model"))
+    x = copy.deepcopy(u); x["runtime"]["rsl_rl"]["git"]["dirty"] = True; cases.append((x, "launch revision"))
     for bad, text in cases:
         probs = m.check(f, bad, EXPECT)
         assert any(text in p for p in probs), (text, probs)
