@@ -19,9 +19,11 @@ found in step 1 and are for orientation only.
 This script measures. It does not decide. Without --max-rel-err it prints no
 PASS/FAIL: the V-gate pass bar is Charbel's decision (CLAUDE.md rule 8).
 
-Runs are given as a CSV (header: bag,tape_start_m,tape_end_m[,note,lat_start_m,lat_end_m])
+Runs are given as a CSV (header: bag,tape_start_m,tape_end_m[,note,lat_start_m,lat_end_m,leg])
 or with repeated --run BAG START_M END_M. lat_* = signed sideways offset (m, left +) of the
 reading point from the tape line; tape displacement = hypot(along, lat_end - lat_start).
+leg = which walk in the bag (1 = first, 2 = second, ...; empty = the longest walk). Use it
+for out-and-back bags: one CSV row per leg, the robot still >= 1 s between legs.
 """
 from __future__ import annotations
 
@@ -48,7 +50,10 @@ def _segments(mask: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
 
 
-def find_walk(t: np.ndarray, speed: np.ndarray, move_thresh: float, merge_s: float) -> tuple[int, int]:
+def find_walk(t: np.ndarray, speed: np.ndarray, move_thresh: float, merge_s: float,
+              leg: int = 0, min_walk_s: float = 1.5) -> tuple[int, int]:
+    """leg = 0: the longest walk. leg = k >= 1: the k-th walk in time order
+    (walks shorter than min_walk_s are ignored; a stop longer than merge_s splits walks)."""
     segs = _segments(speed > move_thresh)
     if not segs:
         raise ValueError(f"no motion above {move_thresh} m/s")
@@ -58,7 +63,13 @@ def find_walk(t: np.ndarray, speed: np.ndarray, move_thresh: float, merge_s: flo
             merged[-1][1] = e
         else:
             merged.append([s, e])
-    s, e = max(merged, key=lambda se: t[se[1] - 1] - t[se[0]])
+    if leg <= 0:
+        s, e = max(merged, key=lambda se: t[se[1] - 1] - t[se[0]])
+        return int(s), int(e)
+    walks = [se for se in merged if t[se[1] - 1] - t[se[0]] >= min_walk_s]
+    if leg > len(walks):
+        raise ValueError(f"leg {leg} asked, bag has {len(walks)} walks of >= {min_walk_s} s")
+    s, e = walks[leg - 1]
     return int(s), int(e)
 
 
@@ -74,8 +85,8 @@ def disp_xy(p0, p1) -> float:
 
 
 def analyse_run(bag: str, tape_start: float, tape_end: float, args, lat_start: float = 0.0,
-                lat_end: float = 0.0) -> dict:
-    out: dict = {"bag": str(bag), "tape_start_m": tape_start, "tape_end_m": tape_end,
+                lat_end: float = 0.0, leg: int = 0) -> dict:
+    out: dict = {"bag": str(bag), "leg": leg, "tape_start_m": tape_start, "tape_end_m": tape_end,
                  "lat_start_m": lat_start, "lat_end_m": lat_end}
     along, lateral = abs(tape_end - tape_start), lat_end - lat_start
     tape = float(np.hypot(along, lateral))  # true straight-line displacement of the reading point
@@ -84,7 +95,7 @@ def analyse_run(bag: str, tape_start: float, tape_end: float, args, lat_start: f
     t = sp.t
     vel_b = sp.cols["velocity"]
     speed = np.hypot(vel_b[:, 0], vel_b[:, 1])
-    s, e = find_walk(t, speed, args.move_thresh, args.merge_s)
+    s, e = find_walk(t, speed, args.move_thresh, args.merge_s, leg, args.min_walk_s)
     t0, t1 = t[s], t[e - 1]
     out.update(walk_t0_s=float(t0 - t[0]), walk_s=float(t1 - t0))
     out["tape_speed_mps"] = tape / (t1 - t0) if t1 > t0 else float("nan")
@@ -150,9 +161,10 @@ def load_runs(args) -> list[tuple]:
             for r in csv.DictReader(f):
                 b = Path(r["bag"])
                 runs.append((str(b if b.is_absolute() else base / b), float(r["tape_start_m"]),
-                             float(r["tape_end_m"]), r.get("note", ""), _f(r, "lat_start_m"), _f(r, "lat_end_m")))
+                             float(r["tape_end_m"]), r.get("note", ""), _f(r, "lat_start_m"), _f(r, "lat_end_m"),
+                             int(_f(r, "leg"))))
     for b, a, z in args.run or []:
-        runs.append((b, float(a), float(z), "", 0.0, 0.0))
+        runs.append((b, float(a), float(z), "", 0.0, 0.0, 0))
     if not runs:
         raise SystemExit("give --runs-csv or at least one --run BAG START_M END_M")
     return runs
@@ -189,6 +201,7 @@ def main(argv=None) -> int:
     ap.add_argument("--move-thresh", type=float, default=0.10, help="m/s; walk detection")
     ap.add_argument("--merge-s", type=float, default=0.5, help="merge walk pieces closer than this")
     ap.add_argument("--still-s", type=float, default=0.5, help="still window before/after the walk")
+    ap.add_argument("--min-walk-s", type=float, default=1.5, help="shorter walks are ignored when a leg is chosen")
     ap.add_argument("--stride", type=int, default=1, help="keep every n-th /sportmodestate message")
     ap.add_argument("--odom-stride", type=int, default=1)
     ap.add_argument("--max-rel-err", type=float, default=None,
@@ -198,9 +211,9 @@ def main(argv=None) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rows = []
-    for bag, a, z, note, la, lz in load_runs(args):
+    for bag, a, z, note, la, lz, leg in load_runs(args):
         try:
-            r = analyse_run(bag, a, z, args, la, lz)
+            r = analyse_run(bag, a, z, args, la, lz, leg)
         except Exception as ex:  # one bad run must not hide the others
             r = {"bag": bag, "error": f"{type(ex).__name__}: {ex}"}
         r["note"] = note
@@ -213,7 +226,7 @@ def main(argv=None) -> int:
             continue
         src = "  ".join(f"{k}={v['ratio']:.3f}" for k, v in r["sources"].items())
         lines.append(
-            f"{Path(r['bag']).name}: tape {r['tape_m']:.3f} m (along {r['tape_along_m']:.3f}, "
+            f"{Path(r['bag']).name}{' leg ' + str(r['leg']) if r.get('leg') else ''}: tape {r['tape_m']:.3f} m (along {r['tape_along_m']:.3f}, "
             f"lateral {r['tape_lateral_m']:+.3f}) in {r['walk_s']:.2f} s "
             f"({r['tape_speed_mps']:.3f} m/s), cmd vx {r.get('cmd_vx_median', float('nan')):.2f}, "
             f"est vx {r['mean_vx_body_mps']:.3f}, yaw drift {r['yaw_drift_deg']:+.1f} deg | ratio {src}"
