@@ -23,6 +23,7 @@ import t11_v_check as vc  # noqa: E402
 TS = go2_bag.TYPESTORE
 SPORT_T = "unitree_go/msg/SportModeState"
 LOW_T = "unitree_go/msg/LowState"
+CMD_T = "unitree_go/msg/LowCmd"
 
 
 def write_bag(path: Path, topic: str, msgtype: str, msgs: list[tuple[int, object]]) -> str:
@@ -31,6 +32,44 @@ def write_bag(path: Path, topic: str, msgtype: str, msgs: list[tuple[int, object
         for t_ns, m in msgs:
             w.write(c, t_ns, bytes(TS.serialize_cdr(m, msgtype)))
     return str(path)
+
+
+def write_bag_multi(path: Path, streams: dict[str, tuple[str, list[tuple[int, object]]]]) -> str:
+    """streams {topic: (msgtype, [(t_ns, msg)])}, written in receive-time order."""
+    with Writer(path, version=8) as w:
+        conns = {tp: w.add_connection(tp, mt, typestore=TS) for tp, (mt, _) in streams.items()}
+        rows = sorted(((t, tp, m) for tp, (_, ms) in streams.items() for t, m in ms), key=lambda r: (r[0], r[1]))
+        for t_ns, tp, m in rows:
+            w.write(conns[tp], t_ns, bytes(TS.serialize_cdr(m, streams[tp][0])))
+    return str(path)
+
+
+def h2_bag(path: Path, kp: float, kd: float, lag_s: float = 0.010, gain: float = 0.9, offset: float = 0.3) -> str:
+    """50 Hz /lowcmd (cmd k at 20 k ms) and 500 Hz /lowstate at odd ms (so each 2 ms lag step is distinct).
+    tau_est = gain * DCMotor(kp (q_tgt held lag earlier - q) - kd dq) + offset; torques stay below the clip."""
+    rng = np.random.default_rng(0)
+    n_cmd, f32 = 200, lambda x: np.asarray(x, np.float32).astype(np.float64)
+    t_cmd = 0.02 * np.arange(n_cmd)
+    q_tgt = f32(rng.uniform(-0.3, 0.3, (n_cmd, 12)))
+    t_st = 0.001 + 0.002 * np.arange(int(0.02 * n_cmd / 0.002) - 1)
+    q, dq = f32(rng.uniform(-0.1, 0.1, (len(t_st), 12))), f32(rng.uniform(-1.0, 1.0, (len(t_st), 12)))
+    held = h2.held_index(t_cmd, t_st, lag_s)
+    keep = held >= 0
+    t_st, q, dq, held = t_st[keep], q[keep], dq[keep], held[keep]
+    tau = gain * h2.dc_motor(kp * (q_tgt[held] - q) - kd * dq, dq) + offset
+    cmds, states = [], []
+    for k in range(n_cmd):
+        m = go2_bag.default_message(CMD_T)
+        for j in range(12):
+            m.motor_cmd[j].q, m.motor_cmd[j].kp, m.motor_cmd[j].kd, m.motor_cmd[j].mode = q_tgt[k, j], kp, kd, 1
+        cmds.append((int(round(1e9 + t_cmd[k] * 1e9)), m))
+    for i in range(len(t_st)):
+        m = go2_bag.default_message(LOW_T)
+        m.tick = 2 * i
+        for j in range(12):
+            m.motor_state[j].q, m.motor_state[j].dq, m.motor_state[j].tau_est = q[i, j], dq[i, j], tau[i, j]
+        states.append((int(round(1e9 + t_st[i] * 1e9)), m))
+    return write_bag_multi(path, {"/lowcmd": (CMD_T, cmds), "/lowstate": (LOW_T, states)})
 
 
 def sport_bag(path: Path, walk_s: float, v: float = 0.5, still_s: float = 1.0, hz: float = 50.0) -> str:
@@ -110,6 +149,54 @@ def test_log_check_reads_tick_and_counts_stale(tmp_path):
     assert p["flagged_steps_gt_30ms"] == 0
     assert p["stale_reused_steps"] == 1  # two grid points read tick 1000; the second is stale
     assert "stale steps" in lc.render(res)
+
+
+def test_log_check_counts_lost_ticks_and_late_burst(tmp_path):
+    msgs, t_ms = [], 0.0
+    for i in range(1000):  # 500 Hz, tick step 2
+        if i == 600:
+            t_ms += 30.0  # message 600 arrives 30 ms late, 601..614 follow in a burst; ticks continuous
+        t_ms += 0.01 if 601 <= i < 615 else 2.0
+        if 300 <= i < 319:
+            continue  # 19 messages lost: tick jumps 40, receive gap 40 ms
+        m = go2_bag.default_message(LOW_T)
+        m.tick = 2 * i
+        msgs.append((int(1e9 + t_ms * 1e6), m))
+    res = lc.analyse(write_bag(tmp_path / "gaps", "/lowstate", LOW_T, msgs), 10)
+    k = res["lowstate_tick"]
+    assert k["tick_step_mode"] == 2 and k["messages_lost_by_tick"] == 19
+    assert k["rx_gaps_gt_20ms_with_continuous_tick"] == 1  # late, not lost
+    assert res["topics"]["/lowstate"]["gaps_gt_20ms"] == 2 and res["topics"]["/lowstate"]["gaps_gt_30ms"] == 2
+    assert res["policy_50hz"]["flagged_steps_gt_30ms"] >= 1
+
+
+# --- H2 actuator replay ---------------------------------------------------------------
+def test_h2_recovers_lag_gain_offset(tmp_path):
+    bag = h2_bag(tmp_path / "h2", kp=25.0, kd=0.5)
+    o = tmp_path / "o"
+    assert h2.main([bag, "--out", str(o), "--policy-sha256", "abc123"]) == 0
+    out = json.loads((o / "h2_actuator.json").read_text())
+    assert out["counts"] is True and out["gain_share"] == 1.0
+    for name, r in out["joints"].items():
+        assert r["lag_ms"] == pytest.approx(10.0), name
+        assert r["gain"] == pytest.approx(0.9, abs=1e-3) and r["offset_nm"] == pytest.approx(0.3, abs=1e-3), name
+        assert r["rmse_fit_nm"] < 1e-3 and r["dc_clip_rows"] == 0, name
+
+
+def test_h2_refuses_unitree_gains(tmp_path):
+    bag = h2_bag(tmp_path / "h2", kp=40.0, kd=1.0)
+    o = tmp_path / "o"
+    assert h2.main([bag, "--out", str(o), "--policy-sha256", "abc123"]) == 2  # stop: not action data
+    assert "NOT ACTION DATA" in (o / "h2_actuator.txt").read_text()
+    assert not (o / "h2_actuator.json").exists()
+    o2 = tmp_path / "o2"
+    assert h2.main([bag, "--out", str(o2), "--policy-sha256", "abc123", "--allow-other-gains"]) == 0
+    assert json.loads((o2 / "h2_actuator.json").read_text())["counts"] is False
+    assert "DOES NOT COUNT" in (o2 / "h2_actuator.txt").read_text()
+    # our gains but no policy hash: runs, does not count
+    o3 = tmp_path / "o3"
+    assert h2.main([h2_bag(tmp_path / "h2b", kp=25.0, kd=0.5), "--out", str(o3)]) == 0
+    assert json.loads((o3 / "h2_actuator.json").read_text())["counts"] is False
 
 
 # --- velocity check ----------------------------------------------------------------
