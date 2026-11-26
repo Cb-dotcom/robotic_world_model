@@ -48,6 +48,16 @@ head advantage counts only if the same head shows it with the same sign (interva
 otherwise it is noise (the heads are interchangeable copies). Stop (termination) predictions are reported apart:
 per head the stop probability by depth and, on falls at the last depth, stop predicted / tilt (>= 30 deg) predicted
 but stop missed / tilt missed.
+Review of the 26 Nov run (added; the earlier keys are unchanged):
+  zero spread  log u of a zero spread is NaN (never a clamp); that pair is left out of every log-u mean and interval
+            and counted (zero_spread_windows, zero_spread_pairs_excluded). Same direction needs a nonzero ensemble error.
+  unstable denominator  as c0m_memory: when the non-fall H interval includes 0 or a bootstrap denominator is <= 0, the
+            ratio prints UNSTABLE DENOMINATOR and the fall - non-fall difference leads; P3 (written on the ratio) is
+            then not computable (None) for that pair; P3_difference is reported apart, descriptive.
+  which side  (which_side, text "SIDE") mean log u_ctx and log u_imag at d16 / d25, fall and non-fall, their
+            differences and e_phys of each arm, pooled and per source.
+  leave one head out  (heads.<model>.<scope>.leave_one_out, text "LOO") the ensemble without each head in turn.
+  The head file starts with the COUNT lines and the per-source advantage at the last depth.
 Limits: the models differ in more than failure data (data volume, recipe, seed; G0 has no friction data); ETH's
 training data are unknown; the windows were seen before; associations, not causes. Eligibility is by trace sha256:
 a trace in a model's fit manifest is excluded whole (envs held out of a fit are not recovered).
@@ -179,6 +189,7 @@ def window_metrics(means, target, stats):
     min-max), and tilt_deg for gravity."""
     mean = means.mean(0)
     spread = means.std(0, ddof=1)
+    spread[(means == means[:1]).all(0)] = 0                # identical heads: exactly 0, not float noise (~1e-15)
     err = mean - target
     lo, hi = means.min(0), means.max(0)
     outside = (target < lo) | (target > hi)
@@ -201,9 +212,30 @@ def arm_metrics(arm, target, stats):
     return res
 
 
+def log_spread(u):
+    """log of a summed spread. A zero spread (identical heads) gives NaN, never a clamp or -inf: the window is left out
+    of every log-u mean with its matched pair and counted (zero_spread_*). Coverage and agree-and-wrong need no log: a
+    zero-spread dim is covered only by an exact hit, and u = 0 is below any median."""
+    u = np.asarray(u)
+    out = np.log(np.where(u > 0, u, 1))
+    out[u <= 0] = np.nan
+    return out
+
+
+def _pair_boot_finite(f, n, boot):
+    """c0.pair_bootstrap on the pairs whose fall and non-fall values are both finite: the same draws as the plain call
+    when every pair is kept. Returns (fall draws, non-fall draws, kept mask); NaN draws when no pair is kept."""
+    strata, cf, cn, n_boot, seed = boot
+    ok = np.isfinite(f) & np.isfinite(n)
+    if not ok.any():
+        return np.full(n_boot, np.nan), np.full(n_boot, np.nan), ok
+    bf, bn = c0.pair_bootstrap(f[ok], n[ok], np.asarray(strata)[ok], np.asarray(cf)[ok], np.asarray(cn)[ok], n_boot, seed)
+    return bf, bn, ok
+
+
 def _columns(x, p90_e0, med_u, p90_e):
-    """Per-window values [W, K] of METRICS (+ tilt_deg): mean over paths of [P, W] metrics."""
-    cols = [x["e"], x["e_phys"], np.log(np.maximum(x["u"], 1e-300)), x["coverage"],
+    """Per-window values [W, K] of METRICS (+ tilt_deg): mean over paths of [P, W] metrics (log u NaN at zero spread)."""
+    cols = [x["e"], x["e_phys"], log_spread(x["u"]), x["coverage"],
             (x["outside"] >= 0.5) & (x["e"] > p90_e0), (x["u"] < med_u) & (x["e"] > p90_e)]
     if "tilt_deg" in x:
         cols.append(x["tilt_deg"])
@@ -220,7 +252,12 @@ def shares(fall, nonfall, d0_nonfall, boot=None):
         p90_e0 = np.percentile(z["e"], 90)
         med_u, p90_e = np.median(n["u"]), np.percentile(n["e"], 90)
         cf, cn = _columns(f, p90_e0, med_u, p90_e), _columns(n, p90_e0, med_u, p90_e)
-        pf, pn = cf.mean(0), cn.mean(0)
+        okf, okn = np.isfinite(cf[:, 2]), np.isfinite(cn[:, 2])            # log u: windows without a zero spread
+        if boot is not None:                                                # matched pairs: both members leave
+            okf = okn = okf & okn
+        pf, pn = np.nan_to_num(cf).mean(0), np.nan_to_num(cn).mean(0)
+        pf[2] = cf[okf, 2].mean() if okf.any() else np.nan
+        pn[2] = cn[okn, 2].mean() if okn.any() else np.nan
         out[gname] = row = dict(joint_miss_fall=float(pf[4]), joint_miss_nonfall=float(pn[4]),
                                 agree_wrong_fall=float(pf[5]), agree_wrong_nonfall=float(pn[5]),
                                 e_fall=float(pf[0]), e_nonfall=float(pn[0]),
@@ -228,11 +265,16 @@ def shares(fall, nonfall, d0_nonfall, boot=None):
                                 u_geomean_fall=float(np.exp(pf[2])), u_geomean_nonfall=float(np.exp(pn[2])),
                                 coverage_fall=float(pf[3]), coverage_nonfall=float(pn[3]),
                                 thresholds=dict(nonfall_p90_e_d0=float(p90_e0), nonfall_median_u=float(med_u),
-                                                nonfall_p90_e=float(p90_e)))
+                                                nonfall_p90_e=float(p90_e)),
+                                zero_spread_windows=dict(fall=int((~np.isfinite(cf[:, 2])).sum()),
+                                                         nonfall=int((~np.isfinite(cn[:, 2])).sum())),
+                                zero_spread_pairs_excluded=int((~okf).sum()) if boot is not None else None)
         if "tilt_deg" in f:
             row["tilt_err_deg_fall"], row["tilt_err_deg_nonfall"] = float(pf[6]), float(pn[6])
         if boot is not None:
-            bf, bn = c0.pair_bootstrap(cf, cn, *boot)
+            bf, bn = c0.pair_bootstrap(np.nan_to_num(cf), np.nan_to_num(cn), *boot)
+            if not okf.all():                                               # log u draws from the kept pairs only
+                bf[:, 2], bn[:, 2], _ = _pair_boot_finite(cf[:, 2], cn[:, 2], boot)
             names = METRICS + ("tilt_deg",) * (cf.shape[1] > len(METRICS))
             row["ci"] = {f"{m}_{kind}": c0.ci(b[:, k]) for k, m in enumerate(names) for kind, b in (("fall", bf), ("nonfall", bn))}
             row["ci"].update({f"{m}_diff": c0.ci(bf[:, k] - bn[:, k]) for k, m in enumerate(names)})
@@ -241,29 +283,44 @@ def shares(fall, nonfall, d0_nonfall, boot=None):
     return out
 
 
+def window_h(u_ctx, u_imag):
+    """Per-window C0 deficit h = -(mean over driving heads of log u_imag - log u_ctx); u_ctx [W], u_imag [P, W].
+    NaN where a spread is 0 (log_spread)."""
+    return -(log_spread(u_imag).mean(0) - log_spread(u_ctx))
+
+
 def h_ratio(u_ctx_f, u_imag_f, u_ctx_n, u_imag_n):
-    """C0 point estimate on these windows: H = -mean over windows of mean over paths log(u_imag / u_ctx)."""
-    hf = -float((np.log(u_imag_f) - np.log(u_ctx_f)).mean())
-    hn = -float((np.log(u_imag_n) - np.log(u_ctx_n)).mean())
-    return dict(H_fall=hf, H_nonfall=hn, ratio=hf / hn if hn != 0 else float("nan"))
+    """C0 point estimate on these windows: H = mean over windows of window_h, on the pairs without a zero spread."""
+    hf, hn = window_h(u_ctx_f, u_imag_f), window_h(u_ctx_n, u_imag_n)
+    ok = np.isfinite(hf) & np.isfinite(hn)
+    hf, hn = (float(hf[ok].mean()), float(hn[ok].mean())) if ok.any() else (float("nan"),) * 2
+    return dict(H_fall=hf, H_nonfall=hn, ratio=hf / hn if hn != 0 else float("nan"),
+                zero_spread_pairs_excluded=int((~ok).sum()))
 
 
 def c0_interval(h_fall, h_nonfall, strata, clusters_fall, clusters_nonfall, n_boot=10_000, seed=0):
     """Part B. Per-window C0 deficit h [W] of falls and their matched non-falls -> H fall, H non-fall, ratio and fall
     minus non-fall with 95 % intervals from the registered matched-pair bootstrap (c0_battery.pair_bootstrap, the
-    draws of c0m_memory.decompose). Ratio interval as the registered rule: the finite draws of H_fall / H_nonfall."""
-    bf, bn = c0.pair_bootstrap(h_fall, h_nonfall, strata, clusters_fall, clusters_nonfall, n_boot, seed)
-    hf, hn = float(np.mean(h_fall)), float(np.mean(h_nonfall))
+    draws of c0m_memory.decompose). Ratio interval as the registered rule: the finite draws of H_fall / H_nonfall.
+    Pairs with a zero spread (h NaN) are left out and counted. unstable_denominator (c0m_memory convention, review
+    26 Nov): the non-fall H interval includes 0, or some draw of the denominator is <= 0; then the ratio is not read
+    (text: UNSTABLE DENOMINATOR) and the fall - non-fall difference is the number to read."""
+    h_fall, h_nonfall = np.asarray(h_fall), np.asarray(h_nonfall)
+    bf, bn, ok = _pair_boot_finite(h_fall, h_nonfall, (strata, clusters_fall, clusters_nonfall, n_boot, seed))
+    hf, hn = (float(np.mean(h_fall[ok])), float(np.mean(h_nonfall[ok]))) if ok.any() else (float("nan"),) * 2
     with np.errstate(divide="ignore", invalid="ignore"):
         rb = bf / bn
     fin = np.isfinite(rb)
     lo, hi = c0.ci(bn)
+    nonpos = int((bn <= 0).sum())
+    comps = c0.pair_components(np.asarray(clusters_fall)[ok], np.asarray(clusters_nonfall)[ok]) if ok.any() else []
     return dict(H_fall=hf, H_fall_ci=c0.ci(bf), H_nonfall=hn, H_nonfall_ci=[lo, hi],
                 ratio=hf / hn if hn != 0 else float("nan"),
                 ratio_ci=c0.ci(rb[fin]) if fin.any() else [float("nan")] * 2, nonfinite_ratio_draws=int((~fin).sum()),
                 difference=hf - hn, difference_ci=c0.ci(bf - bn), nonfall_ci_includes_0=bool(lo <= 0 <= hi),
-                pairs=int(len(h_fall)), pair_components=int(len(np.unique(c0.pair_components(clusters_fall, clusters_nonfall)))),
-                n_boot=n_boot, seed=seed)
+                unstable_denominator=bool(lo <= 0 <= hi or nonpos > 0 or not ok.any()),
+                nonpositive_denominator_draws=nonpos, zero_spread_pairs_excluded=int((~ok).sum()),
+                pairs=int(ok.sum()), pair_components=int(len(np.unique(comps))), n_boot=n_boot, seed=seed)
 
 
 def _tilt(g):
@@ -283,7 +340,8 @@ def head_readout(means, stop, target, stats, depths, boot):
                 p = means[kind][di][..., a:b].astype(np.float64)                     # [heads, W, dims]
                 y = target[kind][:, di, a:b].astype(np.float64)                      # [W, dims]
                 err_m, err_h = p.mean(0) - y, p - y[None]
-                same = (np.sign(err_h) == np.sign(err_m)[None]).all(0).mean(-1)      # [W]
+                # an exact hit of the ensemble mean is no miss (identical heads would otherwise count sign 0 == 0)
+                same = ((np.sign(err_h) == np.sign(err_m)[None]).all(0) & (err_m != 0)).mean(-1)   # [W]
                 adv = (np.abs(err_m)[None] - np.abs(err_h)).mean(-1).T               # [W, heads]
                 cols[kind] = np.column_stack([adv, same])
                 ph, yh = p * std[a:b] + mu[a:b], y * std[a:b] + mu[a:b]
@@ -309,6 +367,58 @@ def head_readout(means, stop, target, stats, depths, boot):
         stop_predicted=(p > 0.5).mean(1).tolist(),
         tilt_predicted_stop_missed=((tilt_h >= TILT_DEG) & (p <= 0.5)).mean(1).tolist(),
         tilt_missed=((tilt_h < TILT_DEG) & (p <= 0.5)).mean(1).tolist())
+    return out
+
+
+def leave_one_out(arms, target, stats, depths, boot, warn_depths=(16, 25)):
+    """Part C, leave one head out (review 26 Nov). arms {kind: {"ctx": [1, D, heads, W, 45], "imag": [heads, D, heads,
+    W, 45]}}, target {kind: [W, D, 45]} normalized. Dropping head h is exact in both arms: on recorded context every
+    head reads the same rows, and imagined path p is driven by head p alone, so the 4-head ensemble keeps paths p != h
+    and heads != h. Per set ("all" = every head, "without_h<i>"): ensemble-mean physical RMS error on recorded context
+    (per group and depth, fall and non-fall); warning quality at d16 and d25 = Part B's fall - non-fall H with its
+    interval (c0_interval), and the AUROC of the summed spread u_ctx for falls vs non-falls (go2_c0_check.auroc,
+    average ranks for ties). A better ensemble mean can still give a worse warning."""
+    from go2_c0_check import auroc
+    n = arms["fall"]["ctx"].shape[2]
+    out = {}
+    for drop in [None] + list(range(n)):
+        keep = [i for i in range(n) if i != drop]
+        m = {k: dict(ctx=arm_metrics(a["ctx"][:, :, keep], target[k], stats),
+                     imag=arm_metrics(a["imag"][keep][:, :, keep], target[k], stats)) for k, a in arms.items()}
+        row = dict(e_phys={f"d{d}": {g: {k: float(m[k]["ctx"][di][g]["e_phys"].mean()) for k in m} for g in GROUPS}
+                           for di, d in enumerate(depths)})
+        for di, d in enumerate(depths):
+            if d in warn_depths:
+                u = {k: m[k]["ctx"][di]["sum"]["u"][0] for k in m}
+                b = c0_interval(*(window_h(u[k], m[k]["imag"][di]["sum"]["u"]) for k in ("fall", "nonfall")), *boot)
+                row[f"warning_d{d}"] = dict({k: b[k] for k in ("difference", "difference_ci", "H_fall", "H_nonfall",
+                                                                "pairs", "zero_spread_pairs_excluded")},
+                                            auroc_u_ctx=auroc(u["fall"], u["nonfall"]))
+        out["all" if drop is None else f"without_h{drop}"] = row
+    return out
+
+
+def which_side(table, depths, at=(16, 25)):
+    """Which side moved (review 26 Nov), sum group: per depth, for falls and non-falls, mean log u on recorded context
+    (ctx) and in imagination (imag), each with its fall - non-fall difference, H = log u_ctx - log u_imag (points),
+    and the ensemble-mean physical RMS error of each arm on the same windows. Read from the component tables: the
+    same pair draws, no new bootstrap."""
+    out = {}
+    for d in [d for d in at if d in depths]:
+        row = {}
+        for arm in ("ctx", "imag"):
+            r = table[f"{arm}/d{d}"]["sum"]
+            c = r.get("ci", {})
+            row[arm] = {f"{m}_{k}": float(np.log(r[f"u_geomean_{k}"])) if m == "log_u" else r[f"{m}_{k}"]
+                        for m in ("log_u", "e_phys") for k in ("fall", "nonfall")}
+            for m in ("log_u", "e_phys"):
+                row[arm][f"{m}_diff"] = row[arm][f"{m}_fall"] - row[arm][f"{m}_nonfall"]
+                row[arm].update({f"{m}_{k}_ci": c[f"{m}_{k}"] for k in ("fall", "nonfall", "diff") if f"{m}_{k}" in c})
+            row[arm].update(u_geomean_fall=r["u_geomean_fall"], u_geomean_nonfall=r["u_geomean_nonfall"],
+                            zero_spread_pairs_excluded=r["zero_spread_pairs_excluded"])
+        for k in ("fall", "nonfall"):
+            row[f"H_{k}"] = row["ctx"][f"log_u_{k}"] - row["imag"][f"log_u_{k}"]
+        out[f"d{d}"] = row
     return out
 
 
@@ -353,28 +463,33 @@ def _tables(m, windows, depths, sel, n_boot, seed):
     last = len(depths) - 1
     u = lambda kind, arm: m[kind][arm][last]["sum"]["u"]
     table["c0_point"] = h_ratio(u("fall", "ctx")[0], u("fall", "imag"), u("nonfall", "ctx")[0], u("nonfall", "imag"))
-    h = lambda kind: -(np.log(u(kind, "imag")).mean(0) - np.log(u(kind, "ctx")[0]))
+    h = lambda kind: window_h(u(kind, "ctx")[0], u(kind, "imag"))
     table["c0_interval"] = dict(c0_interval(h("fall"), h("nonfall"), *boot), depth=int(depths[last]))
-    table["imag_over_ctx_fall"] = float(np.exp(np.log(u("fall", "imag")).mean() - np.log(u("fall", "ctx")).mean()))
+    table["imag_over_ctx_fall"] = float(np.exp(-np.nanmean(h("fall"))))      # fall windows without a zero spread
     table["windows"] = {k: int(len(windows[k]["clusters"][sel])) for k in ("fall", "nonfall")}
+    table["which_side"] = which_side(table, depths)
     return table, boot
 
 
 def model_table(model, stats_np, windows, horizon, depths, n_boot=10_000, seed=0):
     """All metrics of one model on one window set; with two or more sources also per source and the repeats.
     The Part C readout is under "heads" (written to its own file)."""
-    m, ctx, stop, tgt = {}, {}, {}, {}
+    m, ctx, stop, tgt, loo = {}, {}, {}, {}, {}
     for kind in ("fall", "nonfall"):
         w = windows[kind]
         arms = arm_means(model, w["xs"], w["xa"], horizon, depths)
         tgt[kind] = w["y"].numpy()[:, list(depths)]
         m[kind] = {arm: arm_metrics(arms[arm], tgt[kind], stats_np) for arm in ARMS}
         ctx[kind], stop[kind] = arms["ctx"][0], arms["ctx_stop"]
+        loo[kind] = {a: arms[a] for a in ("ctx", "imag")}
 
     def scope(sel):
         table, boot = _tables(m, windows, depths, sel, n_boot, seed)
+        t_sel = {k: v[sel] for k, v in tgt.items()}
         heads = head_readout({k: v[:, :, sel] for k, v in ctx.items()}, {k: v[..., sel] for k, v in stop.items()},
-                             {k: v[sel] for k, v in tgt.items()}, stats_np, depths, boot)
+                             t_sel, stats_np, depths, boot)
+        heads["leave_one_out"] = leave_one_out({k: {a: v[..., sel, :] for a, v in x.items()} for k, x in loo.items()},
+                                               t_sel, stats_np, depths, boot)
         return table, heads
 
     table, heads = scope(slice(None))
@@ -403,14 +518,22 @@ def predictions(tables, anymal_pairs=(("E1V", "ETH"), ("E1R2", "ETH")), go2_pair
     pairs = [p for p in anymal_pairs + go2_pairs if p[0] in tables and p[1] in tables]
     out["P1"] = {f"{a}<{b}": jm(a) < jm(b) for a, b in pairs}
     out["P2"] = {f"{a}>{b}": tables[a]["imag_over_ctx_fall"] > tables[b]["imag_over_ctx_fall"] for a, b in pairs}
-    out["P3"] = {f"{a}<{b}": tables[a]["c0_point"]["ratio"] < tables[b]["c0_point"]["ratio"] for a, b in pairs}
+    # P3 was written on the ratio before the run, so it is not re-cast on the difference after seeing the data: with an
+    # unstable denominator in either model it is not computable (None). The difference is reported apart (P3_difference).
+    unstable = lambda n: tables[n]["c0_interval"]["unstable_denominator"]
+    out["P3"] = {f"{a}<{b}": None if unstable(a) or unstable(b) else
+                 tables[a]["c0_point"]["ratio"] < tables[b]["c0_point"]["ratio"] for a, b in pairs}
+    out["P3_difference"] = {f"{a}<{b}": tables[a]["c0_interval"]["difference"] < tables[b]["c0_interval"]["difference"]
+                            for a, b in pairs}
     out["P4"] = {}
     for name in ("ETH", "G0"):
         if name in tables:
             s = {g: jm(name, g) for g in SIX}
             out["P4"][name] = dict(largest=max(s, key=s.get), held=max(s, key=s.get) == "gravity", shares=s)
-    for k in ("P1", "P2", "P3"):
-        out[k] = dict(per_pair=out[k], held=all(out[k].values()) if out[k] else None)
+    for k in ("P1", "P2", "P3", "P3_difference"):
+        v = list(out[k].values())
+        out[k] = dict(per_pair=out[k], held=None if not v or None in v else all(v))
+    out["P3"]["note"] = "None: not computable (unstable denominator); P3_difference is descriptive, added 26 Nov after the run"
     out["P4"]["held"] = all(v["held"] for v in out["P4"].values() if isinstance(v, dict)) if out["P4"] else None
     return out
 
@@ -518,13 +641,35 @@ def _ci(x):
     return f"[{x[0]:.3f}, {x[1]:.3f}]"
 
 
+def _c0_text(b):
+    """Part B numbers, the difference first; the ratio only with a stable denominator (c0m_memory convention)."""
+    ratio = (f"ratio UNSTABLE DENOMINATOR (non-fall H CI includes 0 or {b['nonpositive_denominator_draws']} draws <= 0; "
+             "not read)" if b["unstable_denominator"] else f"ratio {b['ratio']:.2f} {_ci(b['ratio_ci'])}")
+    z = b["zero_spread_pairs_excluded"]
+    return (f"fall - non-fall {b['difference']:.3f} {_ci(b['difference_ci'])}; H fall {b['H_fall']:.3f} "
+            f"{_ci(b['H_fall_ci'])}, non-fall {b['H_nonfall']:.3f} {_ci(b['H_nonfall_ci'])}; {ratio}"
+            + (f"; zero-spread pairs left out {z}" if z else ""))
+
+
+def _side_lines(name, src, ws):
+    lines = []
+    for d, r in ws.items():
+        u = lambda a, k: f"{r[a][f'log_u_{k}']:.3f} {_ci(r[a].get(f'log_u_{k}_ci', [np.nan] * 2))}"
+        e = lambda a, k: f"{r[a][f'e_phys_{k}']:.3f} {_ci(r[a].get(f'e_phys_{k}_ci', [np.nan] * 2))}"
+        lines.append(f"  SIDE {name} {src} {d} log u: ctx fall {u('ctx', 'fall')} non-fall {u('ctx', 'nonfall')} diff "
+                     f"{u('ctx', 'diff')} | imag fall {u('imag', 'fall')} non-fall {u('imag', 'nonfall')} diff "
+                     f"{u('imag', 'diff')} | geomean u ctx {r['ctx']['u_geomean_fall']:.2f}/{r['ctx']['u_geomean_nonfall']:.2f}"
+                     f" imag {r['imag']['u_geomean_fall']:.2f}/{r['imag']['u_geomean_nonfall']:.2f} | H fall {r['H_fall']:.3f}"
+                     f" non-fall {r['H_nonfall']:.3f}")
+        lines.append(f"  SIDE {name} {src} {d} e_phys sum: ctx fall {e('ctx', 'fall')} non-fall {e('ctx', 'nonfall')} diff "
+                     f"{e('ctx', 'diff')} | imag fall {e('imag', 'fall')} non-fall {e('imag', 'nonfall')} diff {e('imag', 'diff')}")
+    return lines
+
+
 def _table_lines(name, t):
     """Text view of one model's tables on one window set (pooled or one source)."""
     b = t["c0_interval"]
-    lines = [f"  C0 at d{b['depth']} ({b['pairs']} pairs, {b['pair_components']} episode components): H fall "
-             f"{b['H_fall']:.3f} {_ci(b['H_fall_ci'])}, H non-fall {b['H_nonfall']:.3f} {_ci(b['H_nonfall_ci'])}"
-             f"{' (CI includes 0)' if b['nonfall_ci_includes_0'] else ''}, ratio {b['ratio']:.2f} {_ci(b['ratio_ci'])}, "
-             f"fall - non-fall {b['difference']:.3f} {_ci(b['difference_ci'])}",
+    lines = [f"  C0 at d{b['depth']} ({b['pairs']} pairs, {b['pair_components']} episode components): {_c0_text(b)}",
              "  arm/depth group      e_phys fall [CI] | non-fall    u geomean fall [CI] | non-fall   coverage fall [CI] | "
              "non-fall   joint miss fall [CI] | non-fall   agree&wrong fall [CI] | non-fall"]
     for key in [k for k in t if "/d" in k]:
@@ -556,6 +701,21 @@ def _head_lines(h):
     return lines
 
 
+def _loo_lines(name, src, loo):
+    lines = []
+    for s, r in loo.items():
+        e = r["e_phys"]
+        last = list(e)[-1]
+        ef = "/".join(f"{e[d]['sum']['fall']:.3f}" for d in e)
+        en = "/".join(f"{e[d]['sum']['nonfall']:.3f}" for d in e)
+        grp = " ".join(f"{g} {e[last][g]['fall']:.3f}|{e[last][g]['nonfall']:.3f}" for g in SIX)
+        warn = "; ".join(f"{k[8:]} dH {w['difference']:.3f} {_ci(w['difference_ci'])} AUROC {w['auroc_u_ctx']:.3f}"
+                         for k, w in r.items() if k.startswith("warning_"))
+        lines.append(f"  LOO {name} {src} {s}: e_phys sum ({'/'.join(e)}) fall {ef} | non-fall {en}; {last} {grp}; "
+                     f"warning {warn}")
+    return lines
+
+
 def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, heads=None, registered=None):
     pred = predictions(flat_for_pred or tables)
     limits = ["models differ in more than failure data (volume, recipe, seed)", "ETH's training data are unknown",
@@ -580,6 +740,8 @@ def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, head
         lines.append(f"  normalized units common for {k}: {v}")
     for k in ("P1", "P2", "P3"):
         lines.append(f"  {k}: held {pred[k]['held']} {pred[k]['per_pair']}")
+    lines.append(f"  P3 note: {pred['P3']['note']}; P3_difference (fall - non-fall H lower): held "
+                 f"{pred['P3_difference']['held']} {pred['P3_difference']['per_pair']}")
     lines.append(f"  P4: held {pred['P4'].get('held')} " + str({n: v['largest'] for n, v in pred['P4'].items() if isinstance(v, dict)}))
     scopes = {n: t for n, t in tables.items()} if robot == "anymal" else \
         {f"{n} {k}": t[k] for n, t in tables.items() for k in t if k.startswith("K")}
@@ -588,13 +750,24 @@ def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, head
         for src, r in registered["by_source"].items():
             lines.append(f"  ETH registered {src} ({r['pairs']} pairs; {registered['record']}): H fall {r['H_fall']}, "
                          f"non-fall {r['H_nonfall']}, ratio {r['ratio']} {r['ratio_ci']}")
+        t = tables.get("ETH", {})
+        for src, r in registered["by_source"].items():      # reproduction check, printed whatever the denominator
+            b = t.get("by_source", {}).get(src, {}).get("c0_interval") or \
+                (t["c0_interval"] if t.get("traces_used") == [src] else None)
+            if b:
+                lines.append(f"  READ GATE ETH {src}: ratio {b['ratio']:.2f} {_ci(b['ratio_ci'])}, H fall {b['H_fall']:.3f}, "
+                             f"non-fall {b['H_nonfall']:.3f} (registered {r['ratio']} {r['ratio_ci']}, {r['H_fall']} / "
+                             f"{r['H_nonfall']}); a reproduction check, not a reading")
     for n, t in scopes.items():
         for src, tt in [("pooled", t)] + list(t.get("by_source", {}).items()):
             b = tt["c0_interval"]
-            lines.append(f"  {n:8s} {src:12s} {b['pairs']:4d} pairs: H fall {b['H_fall']:.3f} {_ci(b['H_fall_ci'])}, non-fall "
-                         f"{b['H_nonfall']:.3f} {_ci(b['H_nonfall_ci'])}, ratio {b['ratio']:.2f} {_ci(b['ratio_ci'])}, "
-                         f"fall - non-fall {b['difference']:.3f} {_ci(b['difference_ci'])}"
+            lines.append(f"  {n:8s} {src:12s} {b['pairs']:4d} pairs: {_c0_text(b)}"
                          + (f"; pairs excluded {t['pairs_excluded']}" if src == "pooled" and "pairs_excluded" in t else ""))
+    lines.append("WHICH SIDE MOVED (sum group; mean log u per arm, fall | non-fall | fall - non-fall, 95 % intervals; "
+                 "H = log u_ctx - log u_imag; e_phys = ensemble-mean physical RMS error on the same windows)")
+    for n, t in scopes.items():
+        for src, tt in [("pooled", t)] + list(t.get("by_source", {}).items()):
+            lines += _side_lines(n, src, tt["which_side"])
     for n, t in scopes.items():
         lines.append(f"MODEL {n}: components (physical RMS error; summed spread, normalized; 1-sigma coverage; shares)")
         lines += _table_lines(n, t)
@@ -614,14 +787,28 @@ def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, head
               "(normalized, mean over the group's dims; > 0: head closer); same direction = share of dims where every head "
               "misses on the side of the ensemble mean"]
         hscopes = heads if robot == "anymal" else {f"{n} {k}": v for n, h in heads.items() for k, v in h.items()}
-        for n, h in hscopes.items():
-            hl.append(f"MODEL {n} pooled:")
-            hl += _head_lines(h["pooled"])
+        each = lambda h: [("pooled", h["pooled"])] + list(h.get("by_source", {}).items())
+        for n, h in hscopes.items():          # first: what a `head -60` must show (review 26 Nov)
             if "repeats" in h:
                 r = h["repeats"]
-                hl.append(f"  head advantages that COUNT (same head and sign in every source {r['sources']}): "
+                hl.append(f"{n}: head advantages that COUNT (same head and sign in every source {r['sources']}): "
                           + (", ".join(f"{k} {v}" for k, v in r["repeated"].items()) or "none"))
-                hl.append(f"  one-source-only advantages (noise by the repeat rule): {len(r['some_sources_only'])}")
+                hl.append(f"{n}: one-source-only advantages (noise by the repeat rule): {len(r['some_sources_only'])}")
+            for src, hs in each(h):
+                d = [k for k in hs if k.startswith("d")][-1]
+                for kind in ("fall", "nonfall"):
+                    x = hs[d]["sum"][kind]
+                    hl.append(f"  {n} {src} {d} sum {kind} advantage: " + " ".join(
+                        f"h{i} {a:+.3f} {_ci(c)}" for i, (a, c) in enumerate(zip(x["advantage"], x["advantage_ci"]))))
+        hl.append("LEAVE ONE HEAD OUT (recorded context; e_phys = ensemble-mean physical RMS error, sum, per depth, "
+                  "fall | non-fall; groups at the last depth; warning = fall - non-fall H [95 %] and AUROC of u_ctx)")
+        for n, h in hscopes.items():
+            for src, hs in each(h):
+                hl += _loo_lines(n, src, hs["leave_one_out"])
+        for n, h in hscopes.items():
+            for src, hs in each(h):
+                hl.append(f"MODEL {n} {src}:")
+                hl += _head_lines(hs)
         (out / f"components_heads_{robot}.txt").write_text("\n".join(hl) + "\n")
     return rep
 

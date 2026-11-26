@@ -75,17 +75,18 @@ def test_manifest_exclusion_and_common_scale(tmp_path, monkeypatch):
     assert rep["inputs"]["common"] == ["batch0"]
     assert rep["tables"]["ETH"]["traces_used"] == ["batch0"] == rep["tables"]["E1V"]["traces_used"]
     assert rep["common_scale_normalized"] == {"E1V~ETH": True}
-    assert set(rep["predictions"]) == {"P1", "P2", "P3", "P4"}
+    assert set(rep["predictions"]) == {"P1", "P2", "P3", "P3_difference", "P4"}
     t = rep["tables"]["ETH"]["imag/d25"]["sum"]
     assert 0 <= t["joint_miss_fall"] <= 1 and 0 <= t["coverage_fall"] <= 1
     assert (tmp_path / "o" / "components_anymal.txt").exists()
 
 
 def test_predictions_read_the_table():
-    def tab(jm, ratio, imag_over_ctx, gravity_top=True):
+    def tab(jm, ratio, imag_over_ctx, gravity_top=True, unstable=False, diff=1.0):
         g = {k: dict(joint_miss_fall=(0.5 if (k == "gravity") == gravity_top else 0.1)) for k in cc.SIX}
         g["sum"] = dict(joint_miss_fall=jm)
-        return {"imag/d25": g, "c0_point": dict(ratio=ratio), "imag_over_ctx_fall": imag_over_ctx}
+        return {"imag/d25": g, "c0_point": dict(ratio=ratio), "imag_over_ctx_fall": imag_over_ctx,
+                "c0_interval": dict(unstable_denominator=unstable, difference=diff)}
     t = {"ETH": tab(.4, 2.6, .3), "E1V": tab(.2, 1.5, .5), "E1R2": tab(.3, 3.0, .6), "G0": tab(.5, 2, .2, False),
          "D6b": tab(.6, 1, .3)}
     p = cc.predictions(t)
@@ -245,9 +246,24 @@ def test_anymal_two_sources_part_b_part_c_and_separate_table(tmp_path, monkeypat
     h = json.loads((tmp_path / "o" / "components_heads_anymal.json").read_text())["heads"]["ETH"]
     assert set(h) == {"pooled", "by_source", "repeats"} and len(h["pooled"]["d25"]["gravity"]["fall"]["advantage"]) == 5
     assert "COUNT" in (tmp_path / "o" / "components_heads_anymal.txt").read_text()
+    # review 26 Nov: per-recording head readout at the top (head -60), leave one head out, which side, read gate
+    top = (tmp_path / "o" / "components_heads_anymal.txt").read_text().splitlines()[:60]
+    assert any(x.startswith("ETH: head advantages that COUNT") for x in top)
+    for src in ("batchA", "batchC"):
+        assert any(x.startswith(f"  ETH {src} d25 sum fall advantage: h0 ") for x in top)
+        assert set(h["by_source"][src]["leave_one_out"]) == {"all"} | {f"without_h{i}" for i in range(5)}
+    loo = h["pooled"]["leave_one_out"]["all"]["warning_d25"]
+    assert loo["difference"] == pytest.approx(t["c0_interval"]["difference"], rel=1e-5)
+    assert loo["difference_ci"] == pytest.approx(t["c0_interval"]["difference_ci"], rel=1e-4)
+    ws = t["which_side"]["d25"]
+    assert ws["H_fall"] == pytest.approx(t["c0_interval"]["H_fall"], rel=1e-5)
+    assert ws["H_nonfall"] == pytest.approx(t["c0_interval"]["H_nonfall"], rel=1e-5)
+    assert set(t["which_side"]) == {"d16", "d25"} and set(t["by_source"]["batchC"]["which_side"]) == {"d16", "d25"}
+    assert "READ GATE ETH batchA" in txt and "READ GATE ETH batchC" in txt and "  SIDE ETH batchA d25 log u" in txt
     # separate table: round0_1701 alone, each model its own eligible traces; E1V has none and is skipped
     rep = cc.run_anymal(models, traces[2:], tmp_path / "x", n_boot=100, use_intersection=False)
     assert set(rep["tables"]) == {"ETH"} and rep["eligibility"]["E1V"]["skipped"]
+    assert "READ GATE ETH round0_1701: ratio" in (tmp_path / "x" / "components_anymal.txt").read_text()
     with pytest.raises(ValueError, match="no eligible trace"):
         cc.run_anymal(models, traces[2:], tmp_path / "y", n_boot=100)
 
@@ -271,3 +287,105 @@ def test_part_b_reproduces_the_registered_c0_arithmetic(tmp_path, monkeypatch):
         else:
             assert mine["H_fall_ci"] == pytest.approx(rule["h_fall_ci"], rel=1e-4, abs=1e-6)
         assert mine["pair_components"] == rule["pair_components"]
+
+
+# ---------------------------------------------------------------- review of the 26 Nov run: known answers
+def _lift(m):
+    return {g: {k: v[None] for k, v in d.items()} for g, d in m.items()}
+
+
+def test_zero_spread_window_is_left_out_and_counted():
+    strata, cf, cn = _pairs()
+    rng = np.random.default_rng(3)
+    tgt = rng.normal(0, 1, (24, 45))
+    fall, non = tgt[None] + rng.normal(0, .3, (5, 24, 45)), tgt[None] + rng.normal(0, .2, (5, 24, 45))
+    fall[:, 0] = fall[0, 0]                                    # window 0: five identical heads, zero spread everywhere
+    fm, nm = cc.window_metrics(fall, tgt, STATS), cc.window_metrics(non, tgt, STATS)
+    assert fm["sum"]["u"][0] == 0 and fm["sum"]["coverage"][0] == 0.0          # covered only by an exact hit
+    s = cc.shares(_lift(fm), _lift(nm), _lift(nm), (strata, cf, cn, 200, 0))["sum"]
+    assert s["zero_spread_windows"] == {"fall": 1, "nonfall": 0} and s["zero_spread_pairs_excluded"] == 1
+    lf, ln = np.log(fm["sum"]["u"][1:]), np.log(nm["sum"]["u"][1:])
+    assert s["u_geomean_fall"] == pytest.approx(np.exp(lf.mean())) and s["u_geomean_nonfall"] == pytest.approx(np.exp(ln.mean()))
+    bf, bn = c0.pair_bootstrap(lf, ln, strata[1:], cf[1:], cn[1:], 200, 0)
+    assert s["ci"]["log_u_fall"] == pytest.approx(c0.ci(bf)) and s["ci"]["log_u_diff"] == pytest.approx(c0.ci(bf - bn))
+    assert all(np.isfinite(v).all() for v in s["ci"].values())                 # no inf / NaN in any interval
+    # Part B and the point H: the pair is left out and counted
+    h_f = cc.window_h(fm["sum"]["u"], np.stack([fm["sum"]["u"] * .5] * 5))
+    h_n = cc.window_h(nm["sum"]["u"], np.stack([nm["sum"]["u"] * .8] * 5))
+    assert np.isnan(h_f[0]) and h_f[1:] == pytest.approx(np.log(2))
+    r = cc.c0_interval(h_f, h_n, strata, cf, cn, n_boot=200)
+    ref = cc.c0_interval(h_f[1:], h_n[1:], strata[1:], cf[1:], cn[1:], n_boot=200)
+    assert r["zero_spread_pairs_excluded"] == 1 and r["pairs"] == 23 and r["H_fall"] == pytest.approx(np.log(2))
+    assert r["difference_ci"] == pytest.approx(ref["difference_ci"]) and np.isfinite(r["H_fall_ci"]).all()
+    p = cc.h_ratio(fm["sum"]["u"], np.stack([fm["sum"]["u"] * .5] * 5), nm["sum"]["u"], np.stack([nm["sum"]["u"] * .8] * 5))
+    assert p["zero_spread_pairs_excluded"] == 1 and p["H_fall"] == pytest.approx(np.log(2))
+    # same direction: identical heads that hit the target exactly are no miss
+    s10, f10, n10 = _pairs(W=10)
+    zeros = {k: np.zeros((1, 5, 10, 45)) for k in ("fall", "nonfall")}
+    hr = cc.head_readout(zeros, {k: np.zeros((1, 5, 10)) for k in zeros}, {k: np.zeros((10, 1, 45)) for k in zeros},
+                         {k: v.astype(np.float64) for k, v in STATS.items()}, (25,), (s10, f10, n10, 50, 0))
+    assert hr["d25"]["sum"]["fall"]["same_direction"] == 0.0 and hr["d25"]["sum"]["fall"]["advantage"] == [0.0] * 5
+
+
+def test_unstable_denominator_suppresses_the_ratio_and_p3():
+    W = 200
+    strata = np.array(["A"] * W)
+    cf, cn = np.array([f"A/f{i}" for i in range(W)]), np.array([f"A/n{i}" for i in range(W)])
+    h_f, h_n = np.full(W, 2.0), np.ones(W)
+    h_n[0] = -55.0          # CI above 0 (3 copies: 0.16), but ~2 % of draws hold it 4+ times: denominator <= 0
+    r = cc.c0_interval(h_f, h_n, strata, cf, cn, n_boot=2000)
+    assert r["H_nonfall_ci"][0] > 0 and not r["nonfall_ci_includes_0"]
+    assert r["nonpositive_denominator_draws"] > 0 and r["unstable_denominator"]
+    txt = cc._c0_text(r)
+    assert txt.startswith("fall - non-fall 1.280") and "UNSTABLE DENOMINATOR" in txt and f"{r['ratio']:.2f}" not in txt
+    r0 = cc.c0_interval(h_f, np.random.default_rng(0).normal(0, 1, W), strata, cf, cn, n_boot=300)
+    assert r0["nonfall_ci_includes_0"] and r0["unstable_denominator"] and "UNSTABLE DENOMINATOR" in cc._c0_text(r0)
+    rs = cc.c0_interval(h_f, np.full(W, .5), strata, cf, cn, n_boot=300)
+    assert not rs["unstable_denominator"] and "ratio 4.00 [4.000, 4.000]" in cc._c0_text(rs)
+    g = {k: dict(joint_miss_fall=.1) for k in cc.SIX + ("sum",)}
+    tab = lambda b: {"imag/d25": g, "c0_point": dict(ratio=b["ratio"]), "imag_over_ctx_fall": .5, "c0_interval": b}
+    p = cc.predictions({"ETH": tab(rs), "E1V": tab(r), "E1R2": tab(rs)})
+    assert p["P3"]["per_pair"] == {"E1V<ETH": None, "E1R2<ETH": False} and p["P3"]["held"] is None
+    assert p["P3_difference"]["per_pair"] == {"E1V<ETH": True, "E1R2<ETH": False}
+
+
+def test_which_side_reproduces_the_points():
+    strata, cf, cn = _pairs()
+    one = lambda v, P=1: np.full((P, 24), float(v))
+    met = lambda u, e, P=1: {g: dict(e=one(e / 2, P), e_phys=one(e, P), u=one(u, P), coverage=one(.5, P),
+                                     outside=one(0, P)) for g in cc.GROUPS}
+    boot = (strata, cf, cn, 200, 0)
+    # ETH, 26 Nov, sum group, d25: geomean u ctx 12.546 / 5.35, imag 3.250 / 2.95
+    table = {"ctx/d25": cc.shares(met(12.546, .8), met(5.35, .3), met(5.35, .3), boot),
+             "imag/d25": cc.shares(met(3.25, 1.2, 5), met(2.95, .5, 5), met(2.95, .5, 5), boot)}
+    ws = cc.which_side(table, (0, 25))
+    assert list(ws) == ["d25"]
+    r = ws["d25"]
+    assert r["H_fall"] == pytest.approx(1.351, abs=5e-4) and r["H_nonfall"] == pytest.approx(np.log(5.35 / 2.95))
+    assert r["ctx"]["log_u_diff"] == pytest.approx(np.log(12.546 / 5.35)) and r["ctx"]["log_u_diff_ci"] == pytest.approx([np.log(12.546 / 5.35)] * 2)
+    assert r["imag"]["e_phys_fall"] == pytest.approx(1.2) and r["imag"]["e_phys_diff_ci"] == pytest.approx([.7, .7])
+    line = "\n".join(cc._side_lines("ETH", "pooled", ws))
+    assert "geomean u ctx 12.55/5.35 imag 3.25/2.95 | H fall 1.351" in line
+
+
+def test_leave_one_head_out_known_answers():
+    strata, cf, cn = _pairs()
+    W, D = 24, 2
+    stats = {k: v.astype(np.float64) for k, v in STATS.items()}
+    c = np.array([.1, -.1, .2, 5.0, -.2])                   # head 3 far off: the 5-head mean misses by 1 (normalized)
+    ctx = {k: np.broadcast_to(s * c[None, None, :, None, None], (1, D, 5, W, 45)).copy() for k, s in (("fall", 2.), ("nonfall", 1.))}
+    imag = {k: np.broadcast_to(ctx[k] * (.5 if k == "fall" else 1.), (5, D, 5, W, 45)).copy() for k in ctx}
+    r = cc.leave_one_out({k: dict(ctx=ctx[k], imag=imag[k]) for k in ctx}, {k: np.zeros((W, D, 45)) for k in ctx},
+                         stats, (16, 25), (strata, cf, cn, 200, 0))
+    assert set(r) == {"all"} | {f"without_h{i}" for i in range(5)}
+    e = lambda s, k: r[s]["e_phys"]["d25"]["sum"][k]
+    assert e("all", "fall") == pytest.approx(4.0) and e("all", "nonfall") == pytest.approx(2.0)     # state_std 2
+    assert e("without_h3", "fall") == pytest.approx(0, abs=1e-12) and e("without_h0", "nonfall") == pytest.approx(2 * 4.9 / 4)
+    assert r["without_h3"]["e_phys"]["d16"]["gravity"]["nonfall"] == pytest.approx(0, abs=1e-12)
+    for s in r:            # spread halves in imagination on falls only: fall - non-fall H = log 2 for every 4-head set
+        for d in (16, 25):
+            w = r[s][f"warning_d{d}"]
+            assert w["difference"] == pytest.approx(np.log(2)) and w["difference_ci"] == pytest.approx([np.log(2)] * 2)
+            assert w["auroc_u_ctx"] == 1.0 and w["pairs"] == 24       # u_ctx(fall) = 2 u_ctx(non-fall) everywhere
+    assert any(x.startswith("  LOO ETH batchA without_h3: e_phys sum (d16/d25) fall 0.000/0.000")
+               for x in cc._loo_lines("ETH", "batchA", r))
