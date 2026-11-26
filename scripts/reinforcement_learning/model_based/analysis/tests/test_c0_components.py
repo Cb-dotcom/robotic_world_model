@@ -387,5 +387,6 @@ def test_leave_one_head_out_known_answers():
             w = r[s][f"warning_d{d}"]
             assert w["difference"] == pytest.approx(np.log(2)) and w["difference_ci"] == pytest.approx([np.log(2)] * 2)
             assert w["auroc_u_ctx"] == 1.0 and w["pairs"] == 24       # u_ctx(fall) = 2 u_ctx(non-fall) everywhere
+            assert w["auroc_u_imag"] == 0.5     # imagined spread equal on falls and non-falls: no imagination-time warning
     assert any(x.startswith("  LOO ETH batchA without_h3: e_phys sum (d16/d25) fall 0.000/0.000")
                for x in cc._loo_lines("ETH", "batchA", r))

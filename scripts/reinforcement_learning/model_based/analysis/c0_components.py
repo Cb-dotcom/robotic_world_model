@@ -375,9 +375,11 @@ def leave_one_out(arms, target, stats, depths, boot, warn_depths=(16, 25)):
     W, 45]}}, target {kind: [W, D, 45]} normalized. Dropping head h is exact in both arms: on recorded context every
     head reads the same rows, and imagined path p is driven by head p alone, so the 4-head ensemble keeps paths p != h
     and heads != h. Per set ("all" = every head, "without_h<i>"): ensemble-mean physical RMS error on recorded context
-    (per group and depth, fall and non-fall); warning quality at d16 and d25 = Part B's fall - non-fall H with its
-    interval (c0_interval), and the AUROC of the summed spread u_ctx for falls vs non-falls (go2_c0_check.auroc,
-    average ranks for ties). A better ensemble mean can still give a worse warning."""
+    (per group and depth, fall and non-fall); at d16 and d25 (keys "warning_d*", kept for the 26 Nov outputs): the C0
+    gap = Part B's fall - non-fall H with its interval (c0_interval), the AUROC of the summed spread on RECORDED
+    context u_ctx (not available inside imagination), and the AUROC of the imagination-time spread u_imag (geometric
+    mean over the driving paths, as in H; the only one of these a policy sees while imagining). AUROCs: falls vs
+    non-falls, go2_c0_check.auroc (average ranks for ties). A better ensemble mean can still give a worse warning."""
     from go2_c0_check import auroc
     n = arms["fall"]["ctx"].shape[2]
     out = {}
@@ -391,9 +393,12 @@ def leave_one_out(arms, target, stats, depths, boot, warn_depths=(16, 25)):
             if d in warn_depths:
                 u = {k: m[k]["ctx"][di]["sum"]["u"][0] for k in m}
                 b = c0_interval(*(window_h(u[k], m[k]["imag"][di]["sum"]["u"]) for k in ("fall", "nonfall")), *boot)
+                li = {k: log_spread(m[k]["imag"][di]["sum"]["u"]).mean(0) for k in m}   # [W]; NaN on a zero spread
+                li = {k: v[np.isfinite(v)] for k, v in li.items()}
                 row[f"warning_d{d}"] = dict({k: b[k] for k in ("difference", "difference_ci", "H_fall", "H_nonfall",
                                                                 "pairs", "zero_spread_pairs_excluded")},
-                                            auroc_u_ctx=auroc(u["fall"], u["nonfall"]))
+                                            auroc_u_ctx=auroc(u["fall"], u["nonfall"]),
+                                            auroc_u_imag=auroc(li["fall"], li["nonfall"]))
         out["all" if drop is None else f"without_h{drop}"] = row
     return out
 
@@ -709,10 +714,11 @@ def _loo_lines(name, src, loo):
         ef = "/".join(f"{e[d]['sum']['fall']:.3f}" for d in e)
         en = "/".join(f"{e[d]['sum']['nonfall']:.3f}" for d in e)
         grp = " ".join(f"{g} {e[last][g]['fall']:.3f}|{e[last][g]['nonfall']:.3f}" for g in SIX)
-        warn = "; ".join(f"{k[8:]} dH {w['difference']:.3f} {_ci(w['difference_ci'])} AUROC {w['auroc_u_ctx']:.3f}"
+        warn = "; ".join(f"{k[8:]} gap dH {w['difference']:.3f} {_ci(w['difference_ci'])} AUROC recorded "
+                         f"{w['auroc_u_ctx']:.3f} imagined {w['auroc_u_imag']:.3f}"
                          for k, w in r.items() if k.startswith("warning_"))
         lines.append(f"  LOO {name} {src} {s}: e_phys sum ({'/'.join(e)}) fall {ef} | non-fall {en}; {last} {grp}; "
-                     f"warning {warn}")
+                     f"{warn}")
     return lines
 
 
@@ -801,7 +807,8 @@ def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, head
                     hl.append(f"  {n} {src} {d} sum {kind} advantage: " + " ".join(
                         f"h{i} {a:+.3f} {_ci(c)}" for i, (a, c) in enumerate(zip(x["advantage"], x["advantage_ci"]))))
         hl.append("LEAVE ONE HEAD OUT (recorded context; e_phys = ensemble-mean physical RMS error, sum, per depth, "
-                  "fall | non-fall; groups at the last depth; warning = fall - non-fall H [95 %] and AUROC of u_ctx)")
+                  "fall | non-fall; groups at the last depth; gap dH = C0 fall - non-fall H [95 %]; AUROC falls vs "
+                  "non-falls of the spread on recorded context (not seen in imagination) and of the imagined spread)")
         for n, h in hscopes.items():
             for src, hs in each(h):
                 hl += _loo_lines(n, src, hs["leave_one_out"])
