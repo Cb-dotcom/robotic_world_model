@@ -18,6 +18,9 @@ found in step 1 and are for orientation only.
 
 This script measures. It does not decide. Without --max-rel-err it prints no
 PASS/FAIL: the V-gate pass bar is Charbel's decision (CLAUDE.md rule 8).
+A source gets PASS or FAIL only when every listed run gave it a finite ratio; a run
+that is missing, errored (no walk, walk shorter than --min-walk-s, zero tape) or NaN
+makes it INVALID. Exit 1 when any run errored or any verdict is INVALID.
 
 Runs are given as a CSV (header: bag,tape_start_m,tape_end_m[,note,lat_start_m,lat_end_m,leg])
 or with repeated --run BAG START_M END_M. lat_* = signed sideways offset (m, left +) of the
@@ -91,12 +94,16 @@ def analyse_run(bag: str, tape_start: float, tape_end: float, args, lat_start: f
     along, lateral = abs(tape_end - tape_start), lat_end - lat_start
     tape = float(np.hypot(along, lateral))  # true straight-line displacement of the reading point
     out.update(tape_along_m=along, tape_lateral_m=lateral, tape_m=tape)
+    if not tape > 0:
+        raise ValueError(f"tape displacement {tape} m: no run")
     sp = go2_bag.read_topic(bag, SPORT, stride=args.stride)
     t = sp.t
     vel_b = sp.cols["velocity"]
     speed = np.hypot(vel_b[:, 0], vel_b[:, 1])
     s, e = find_walk(t, speed, args.move_thresh, args.merge_s, leg, args.min_walk_s)
     t0, t1 = t[s], t[e - 1]
+    if t1 - t0 < args.min_walk_s:
+        raise ValueError(f"walk {t1 - t0:.2f} s is shorter than --min-walk-s {args.min_walk_s} s")
     out.update(walk_t0_s=float(t0 - t[0]), walk_s=float(t1 - t0))
     out["tape_speed_mps"] = tape / (t1 - t0) if t1 > t0 else float("nan")
 
@@ -171,23 +178,32 @@ def load_runs(args) -> list[tuple]:
 
 
 def summarize(rows: list[dict], max_rel_err: float | None) -> tuple[dict, list[str]]:
+    """rows = every expected run, errored ones included (they count as not measured)."""
+    n_exp = len(rows)
     names = sorted({k for r in rows for k in r.get("sources", {})})
     summ, lines = {}, []
-    lines.append(f"{'source':28s} {'n':>2s} {'ratio mean':>10s} {'min':>7s} {'max':>7s} {'max |err| %':>11s}")
+    lines.append(f"{'source':28s} {'n/exp':>5s} {'ratio mean':>10s} {'min':>7s} {'max':>7s} {'max |err| %':>11s}")
     for n in names:
-        rs = np.array([r["sources"][n]["ratio"] for r in rows if n in r.get("sources", {})], dtype=float)
+        rs = np.array([r.get("sources", {}).get(n, {}).get("ratio", np.nan) for r in rows], dtype=float)
+        n_bad = int((~np.isfinite(rs)).sum())  # errored run, source absent, or NaN ratio
         rs = rs[np.isfinite(rs)]
         if rs.size == 0:
-            summ[n] = {"n": 0}
-            lines.append(f"{n:28s} {0:2d}  (no usable runs)")
+            summ[n] = {"n": 0, "n_expected": n_exp}
+            if max_rel_err is not None:
+                summ[n]["verdict"] = "INVALID"
+            lines.append(f"{n:28s} {'0/' + str(n_exp):>5s}  (no usable runs)"
+                         + ("  INVALID" if max_rel_err is not None else ""))
             continue
         worst = float(np.max(np.abs(rs - 1.0)) * 100)
-        summ[n] = {"n": int(rs.size), "ratio_mean": float(rs.mean()), "ratio_min": float(rs.min()),
-                   "ratio_max": float(rs.max()), "max_abs_err_pct": worst}
+        summ[n] = {"n": int(rs.size), "n_expected": n_exp, "ratio_mean": float(rs.mean()),
+                   "ratio_min": float(rs.min()), "ratio_max": float(rs.max()), "max_abs_err_pct": worst}
         if max_rel_err is not None:
-            summ[n]["verdict"] = "PASS" if worst <= max_rel_err * 100 else "FAIL"
-        lines.append(f"{n:28s} {rs.size:2d} {rs.mean():10.3f} {rs.min():7.3f} {rs.max():7.3f} {worst:11.1f}"
-                     + (f"  {summ[n]['verdict']}" if max_rel_err is not None else ""))
+            summ[n]["verdict"] = "INVALID" if n_bad else ("PASS" if worst <= max_rel_err * 100 else "FAIL")
+        lines.append(f"{n:28s} {f'{rs.size}/{n_exp}':>5s} {rs.mean():10.3f} {rs.min():7.3f} {rs.max():7.3f} "
+                     f"{worst:11.1f}" + (f"  {summ[n]['verdict']}" if max_rel_err is not None else ""))
+    n_err = sum("error" in r for r in rows)
+    if n_err:
+        lines.append(f"{n_err} of {n_exp} runs not analysed (ERROR above): no source can PASS.")
     if max_rel_err is None:
         lines.append("No pass bar given (--max-rel-err): descriptive only. The V-gate bar is Charbel's decision.")
     return summ, lines
@@ -231,8 +247,7 @@ def main(argv=None) -> int:
             f"({r['tape_speed_mps']:.3f} m/s), cmd vx {r.get('cmd_vx_median', float('nan')):.2f}, "
             f"est vx {r['mean_vx_body_mps']:.3f}, yaw drift {r['yaw_drift_deg']:+.1f} deg | ratio {src}"
         )
-    ok = [r for r in rows if "error" not in r]
-    summ, slines = summarize(ok, args.max_rel_err)
+    summ, slines = summarize(rows, args.max_rel_err)
     lines += ["", *slines]
     text = "\n".join(lines) + "\n"
     (out / "v_check.txt").write_text(text)
@@ -242,7 +257,8 @@ def main(argv=None) -> int:
                                                                 if k not in ("run",)}},
                                                   indent=2, default=float))
     print(text, end="")
-    return 0 if ok else 1
+    bad = any("error" in r for r in rows) or any(v.get("verdict") == "INVALID" for v in summ.values())
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

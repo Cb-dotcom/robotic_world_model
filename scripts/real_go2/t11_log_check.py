@@ -11,8 +11,9 @@ Joint topics: gaps where ALL topics stop together (H0 saw up to 92 ms).
 50 Hz emulation (contract §1): a policy loop at 20 ms reads the newest /lowstate.
 The interval between the states it gets is the step interval:
   > 30 ms  -> step flagged;  > 100 ms -> segment ends.
-Usable windows = 58 consecutive steps (32 context + 26 rows) with no flagged step,
-counted both as non-overlapping windows and as sliding start positions.
+A step that reuses the previous step's state (no new message: same sample, same
+timestamp or same tick) is stale. Usable windows = 58 consecutive steps (32 context
++ 26 rows) with no flagged and no stale step, counted both as non-overlapping windows and as sliding start positions.
 
 This measures the bag. It does not decide. Thresholds are the contract's.
 """
@@ -53,8 +54,8 @@ def gap_stats(t_ns: np.ndarray) -> dict:
     return out
 
 
-def emulate_policy_steps(t_state: np.ndarray) -> dict:
-    """50 Hz loop reading the newest state. t_state in seconds, sorted."""
+def emulate_policy_steps(t_state: np.ndarray, tick: np.ndarray | None = None) -> dict:
+    """50 Hz loop reading the newest state. t_state in seconds, sorted; tick = LowState.tick per state."""
     t0, t1 = t_state[0], t_state[-1]
     grid = np.arange(t0 + STEP_S, t1 + 1e-9, STEP_S)
     idx = np.searchsorted(t_state, grid, side="right") - 1
@@ -62,8 +63,12 @@ def emulate_policy_steps(t_state: np.ndarray) -> dict:
     interval = np.diff(np.r_[t_state[0], used])
     flagged = interval > FLAG_S
     seg_end = interval > END_S
-    # windows: runs of unflagged steps (a flagged step breaks the run)
-    ok = ~flagged
+    stale = interval == 0  # same sample or same timestamp as the previous step
+    if tick is not None:
+        tk = np.asarray(tick)
+        stale |= np.diff(np.r_[tk[0], tk[idx]]) == 0
+    # windows: runs of unflagged, non-stale steps (either breaks the run)
+    ok = ~flagged & ~stale
     runs = []
     d = np.diff(np.r_[0, ok.astype(np.int8), 0])
     for s, e in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
@@ -75,6 +80,7 @@ def emulate_policy_steps(t_state: np.ndarray) -> dict:
         "segment_ends_gt_100ms": int(seg_end.sum()),
         "segments": int(seg_end.sum()) + 1,
         "repeated_state_steps": int((interval == 0).sum()),
+        "stale_reused_steps": int(stale.sum()),
         "max_step_interval_ms": float(interval.max() * 1e3) if len(interval) else float("nan"),
         "usable_windows_nonoverlap": int((runs // WINDOW).sum()) if runs.size else 0,
         "usable_window_starts_sliding": int(np.clip(runs - WINDOW + 1, 0, None).sum()) if runs.size else 0,
@@ -116,7 +122,7 @@ def analyse(bag: str, stride_temp: int) -> dict:
             "messages_lost_by_tick": lost,
             "rx_gaps_gt_20ms_with_continuous_tick": late_not_lost,
         }
-        res["policy_50hz"] = emulate_policy_steps(lo.t)
+        res["policy_50hz"] = emulate_policy_steps(lo.t, tick)
         temp = lo.cols["temperature"][::max(stride_temp, 1)]
         res["motor_temp_max_c_sim_order"] = dict(
             zip(go2_bag.SIM_JOINT_NAMES, temp[:, go2_bag.SIM_FROM_SDK].max(0).tolist()))
@@ -155,7 +161,8 @@ def render(res: dict) -> str:
         p = res["policy_50hz"]
         L.append(f"50 Hz emulation: {p['steps']} steps, {p['flagged_steps_gt_30ms']} flagged (> 30 ms), "
                  f"{p['segment_ends_gt_100ms']} segment ends (> 100 ms), max interval {p['max_step_interval_ms']:.1f} ms, "
-                 f"{p['repeated_state_steps']} steps reused the previous state")
+                 f"{p['repeated_state_steps']} steps reused the previous state, "
+                 f"{p['stale_reused_steps']} stale steps (same sample or tick; excluded from windows)")
         L.append(f"  usable 58-step windows: {p['usable_windows_nonoverlap']} non-overlapping, "
                  f"{p['usable_window_starts_sliding']} sliding starts, "
                  f"{100 * p['usable_fraction_of_steps']:.1f} % of steps inside a usable run")
