@@ -41,7 +41,7 @@ def episodes_for(envs, steps, n_falls, startup_falls=0, seed=0):
 
 
 def write_cell(folder, envs=4, steps=2000, n_falls=5, startup_falls=0, seed=42, cmd=10, friction=0.3, speed=0.9,
-               track=0.85, exposure="auto", task=sc.TASK, push=True, drop_env_rows=0, seed_data=0):
+               track=0.85, exposure="auto", task=sc.TASK, push=False, drop_env_rows=0, seed_data=0):
     folder.mkdir(parents=True)
     eps = episodes_for(envs, steps, n_falls, startup_falls, seed_data)
     if drop_env_rows:
@@ -104,7 +104,7 @@ def test_incomplete_or_mismatched_cells_are_rejected(tmp_path):
         "exposure": dict(U8=dict(exposure=999.0)),
         "friction": dict(D7=dict(friction=0.45)),
         "task": dict(S2=dict(task="Template-Isaac-Velocity-Flat-Unitree-Go2-Pretrain-v0")),
-        "push": dict(F8=dict(push=False)),
+        "push": dict(F8=dict(push=True)),
     }
     for name, kw in cases.items():
         new, ref, _ = make_all(tmp_path / name, envs=4, steps=2000, **kw)

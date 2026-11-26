@@ -6,7 +6,7 @@ Cells: <dir>/<TAG>_cmd<C>_s<seed>/{episodes_summary.json, episodes.csv} as eval_
 F8 and U8 come from the D8 run's eval folder; D7 and S2 from their saved evaluations (D7's run, a4_d7_1123b).
 
 Every cell is validated before any number is used (a failure stops the scorer; exit 3):
-  protocol   task, num_envs, num_steps, seed (= the folder's), std, cmd_resample_s (= the folder's), push enabled,
+  protocol   task, num_envs, num_steps, seed (= the folder's), std, cmd_resample_s (= the folder's), pushes off,
              friction shift verified at the expected factor; equal across all policies of a schedule;
   complete   per env, the episode lengths in episodes.csv add up to num_steps (every step of every env is in exactly
              one episode, censored ones included), so the cell is not a partial run;
@@ -79,8 +79,9 @@ def validate_cell(folder, cmd, seed, friction, envs=ENVS, steps=STEPS, std=STD, 
         same = (got is not None and float(got) == float(v)) if k != "task" else got == v
         if not same:
             raise CellInvalid(f"{folder}: {k} = {got!r}, expected {v!r}")
-    if not (summ.get("push_robot") or {}).get("enabled", False):
-        raise CellInvalid(f"{folder}: push_robot not enabled (the G6 protocol keeps pushes)")
+    # G6 = Go2-Start-v0, no pushes (A3; run-log 21 Oct); a missing record is rejected too
+    if (summ.get("push_robot") or {}).get("enabled", True):
+        raise CellInvalid(f"{folder}: push_robot enabled or not recorded (the G6 protocol has no pushes)")
     fs = summ.get("friction_shift") or {}
     if not fs.get("verified") or abs(float(fs.get("factor", math.nan)) - friction) > 1e-9:
         raise CellInvalid(f"{folder}: friction shift {fs} is not a verified x{friction}")
