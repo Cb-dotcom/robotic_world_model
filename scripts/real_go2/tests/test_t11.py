@@ -24,6 +24,8 @@ TS = go2_bag.TYPESTORE
 SPORT_T = "unitree_go/msg/SportModeState"
 LOW_T = "unitree_go/msg/LowState"
 CMD_T = "unitree_go/msg/LowCmd"
+ODOM_T = "nav_msgs/msg/Odometry"
+REQ_T = "unitree_api/msg/Request"
 
 
 def write_bag(path: Path, topic: str, msgtype: str, msgs: list[tuple[int, object]]) -> str:
@@ -72,18 +74,30 @@ def h2_bag(path: Path, kp: float, kd: float, lag_s: float = 0.010, gain: float =
     return write_bag_multi(path, {"/lowcmd": (CMD_T, cmds), "/lowstate": (LOW_T, states)})
 
 
-def sport_bag(path: Path, walk_s: float, v: float = 0.5, still_s: float = 1.0, hz: float = 50.0) -> str:
-    """Still, straight walk along x at v m/s (body = world, yaw 0), still."""
+def sport_bag(path: Path, walk_s: float, v: float = 0.5, still_s: float = 1.0, hz: float = 50.0,
+              point_lio: float | None = None, cmd: float | None = None) -> str:
+    """Still, straight walk along x at v m/s (body = world, yaw 0), still.
+    point_lio = scale of a Point-LIO Odometry track (x * scale); cmd = Move x on /api/sport/request in the walk."""
     t = np.arange(0.0, still_s + walk_s + still_s, 1.0 / hz)
     vel = np.where((t >= still_s) & (t < still_s + walk_s), v, 0.0)
     x = np.r_[0.0, np.cumsum(vel[:-1]) / hz]
-    msgs = []
+    streams = {vc.SPORT: (SPORT_T, []), vc.POINT_LIO: (ODOM_T, []), vc.REQUEST: (REQ_T, [])}
     for ti, vi, xi in zip(t, vel, x):
+        t_ns = int(1e9 + ti * 1e9)
         m = go2_bag.default_message(SPORT_T)
         m.velocity[:] = (vi, 0.0, 0.0)
         m.position[:] = (xi, 0.0, 0.0)
-        msgs.append((int(1e9 + ti * 1e9), m))
-    return write_bag(path, vc.SPORT, SPORT_T, msgs)
+        streams[vc.SPORT][1].append((t_ns, m))
+        if point_lio is not None:
+            o = go2_bag.default_message(ODOM_T)
+            o.pose.pose.position.x = xi * point_lio
+            streams[vc.POINT_LIO][1].append((t_ns, o))
+        if cmd is not None and vi > 0:
+            q = go2_bag.default_message(REQ_T)
+            q.header.identity.api_id = go2_bag.SPORT_API_MOVE
+            q.parameter = json.dumps({"x": cmd, "y": 0.0, "z": 0.0})
+            streams[vc.REQUEST][1].append((t_ns, q))
+    return write_bag_multi(path, {k: v for k, v in streams.items() if v[1]})
 
 
 # --- layout and maps --------------------------------------------------------------
@@ -200,12 +214,74 @@ def test_h2_refuses_unitree_gains(tmp_path):
 
 
 # --- velocity check ----------------------------------------------------------------
-def test_v_check_recovers_tape_and_passes_with_bar(tmp_path):
-    bag = sport_bag(tmp_path / "w", walk_s=4.0)  # 2.0 m
-    rc = vc.main(["--run", bag, "0.50", "2.52", "--out", str(tmp_path / "o"), "--max-rel-err", "0.05"])
+def v_run(tmp_path, bags, *extra):
+    """bags: [path] each walked 5 m (tape 0 -> 5). Returns (exit code, json, text)."""
+    o = tmp_path / "o"
+    argv = [a for b in bags for a in ("--run", b, "0.0", "5.0")] + ["--out", str(o), *extra]
+    rc = vc.main(argv)
+    return rc, json.loads((o / "v_check.json").read_text()), (o / "v_check.txt").read_text()
+
+
+def v_set(tmp_path, point_lio=1.02, n=3, tag=""):
+    """The prescribed set: n bags at 0.30 and n at 0.45 m/s, 5 m walks (20 Hz keeps the test fast)."""
+    return [sport_bag(tmp_path / f"w{int(v * 100):03d}_{i}{tag}", walk_s=5.0 / v, v=v, hz=20.0,
+                      point_lio=point_lio, cmd=v) for v in (0.30, 0.45) for i in range(1, n + 1)]
+
+
+def test_v_check_recovers_tape_one_unitree_run_is_not_pass(tmp_path):
+    bag = sport_bag(tmp_path / "w", walk_s=4.0)  # 2.0 m, /sportmodestate only
+    rc = vc.main(["--run", bag, "0.50", "2.52", "--out", str(tmp_path / "o")])
     out = json.loads((tmp_path / "o" / "v_check.json").read_text())
     assert out["runs"][0]["sources"]["sport_pos"]["ratio"] == pytest.approx(2.0 / 2.02, abs=0.01)
-    assert out["summary"]["sport_pos"]["verdict"] == "PASS" and rc == 0
+    assert out["gate"]["status"] == "DIAGNOSTIC ONLY" and rc == 2
+    assert "PASS" not in (tmp_path / "o" / "v_check.txt").read_text()
+
+
+def test_v_gate_one_run_with_point_lio_is_not_pass(tmp_path):
+    rc, out, text = v_run(tmp_path, [sport_bag(tmp_path / "w030_1", 5.0 / 0.3, v=0.3, hz=20.0,
+                                               point_lio=1.0, cmd=0.3)])
+    assert out["runs"][0]["sources"][vc.POINT_LIO]["ratio"] == pytest.approx(1.0, abs=0.01)
+    assert rc == 2 and out["gate"]["status"] == "DIAGNOSTIC ONLY" and "PASS" not in text
+    assert "1 of 3 bags at commanded 0.30 m/s" in text and "0 of 3 bags at commanded 0.45 m/s" in text
+
+
+def test_v_gate_unitree_sources_only_is_not_pass(tmp_path):
+    rc, out, text = v_run(tmp_path, v_set(tmp_path, point_lio=None))
+    assert out["summary"]["sport_pos"]["max_abs_err_pct"] < 2.0  # Unitree within 5 %, still not the gate
+    assert rc == 2 and out["gate"]["status"] == "DIAGNOSTIC ONLY" and "PASS" not in text
+    assert out["gate"]["reasons"] == [next(r for r in out["gate"]["reasons"] if "no Point-LIO" in r)]
+
+
+def test_v_gate_full_set_within_5_pct_passes_and_6_pct_fails(tmp_path):
+    good = v_set(tmp_path)
+    rc, out, text = v_run(tmp_path, good)
+    assert out["summary"][vc.POINT_LIO]["max_abs_err_pct"] == pytest.approx(2.0, abs=0.5)  # walk 5.01 m (20 Hz steps)
+    assert rc == 0 and out["gate"] == {"status": "PASS", "reasons": []}
+    assert "V GATE (Point-LIO vs tape, every run within 5 %): PASS" in text
+    bad = sport_bag(tmp_path / "w045_3b", walk_s=5.0 / 0.45, v=0.45, hz=20.0, point_lio=1.06, cmd=0.45)
+    rc, out, _ = v_run(tmp_path, good[:-1] + [bad])
+    assert rc == 0 and out["gate"]["status"] == "FAIL"
+    # the bar can be overridden only as a diagnostic
+    rc, out, _ = v_run(tmp_path, good[:-1] + [bad], "--max-rel-err", "0.10")
+    assert rc == 2 and out["gate"]["status"] == "DIAGNOSTIC ONLY" and "is not the decided 5 %" in out["gate"]["reasons"][0]
+
+
+def test_v_gate_point_lio_missing_in_one_run_is_invalid(tmp_path):
+    runs = v_set(tmp_path)
+    runs[0] = sport_bag(tmp_path / "w030_1x", walk_s=5.0 / 0.3, v=0.3, hz=20.0, cmd=0.3)  # no Point-LIO
+    rc, out, text = v_run(tmp_path, runs)
+    assert rc == 1 and out["gate"]["status"] == "INVALID"
+    assert "Point-LIO ratio missing in 1 of 6 runs" in text
+
+
+def test_v_gate_4m_line_is_not_official():
+    rows = [{"bag": f"w{v}_{i}", "tape_m": 4.0, "cmd_vx_median": s, "sources": {vc.POINT_LIO: {"ratio": 1.0}}}
+            for v, s in (("030", 0.30), ("045", -0.45)) for i in range(3)]  # backward legs command -x
+    status, why = vc.v_gate(rows, vc.summarize(rows)[0], vc.V_BAR)
+    assert status == "DIAGNOSTIC ONLY" and len(why) == 6 and "protocol line 5 m" in why[0]
+    for r in rows:
+        r["tape_m"] = 4.9
+    assert vc.v_gate(rows, vc.summarize(rows)[0], vc.V_BAR) == ("PASS", [])
 
 
 def test_v_check_missing_short_or_nan_run_is_never_pass(tmp_path):
@@ -213,17 +289,15 @@ def test_v_check_missing_short_or_nan_run_is_never_pass(tmp_path):
     short = sport_bag(tmp_path / "s", walk_s=1.0)  # < --min-walk-s 1.5
     o = tmp_path / "o"
     rc = vc.main(["--run", good, "0.5", "2.5", "--run", short, "0.5", "1.0", "--run", str(tmp_path / "gone"),
-                  "0.5", "2.5", "--out", str(o), "--max-rel-err", "0.05"])
+                  "0.5", "2.5", "--out", str(o)])
     out = json.loads((o / "v_check.json").read_text())
     assert rc == 1
     assert "shorter than --min-walk-s" in out["runs"][1]["error"] and "error" in out["runs"][2]
-    assert out["summary"]["sport_pos"] == {**out["summary"]["sport_pos"], "n": 1, "n_expected": 3,
-                                           "verdict": "INVALID"}
+    assert out["summary"]["sport_pos"] == {**out["summary"]["sport_pos"], "n": 1, "n_expected": 3}
+    assert out["gate"]["status"] == "INVALID"
     assert "2 of 3 runs not analysed" in (o / "v_check.txt").read_text()
-    # NaN ratio or a source absent in one run: INVALID even though the finite ratios are perfect
-    ok = {"sources": {"a": {"ratio": 1.0}, "b": {"ratio": 1.0}}}
-    nan = {"sources": {"a": {"ratio": float("nan")}}}
-    summ, _ = vc.summarize([ok, nan], 0.05)
-    assert summ["a"]["verdict"] == "INVALID" and summ["b"]["verdict"] == "INVALID"
-    assert vc.summarize([ok, ok], 0.05)[0]["a"]["verdict"] == "PASS"
-    assert vc.summarize([ok, nan], None)[0]["a"].get("verdict") is None  # no bar: still no verdict
+    # NaN Point-LIO ratio in one run: INVALID even though the finite ratios are perfect
+    ok = {"bag": "a", "tape_m": 5.0, "cmd_vx_median": 0.3, "sources": {vc.POINT_LIO: {"ratio": 1.0}}}
+    nan = {**ok, "sources": {vc.POINT_LIO: {"ratio": float("nan")}}}
+    assert vc.v_gate([ok, nan], vc.summarize([ok, nan])[0], vc.V_BAR)[0] == "INVALID"
+    assert vc.v_gate([ok, ok], vc.summarize([ok, ok])[0], vc.V_BAR)[0] == "DIAGNOSTIC ONLY"  # 1 bag only

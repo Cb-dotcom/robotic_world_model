@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """T11 velocity check (V gate input): taped straight walks vs the robot's speed sources.
 
-For each run (one bag + tape readings of the head front edge at start and end):
+For each run (one bag + tape readings of one robot point at start and end; 18 Nov rule:
+the front-left foot):
   1. Find the walk: the longest segment where the /sportmodestate speed is above
      --move-thresh (short dips below it are merged).
   2. Take the robot pose while it stands still before and after the walk
@@ -16,11 +17,16 @@ For each run (one bag + tape readings of the head front edge at start and end):
 The ratio does not depend on the walk timing. Speeds (m/s) use the walk duration
 found in step 1 and are for orientation only.
 
-This script measures. It does not decide. Without --max-rel-err it prints no
-PASS/FAIL: the V-gate pass bar is Charbel's decision (CLAUDE.md rule 8).
-A source gets PASS or FAIL only when every listed run gave it a finite ratio; a run
-that is missing, errored (no walk, walk shorter than --min-walk-s, zero tape) or NaN
-makes it INVALID. Exit 1 when any run errored or any verdict is INVALID.
+Official V-gate verdict (decisions-log 18 Nov 2026, both V rows), from the Point-LIO source only:
+  PASS / FAIL    the prescribed set is complete (>= 3 bags at each commanded speed 0.30 and
+                 0.45 m/s, from /api/sport/request Move x), every run has a tape distance of the
+                 5 m line (+-0.5 m), Point-LIO is in every run, bar 5 %; PASS = every run within 5 %.
+  INVALID        a listed run is missing or errored, or Point-LIO has no finite ratio in a run.
+  DIAGNOSTIC ONLY: <reasons>   anything else (too few runs, no Point-LIO in any bag, another
+                 line length, --max-rel-err other than 0.05). Ratios are printed, never PASS.
+/sportmodestate and /utlidar/robot_odom are one Unitree estimate: reported, never the gate.
+Exit 0 = official verdict (PASS or FAIL, read the V GATE line), 1 = INVALID (as before),
+2 = no official verdict (DIAGNOSTIC ONLY).
 
 Runs are given as a CSV (header: bag,tape_start_m,tape_end_m[,note,lat_start_m,lat_end_m,leg])
 or with repeated --run BAG START_M END_M. lat_* = signed sideways offset (m, left +) of the
@@ -43,6 +49,17 @@ import go2_bag  # noqa: E402
 
 SPORT = "/sportmodestate"
 REQUEST = "/api/sport/request"
+
+# V gate, decisions-log 18 Nov 2026: Point-LIO vs a measured 5 m line, keyboard teleop 0.30 and
+# 0.45 m/s, 3 runs each; pass = every run within 5 %.
+POINT_LIO = "/state_estimation_at_scan"  # 14 Hz Point-LIO odometry (lab 25 Nov); /odom relays Unitree
+V_SPEEDS_MPS = (0.30, 0.45)
+V_BAGS_PER_SPEED = 3  # counted as bags: an out-and-back bag (2 legs) is one run
+V_LINE_M = 5.0
+V_BAR = 0.05
+# shortcut: the two tolerances below are not in the 18 Nov rule; Charbel to confirm before the data.
+V_SPEED_TOL_MPS = 0.05
+V_LINE_TOL_M = 0.5
 
 
 def _segments(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -177,36 +194,58 @@ def load_runs(args) -> list[tuple]:
     return runs
 
 
-def summarize(rows: list[dict], max_rel_err: float | None) -> tuple[dict, list[str]]:
-    """rows = every expected run, errored ones included (they count as not measured)."""
+def summarize(rows: list[dict]) -> tuple[dict, list[str]]:
+    """Ratio statistics per source. rows = every expected run, errored ones included."""
     n_exp = len(rows)
     names = sorted({k for r in rows for k in r.get("sources", {})})
     summ, lines = {}, []
     lines.append(f"{'source':28s} {'n/exp':>5s} {'ratio mean':>10s} {'min':>7s} {'max':>7s} {'max |err| %':>11s}")
     for n in names:
         rs = np.array([r.get("sources", {}).get(n, {}).get("ratio", np.nan) for r in rows], dtype=float)
-        n_bad = int((~np.isfinite(rs)).sum())  # errored run, source absent, or NaN ratio
-        rs = rs[np.isfinite(rs)]
+        rs = rs[np.isfinite(rs)]  # errored run, source absent, or NaN ratio: not counted in n
+        tag = "  (gate source)" if n == POINT_LIO else ""
         if rs.size == 0:
             summ[n] = {"n": 0, "n_expected": n_exp}
-            if max_rel_err is not None:
-                summ[n]["verdict"] = "INVALID"
-            lines.append(f"{n:28s} {'0/' + str(n_exp):>5s}  (no usable runs)"
-                         + ("  INVALID" if max_rel_err is not None else ""))
+            lines.append(f"{n:28s} {'0/' + str(n_exp):>5s}  (no usable runs){tag}")
             continue
         worst = float(np.max(np.abs(rs - 1.0)) * 100)
         summ[n] = {"n": int(rs.size), "n_expected": n_exp, "ratio_mean": float(rs.mean()),
                    "ratio_min": float(rs.min()), "ratio_max": float(rs.max()), "max_abs_err_pct": worst}
-        if max_rel_err is not None:
-            summ[n]["verdict"] = "INVALID" if n_bad else ("PASS" if worst <= max_rel_err * 100 else "FAIL")
         lines.append(f"{n:28s} {f'{rs.size}/{n_exp}':>5s} {rs.mean():10.3f} {rs.min():7.3f} {rs.max():7.3f} "
-                     f"{worst:11.1f}" + (f"  {summ[n]['verdict']}" if max_rel_err is not None else ""))
-    n_err = sum("error" in r for r in rows)
-    if n_err:
-        lines.append(f"{n_err} of {n_exp} runs not analysed (ERROR above): no source can PASS.")
-    if max_rel_err is None:
-        lines.append("No pass bar given (--max-rel-err): descriptive only. The V-gate bar is Charbel's decision.")
+                     f"{worst:11.1f}{tag}")
     return summ, lines
+
+
+def v_gate(rows: list[dict], summ: dict, bar: float) -> tuple[str, list[str]]:
+    """Official V-gate status (PASS, FAIL, INVALID, DIAGNOSTIC ONLY) and the reasons."""
+    pl = summ.get(POINT_LIO)
+    n_err = sum("error" in r for r in rows)
+    bad = [f"{n_err} of {len(rows)} runs not analysed (ERROR above)"] if n_err else []
+    if pl and pl["n"] < pl["n_expected"]:
+        bad.append(f"Point-LIO ratio missing in {pl['n_expected'] - pl['n']} of {pl['n_expected']} runs")
+    if bad:
+        return "INVALID", bad
+    why = []
+    if not np.isclose(bar, V_BAR):
+        why.append(f"bar {bar * 100:g} % (--max-rel-err) is not the decided {V_BAR * 100:g} %")
+    if pl is None:
+        why.append(f"no Point-LIO source ({POINT_LIO}) in any run; /sportmodestate and "
+                   "/utlidar/robot_odom are one Unitree estimate and cannot decide the gate")
+    bags: dict[float, set] = {v: set() for v in V_SPEEDS_MPS}
+    for r in rows:
+        name = Path(r["bag"]).name + (f" leg {r['leg']}" if r.get("leg") else "")
+        cmd = abs(r.get("cmd_vx_median", np.nan))  # a backward leg commands -x
+        hit = [v for v in V_SPEEDS_MPS if abs(cmd - v) <= V_SPEED_TOL_MPS]
+        if hit:
+            bags[hit[0]].add(r["bag"])
+        if not abs(r["tape_m"] - V_LINE_M) <= V_LINE_TOL_M:
+            why.append(f"{name}: tape {r['tape_m']:.2f} m, protocol line {V_LINE_M:g} m")
+    for v, b in bags.items():
+        if len(b) < V_BAGS_PER_SPEED:
+            why.append(f"{len(b)} of {V_BAGS_PER_SPEED} bags at commanded {v:.2f} m/s")
+    if why:
+        return "DIAGNOSTIC ONLY", why
+    return ("PASS" if pl["max_abs_err_pct"] <= bar * 100 else "FAIL"), []
 
 
 def main(argv=None) -> int:
@@ -220,8 +259,8 @@ def main(argv=None) -> int:
     ap.add_argument("--min-walk-s", type=float, default=1.5, help="shorter walks are ignored when a leg is chosen")
     ap.add_argument("--stride", type=int, default=1, help="keep every n-th /sportmodestate message")
     ap.add_argument("--odom-stride", type=int, default=1)
-    ap.add_argument("--max-rel-err", type=float, default=None,
-                    help="optional pass bar, e.g. 0.05 = 5 %%. Only with a dated approval row.")
+    ap.add_argument("--max-rel-err", type=float, default=V_BAR,
+                    help="per-run bar (decided 18 Nov: 0.05 = 5 %%). Another value gives DIAGNOSTIC ONLY.")
     args = ap.parse_args(argv)
 
     out = Path(args.out)
@@ -247,19 +286,22 @@ def main(argv=None) -> int:
             f"({r['tape_speed_mps']:.3f} m/s), cmd vx {r.get('cmd_vx_median', float('nan')):.2f}, "
             f"est vx {r['mean_vx_body_mps']:.3f}, yaw drift {r['yaw_drift_deg']:+.1f} deg | ratio {src}"
         )
-    summ, slines = summarize(rows, args.max_rel_err)
-    lines += ["", *slines]
+    summ, slines = summarize(rows)
+    status, reasons = v_gate(rows, summ, args.max_rel_err)
+    lines += ["", *slines, "",
+              f"V GATE (Point-LIO vs tape, every run within {args.max_rel_err * 100:g} %): "
+              + (f"{status}: " + "; ".join(reasons) if reasons else status),
+              "Unitree sources (sport_pos, sport_int, /utlidar/robot_odom, /odom) are reported, never the gate."]
     text = "\n".join(lines) + "\n"
     (out / "v_check.txt").write_text(text)
     (out / "v_check.json").write_text(json.dumps({"runs": rows, "summary": summ,
+                                                   "gate": {"status": status, "reasons": reasons},
                                                    "max_rel_err": args.max_rel_err,
                                                    "settings": {k: v for k, v in vars(args).items()
                                                                 if k not in ("run",)}},
                                                   indent=2, default=float))
     print(text, end="")
-    bad = any("error" in r for r in rows) or any(v.get("verdict") == "INVALID" for v in summ.values())
-    return 1 if bad else 0
-
+    return {"PASS": 0, "FAIL": 0, "INVALID": 1}.get(status, 2)
 
 if __name__ == "__main__":
     raise SystemExit(main())
