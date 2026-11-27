@@ -260,6 +260,8 @@ def test_anymal_two_sources_part_b_part_c_and_separate_table(tmp_path, monkeypat
     assert ws["H_nonfall"] == pytest.approx(t["c0_interval"]["H_nonfall"], rel=1e-5)
     assert set(t["which_side"]) == {"d16", "d25"} and set(t["by_source"]["batchC"]["which_side"]) == {"d16", "d25"}
     assert "READ GATE ETH batchA" in txt and "READ GATE ETH batchC" in txt and "  SIDE ETH batchA d25 log u" in txt
+    assert "  WINDOWS E1V pooled: common windows 6, excluded for zero spread 0" in txt
+    assert "  WINDOWS ETH batchA: common windows" in (tmp_path / "o" / "components_heads_anymal.txt").read_text()
     # separate table: round0_1701 alone, each model its own eligible traces; E1V has none and is skipped
     rep = cc.run_anymal(models, traces[2:], tmp_path / "x", n_boot=100, use_intersection=False)
     assert set(rep["tables"]) == {"ETH"} and rep["eligibility"]["E1V"]["skipped"]
@@ -353,7 +355,8 @@ def test_which_side_reproduces_the_points():
     strata, cf, cn = _pairs()
     one = lambda v, P=1: np.full((P, 24), float(v))
     met = lambda u, e, P=1: {g: dict(e=one(e / 2, P), e_phys=one(e, P), u=one(u, P), coverage=one(.5, P),
-                                     outside=one(0, P)) for g in cc.GROUPS}
+                                     outside=one(0, P), **({"tilt_deg": one(10 * e, P)} if g == "gravity" else {}))
+                             for g in cc.GROUPS}
     boot = (strata, cf, cn, 200, 0)
     # ETH, 26 Nov, sum group, d25: geomean u ctx 12.546 / 5.35, imag 3.250 / 2.95
     table = {"ctx/d25": cc.shares(met(12.546, .8), met(5.35, .3), met(5.35, .3), boot),
@@ -366,6 +369,15 @@ def test_which_side_reproduces_the_points():
     assert r["imag"]["e_phys_fall"] == pytest.approx(1.2) and r["imag"]["e_phys_diff_ci"] == pytest.approx([.7, .7])
     line = "\n".join(cc._side_lines("ETH", "pooled", ws))
     assert "geomean u ctx 12.55/5.35 imag 3.25/2.95 | H fall 1.351" in line
+    # review 27 Nov: error per component in its own units (gravity as tilt deg); the mixed-unit sum is not a text line
+    eg = r["imag"]["error_by_group"]
+    assert list(eg) == list(cc.SIX) and eg["torque"]["unit"] == "N m" and eg["gravity"]["unit"] == "tilt deg"
+    assert eg["gravity"]["fall"] == pytest.approx(12.0) and eg["gravity"]["diff_ci"] == pytest.approx([7.0, 7.0])
+    assert eg["lin_vel"]["diff"] == pytest.approx(.7) and r["imag"]["e_phys_fall"] == pytest.approx(1.2)   # JSON kept
+    assert r["imag"]["e_phys_sum_note"] == cc.SUM_NOTE and "e_phys sum" not in line.replace(cc.SUM_NOTE, "")
+    assert ("SIDE ETH pooled d25 error by component (fall|non-fall, diff [95 %]): ctx lin_vel m/s 0.800|0.300 diff "
+            "+0.500 [0.500, 0.500]; ang_vel rad/s") in line and "imag lin_vel m/s 1.200|0.500 diff +0.700" in line
+    assert "gravity tilt deg 12.000|5.000 diff +7.000 [7.000, 7.000]; joint_pos rad" in line and "torque N m" in line
 
 
 def test_leave_one_head_out_known_answers():
@@ -388,5 +400,75 @@ def test_leave_one_head_out_known_answers():
             assert w["difference"] == pytest.approx(np.log(2)) and w["difference_ci"] == pytest.approx([np.log(2)] * 2)
             assert w["auroc_u_ctx"] == 1.0 and w["pairs"] == 24       # u_ctx(fall) = 2 u_ctx(non-fall) everywhere
             assert w["auroc_u_imag"] == 0.5     # imagined spread equal on falls and non-falls: no imagination-time warning
-    assert any(x.startswith("  LOO ETH batchA without_h3: e_phys sum (d16/d25) fall 0.000/0.000")
-               for x in cc._loo_lines("ETH", "batchA", r))
+    lines = cc._loo_lines("ETH", "batchA", r)
+    assert any(x.startswith("  LOO ETH batchA without_h3: error d25 recorded context fall|non-fall lin_vel m/s "
+                            "0.000|0.000 ang_vel rad/s 0.000|0.000 gravity tilt deg ") for x in lines)
+    assert not any("e_phys sum" in x for x in lines) and r["all"]["e_phys_sum_note"] == cc.SUM_NOTE
+    assert "recorded-action imagined-path (geomean of 4 paths) 0.500, one path mean 0.500 [0.500, 0.500]" in lines[1]
+
+
+def test_per_path_imagined_auroc_known_answers():
+    """Review 27 Nov: the AUROC of the geometric mean over driving paths is not what one path gives. Path p's imagined
+    spread on falls is f_p times the non-fall one (every window): AUROC 1 if f_p > 1, 0 if f_p < 1, 0.5 if equal."""
+    strata, cf, cn = _pairs()
+    W, D = 24, 2
+    stats = {k: v.astype(np.float64) for k, v in STATS.items()}
+    c = np.array([.1, -.1, .2, .3, -.2])
+    base = np.broadcast_to(c[None, None, :, None, None], (1, D, 5, W, 45))
+    f = np.array([3.0, .25, 1, 1, 1])
+    imag = {"fall": base * f[:, None, None, None, None], "nonfall": np.broadcast_to(base, (5, D, 5, W, 45))}
+    r = cc.leave_one_out({k: dict(ctx=base.copy(), imag=imag[k].copy()) for k in imag},
+                         {k: np.zeros((W, D, 45)) for k in imag}, stats, (16, 25), (strata, cf, cn, 100, 0))
+    w = r["all"]["warning_d25"]
+    assert w["auroc_u_imag_per_path"] == [1.0, 0.0, 0.5, 0.5, 0.5] and r["all"]["driving_heads"] == [0, 1, 2, 3, 4]
+    assert w["auroc_u_imag_path_mean"] == 0.5 and (w["auroc_u_imag_path_min"], w["auroc_u_imag_path_max"]) == (0.0, 1.0)
+    assert w["auroc_u_imag"] == 0.0                               # geomean (3 x 0.25)^(1/5) < 1 on every fall window
+    w = r["without_h0"]["warning_d16"]
+    assert w["auroc_u_imag_per_path"] == [0.0, 0.5, 0.5, 0.5] and w["auroc_u_imag_path_mean"] == 0.375
+    assert r["without_h1"]["warning_d25"]["auroc_u_imag"] == 1.0    # paths 0, 2, 3, 4: geomean 3^(1/4) > 1
+    assert "geomean of 5 paths) 0.000, one path mean 0.500 [0.000, 1.000]" in cc._loo_lines("M", "pooled", r)[0]
+
+
+def _synthetic_model(W=12, D=3, seed=0):
+    rng = np.random.default_rng(seed)
+    arms = {k: dict(ctx=rng.normal(0, 1, (1, D, 5, W, 45)), car=rng.normal(0, 1, (1, D, 5, W, 45)),
+                    imag=rng.normal(0, 1, (5, D, 5, W, 45)), ctx_stop=rng.uniform(0, 1, (D, 5, W)))
+            for k in ("fall", "nonfall")}
+    strata, cf, cn = _pairs(W)
+    import torch
+    win = {k: dict(y=torch.from_numpy(rng.normal(0, 1, (W, 26, 45))), strata=strata, clusters=c,
+                   origins=np.arange(W) + (100 if k == "nonfall" else 0)) for k, c in (("fall", cf), ("nonfall", cn))}
+    return arms, win
+
+
+def test_common_windows_one_zero_spread_mask_for_every_row():
+    """Review 27 Nov: a zero spread in one model / one head set / one depth must not change the windows of any compared
+    row. No zero spread: identical results. One zero spread in one model: the same pair leaves every row of every model."""
+    depths, stats = (0, 16, 25), {k: v.astype(np.float64) for k, v in STATS.items()}
+    a, win = _synthetic_model()
+    dump = lambda t: json.dumps(c0.json_safe(t), sort_keys=True)
+    assert not cc.zero_spread_pairs(a).any()
+    t0 = cc.model_table(a, stats, win, depths, 50, 0)
+    t1 = cc.model_table(a, stats, win, depths, 50, 0, cc.common_drop([win], [a]))
+    assert dump(t0) == dump(t1) and t0["common_windows"] == {"pairs": 12, "excluded_zero_spread": 0}
+    # model B: on fall window 0, heads 0-3 agree exactly on imagined path 0 at d25 -> only "without_h4" has a zero spread
+    b = {k: {x: v.copy() for x, v in d.items()} for k, d in a.items()}
+    b["fall"]["imag"][0, 2, :4, 0] = b["fall"]["imag"][0, 2, 0, 0]
+    assert np.flatnonzero(cc.zero_spread_pairs(b)).tolist() == [0]
+    old = cc.model_table(b, stats, win, depths, 50, 0)["heads"]["pooled"]["leave_one_out"]   # per-row exclusion
+    assert old["all"]["warning_d25"]["pairs"] == 12 and old["without_h4"]["warning_d25"]["pairs"] == 11
+    drop = cc.common_drop([win, win], [a, b])
+    for t in (cc.model_table(a, stats, win, depths, 50, 0, drop), cc.model_table(b, stats, win, depths, 50, 0, drop)):
+        assert t["windows"] == {"fall": 11, "nonfall": 11} and t["c0_interval"]["pairs"] == 11
+        assert t["common_windows"] == {"pairs": 11, "excluded_zero_spread": 1}
+        assert t["by_source"]["A"]["common_windows"] == {"pairs": 5, "excluded_zero_spread": 1}
+        assert t["by_source"]["C"]["common_windows"] == {"pairs": 6, "excluded_zero_spread": 0}
+        assert all(t[k][g]["zero_spread_pairs_excluded"] == 0 for k in t if "/d" in k for g in cc.GROUPS)
+        for scope in [t["heads"]["pooled"]] + list(t["heads"]["by_source"].values()):
+            for row in scope["leave_one_out"].values():
+                for d in (16, 25):
+                    assert row[f"warning_d{d}"]["zero_spread_pairs_excluded"] == 0
+                    assert row[f"warning_d{d}"]["pairs"] == scope["common_windows"]["pairs"]
+    other = {k: dict(v, origins=v["origins"] + 1) for k, v in win.items()}
+    with pytest.raises(ValueError, match="same windows"):
+        cc.common_drop([win, other], [a, b])

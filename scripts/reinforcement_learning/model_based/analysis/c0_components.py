@@ -58,6 +58,16 @@ Review of the 26 Nov run (added; the earlier keys are unchanged):
             differences and e_phys of each arm, pooled and per source.
   leave one head out  (heads.<model>.<scope>.leave_one_out, text "LOO") the ensemble without each head in turn.
   The head file starts with the COUNT lines and the per-source advantage at the last depth.
+Review of 27 Nov (pre-merge; the earlier keys are unchanged):
+  recorded-action imagined-path AUROC  (auroc_u_imag) the AUROC of the imagined spread averaged over the five driving
+            paths (geometric mean, as in H), each path fed the RECORDED actions. PPO in imagination sees one driving
+            path at a time, so the AUROC of each single path is added (auroc_u_imag_per_path, its mean and min-max).
+  common windows  zero-spread exclusions are no longer per row: one pair mask (union over models, arms, depths,
+            groups, imagined paths and head sets; zero_spread_pairs) is left out everywhere, so every compared row
+            reads the same windows. Text "WINDOWS": common windows N, excluded for zero spread K. K = 0: no change.
+  error by component  SIDE and LOO print the ensemble-mean error per component in its own units (lin_vel m/s, ang_vel
+            rad/s, gravity as tilt deg, joint_pos rad, joint_vel rad/s, torque N m). The e_phys "sum" group mixes
+            units, is not a physical quantity and is kept in the JSON only. log u sums NORMALIZED spreads (unitless).
 Limits: the models differ in more than failure data (data volume, recipe, seed; G0 has no friction data); ETH's
 training data are unknown; the windows were seen before; associations, not causes. Eligibility is by trace sha256:
 a trace in a model's fit manifest is excluded whole (envs held out of a fit are not recovered).
@@ -87,6 +97,9 @@ from pre_reset_transitions import sha256, validate_trace  # noqa: E402
 GROUPS = {"lin_vel": (0, 3), "ang_vel": (3, 6), "gravity": (6, 9), "joint_pos": (9, 21), "joint_vel": (21, 33),
           "torque": (33, 45), "sum": (0, 45)}
 SIX = ("lin_vel", "ang_vel", "gravity", "joint_pos", "joint_vel", "torque")
+UNITS = {"lin_vel": "m/s", "ang_vel": "rad/s", "gravity": "tilt deg", "joint_pos": "rad", "joint_vel": "rad/s",
+         "torque": "N m"}
+SUM_NOTE = "e_phys sum: mixed units, not a physical quantity (JSON only, not a result)"
 ANYMAL_DEPTHS = (0, 8, 16, 25)
 ARMS = ("ctx", "car", "imag")
 HEX64 = re.compile(r"\b[0-9a-f]{64}\b")
@@ -220,6 +233,34 @@ def log_spread(u):
     out = np.log(np.where(u > 0, u, 1))
     out[u <= 0] = np.nan
     return out
+
+
+def zero_spread_pairs(arms):
+    """arms {kind: arm_means output} -> [W] True for a pair whose fall or non-fall window has a zero summed spread in
+    some group, arm, depth, imagined path or head set (all heads and each leave-one-out set; spread as window_metrics).
+    Leaving this one mask out everywhere keeps the windows equal between every compared row (review 27 Nov)."""
+    n = arms["fall"]["ctx"].shape[2]
+    sets = [list(range(n))] + [[i for i in range(n) if i != h] for h in range(n)]
+    zero = np.zeros(arms["fall"]["ctx"].shape[3], bool)
+    for x in arms.values():
+        for arm in ARMS:
+            for keep in sets:
+                a = x[arm][:, :, keep]
+                a = a[keep] if arm == "imag" else a                 # imagined path p is driven by head p
+                s = a.std(2, ddof=1)
+                s[(a == a[:, :, :1]).all(2)] = 0
+                for lo, hi in GROUPS.values():
+                    zero |= (s[..., lo:hi].sum(-1) <= 0).any((0, 1))
+    return zero
+
+
+def common_drop(windows, arms):
+    """Union of zero_spread_pairs over models that read the same windows (lists, one entry per model)."""
+    for w in windows[1:]:
+        for k in ("fall", "nonfall"):
+            if any(not np.array_equal(w[k][x], windows[0][k][x]) for x in ("origins", "clusters")):
+                raise ValueError("common zero-spread mask needs the same windows for every model")
+    return np.logical_or.reduce([zero_spread_pairs(a) for a in arms])
 
 
 def _pair_boot_finite(f, n, boot):
@@ -377,9 +418,12 @@ def leave_one_out(arms, target, stats, depths, boot, warn_depths=(16, 25)):
     and heads != h. Per set ("all" = every head, "without_h<i>"): ensemble-mean physical RMS error on recorded context
     (per group and depth, fall and non-fall); at d16 and d25 (keys "warning_d*", kept for the 26 Nov outputs): the C0
     gap = Part B's fall - non-fall H with its interval (c0_interval), the AUROC of the summed spread on RECORDED
-    context u_ctx (not available inside imagination), and the AUROC of the imagination-time spread u_imag (geometric
-    mean over the driving paths, as in H; the only one of these a policy sees while imagining). AUROCs: falls vs
-    non-falls, go2_c0_check.auroc (average ranks for ties). A better ensemble mean can still give a worse warning."""
+    context u_ctx (not available inside imagination), the recorded-action imagined-path AUROC auroc_u_imag (imagined
+    spread averaged over the driving paths, geometric mean as in H, each path fed the recorded actions), and the
+    AUROC of each single driving path (auroc_u_imag_per_path in the order of driving_heads, with its mean and
+    min-max): PPO in imagination sees one driving path at a time. AUROCs: falls vs non-falls, go2_c0_check.auroc
+    (average ranks for ties). A better ensemble mean can still give a worse warning. Errors per group in physical
+    units and the gravity tilt error (deg); the "sum" group mixes units (SUM_NOTE)."""
     from go2_c0_check import auroc
     n = arms["fall"]["ctx"].shape[2]
     out = {}
@@ -388,17 +432,23 @@ def leave_one_out(arms, target, stats, depths, boot, warn_depths=(16, 25)):
         m = {k: dict(ctx=arm_metrics(a["ctx"][:, :, keep], target[k], stats),
                      imag=arm_metrics(a["imag"][keep][:, :, keep], target[k], stats)) for k, a in arms.items()}
         row = dict(e_phys={f"d{d}": {g: {k: float(m[k]["ctx"][di][g]["e_phys"].mean()) for k in m} for g in GROUPS}
-                           for di, d in enumerate(depths)})
+                           for di, d in enumerate(depths)}, e_phys_sum_note=SUM_NOTE, driving_heads=keep,
+                   tilt_err_deg={f"d{d}": {k: float(m[k]["ctx"][di]["gravity"]["tilt_deg"].mean()) for k in m}
+                                 for di, d in enumerate(depths)})
         for di, d in enumerate(depths):
             if d in warn_depths:
                 u = {k: m[k]["ctx"][di]["sum"]["u"][0] for k in m}
                 b = c0_interval(*(window_h(u[k], m[k]["imag"][di]["sum"]["u"]) for k in ("fall", "nonfall")), *boot)
-                li = {k: log_spread(m[k]["imag"][di]["sum"]["u"]).mean(0) for k in m}   # [W]; NaN on a zero spread
-                li = {k: v[np.isfinite(v)] for k, v in li.items()}
+                lp = {k: log_spread(m[k]["imag"][di]["sum"]["u"]) for k in m}             # [P, W]; NaN on a zero spread
+                fin = lambda v: v[np.isfinite(v)]
+                li = {k: fin(v.mean(0)) for k, v in lp.items()}
+                per = [auroc(fin(lp["fall"][p]), fin(lp["nonfall"][p])) for p in range(len(keep))]
                 row[f"warning_d{d}"] = dict({k: b[k] for k in ("difference", "difference_ci", "H_fall", "H_nonfall",
                                                                 "pairs", "zero_spread_pairs_excluded")},
                                             auroc_u_ctx=auroc(u["fall"], u["nonfall"]),
-                                            auroc_u_imag=auroc(li["fall"], li["nonfall"]))
+                                            auroc_u_imag=auroc(li["fall"], li["nonfall"]),
+                                            auroc_u_imag_per_path=per, auroc_u_imag_path_mean=float(np.mean(per)),
+                                            auroc_u_imag_path_min=min(per), auroc_u_imag_path_max=max(per))
         out["all" if drop is None else f"without_h{drop}"] = row
     return out
 
@@ -406,16 +456,23 @@ def leave_one_out(arms, target, stats, depths, boot, warn_depths=(16, 25)):
 def which_side(table, depths, at=(16, 25)):
     """Which side moved (review 26 Nov), sum group: per depth, for falls and non-falls, mean log u on recorded context
     (ctx) and in imagination (imag), each with its fall - non-fall difference, H = log u_ctx - log u_imag (points),
-    and the ensemble-mean physical RMS error of each arm on the same windows. Read from the component tables: the
-    same pair draws, no new bootstrap."""
+    and the ensemble-mean error of each arm on the same windows per component in its own units (error_by_group;
+    gravity as the tilt error in deg). log u sums normalized spreads (unitless); the e_phys "sum" keys are kept for the
+    26 Nov outputs but mix units (SUM_NOTE). Read from the component tables: the same pair draws, no new bootstrap."""
     out = {}
     for d in [d for d in at if d in depths]:
         row = {}
         for arm in ("ctx", "imag"):
             r = table[f"{arm}/d{d}"]["sum"]
             c = r.get("ci", {})
-            row[arm] = {f"{m}_{k}": float(np.log(r[f"u_geomean_{k}"])) if m == "log_u" else r[f"{m}_{k}"]
-                        for m in ("log_u", "e_phys") for k in ("fall", "nonfall")}
+            row[arm] = dict(error_by_group={}, e_phys_sum_note=SUM_NOTE)
+            for g in SIX:
+                rg, (m, pt) = table[f"{arm}/d{d}"][g], (("tilt_deg", "tilt_err_deg") if g == "gravity" else ("e_phys",) * 2)
+                x = row[arm]["error_by_group"][g] = dict(unit=UNITS[g], fall=rg[f"{pt}_fall"], nonfall=rg[f"{pt}_nonfall"])
+                x["diff"] = x["fall"] - x["nonfall"]
+                x.update({f"{k}_ci": rg["ci"][f"{m}_{k}"] for k in ("fall", "nonfall", "diff") if f"{m}_{k}" in rg.get("ci", {})})
+            row[arm].update({f"{m}_{k}": float(np.log(r[f"u_geomean_{k}"])) if m == "log_u" else r[f"{m}_{k}"]
+                             for m in ("log_u", "e_phys") for k in ("fall", "nonfall")})
             for m in ("log_u", "e_phys"):
                 row[arm][f"{m}_diff"] = row[arm][f"{m}_fall"] - row[arm][f"{m}_nonfall"]
                 row[arm].update({f"{m}_{k}_ci": c[f"{m}_{k}"] for k in ("fall", "nonfall", "diff") if f"{m}_{k}" in c})
@@ -476,28 +533,38 @@ def _tables(m, windows, depths, sel, n_boot, seed):
     return table, boot
 
 
-def model_table(model, stats_np, windows, horizon, depths, n_boot=10_000, seed=0):
-    """All metrics of one model on one window set; with two or more sources also per source and the repeats.
-    The Part C readout is under "heads" (written to its own file)."""
+def model_arms(model, windows, horizon, depths):
+    """{kind: arm_means} for the fall and non-fall windows: one forward pass per model, shared by every table and by
+    the common zero-spread mask (zero_spread_pairs)."""
+    return {k: arm_means(model, windows[k]["xs"], windows[k]["xa"], horizon, depths) for k in ("fall", "nonfall")}
+
+
+def model_table(arms, stats_np, windows, depths, n_boot=10_000, seed=0, drop=None):
+    """All metrics of one model (arms = model_arms output) on one window set; with two or more sources also per source
+    and the repeats. drop [W]: pairs left out of EVERY table (the common zero-spread mask; None = none); each scope
+    records "common_windows" (pairs kept, pairs excluded for zero spread). The Part C readout is under "heads"."""
     m, ctx, stop, tgt, loo = {}, {}, {}, {}, {}
     for kind in ("fall", "nonfall"):
-        w = windows[kind]
-        arms = arm_means(model, w["xs"], w["xa"], horizon, depths)
-        tgt[kind] = w["y"].numpy()[:, list(depths)]
-        m[kind] = {arm: arm_metrics(arms[arm], tgt[kind], stats_np) for arm in ARMS}
-        ctx[kind], stop[kind] = arms["ctx"][0], arms["ctx_stop"]
-        loo[kind] = {a: arms[a] for a in ("ctx", "imag")}
+        a = arms[kind]
+        tgt[kind] = windows[kind]["y"].numpy()[:, list(depths)]
+        m[kind] = {arm: arm_metrics(a[arm], tgt[kind], stats_np) for arm in ARMS}
+        ctx[kind], stop[kind] = a["ctx"][0], a["ctx_stop"]
+        loo[kind] = {x: a[x] for x in ("ctx", "imag")}
+    drop = np.zeros(len(tgt["fall"]), bool) if drop is None else np.asarray(drop, bool)
 
-    def scope(sel):
+    def scope(src):
+        sel = src & ~drop
         table, boot = _tables(m, windows, depths, sel, n_boot, seed)
         t_sel = {k: v[sel] for k, v in tgt.items()}
         heads = head_readout({k: v[:, :, sel] for k, v in ctx.items()}, {k: v[..., sel] for k, v in stop.items()},
                              t_sel, stats_np, depths, boot)
         heads["leave_one_out"] = leave_one_out({k: {a: v[..., sel, :] for a, v in x.items()} for k, x in loo.items()},
                                                t_sel, stats_np, depths, boot)
+        table["common_windows"] = heads["common_windows"] = dict(pairs=int(sel.sum()),
+                                                                 excluded_zero_spread=int((src & drop).sum()))
         return table, heads
 
-    table, heads = scope(slice(None))
+    table, heads = scope(np.ones_like(drop))
     heads = {"pooled": heads}
     strata = windows["fall"]["strata"]
     sources = list(dict.fromkeys(strata.tolist()))
@@ -507,7 +574,7 @@ def model_table(model, stats_np, windows, horizon, depths, n_boot=10_000, seed=0
         heads["by_source"] = {s: v[1] for s, v in per.items()}
         table["repeats"] = repeats(table["by_source"], {
             f"{k}/{g}/{mt}": (k, g, "ci", f"{mt}_diff") for k in table if "/d" in k for g in GROUPS
-            for mt in ("e_phys", "log_u", "coverage", "joint_miss", "agree_wrong")})
+            for mt in ("e_phys", "log_u", "coverage", "joint_miss", "agree_wrong") if (g, mt) != ("sum", "e_phys")})
         heads["repeats"] = repeats(heads["by_source"], {
             f"d{d}/{g}/{kind}/head{h}": (f"d{d}", g, kind, "advantage_ci", h) for d in depths for g in GROUPS
             for kind in ("fall", "nonfall") for h in range(ctx["fall"].shape[1])})
@@ -581,7 +648,7 @@ def run_anymal(models, traces, out, seed=0, use_intersection=True, n_boot=10_000
         flags[name] = dict(manifest=str(man) if man else None, excluded=excl, excluded_pairs=sum(pairs[n] for n in excl),
                            no_manifest=man is None)
     common = [n for n, _ in traces if all(n in e for e in eligible.values())]
-    tables, heads, norm_ids = {}, {}, {}
+    tables, heads, norm_ids, loaded = {}, {}, {}, {}
     for name, wm, _ in models:
         use = common if use_intersection else eligible[name]
         if not use:
@@ -599,9 +666,17 @@ def run_anymal(models, traces, out, seed=0, use_intersection=True, n_boot=10_000
                 merged[kind].append(w[kind])
         win = {k: dict(xs=torch.cat([x["xs"] for x in v]), xa=torch.cat([x["xa"] for x in v]),
                        y=torch.cat([x["y"] for x in v]), clusters=np.concatenate([x["clusters"] for x in v]),
-                       strata=np.concatenate([x["strata"] for x in v]))
+                       strata=np.concatenate([x["strata"] for x in v]), origins=np.concatenate([x["origins"] for x in v]))
                for k, v in merged.items()}
-        tables[name] = model_table(model, stats_np, win, c0.HORIZON, ANYMAL_DEPTHS, n_boot, seed)
+        loaded[name] = (stats_np, win, model_arms(model, win, c0.HORIZON, ANYMAL_DEPTHS), use)
+    # one zero-spread mask for every compared row: the union over models when they read the same windows
+    drop = common_drop([v[1] for v in loaded.values()], [v[2] for v in loaded.values()]) if use_intersection else None
+    for name, wm, _ in models:
+        if name not in loaded:
+            continue
+        stats_np, win, arms, use = loaded[name]
+        tables[name] = model_table(arms, stats_np, win, ANYMAL_DEPTHS, n_boot, seed,
+                                   drop if use_intersection else zero_spread_pairs(arms))
         heads[name] = tables[name].pop("heads")
         tables[name]["traces_used"] = use
         tables[name]["pairs_excluded"] = {n: pairs[n] for n, _ in traces if n not in use}
@@ -619,7 +694,7 @@ def run_go2(models, norm_path, probes, out, seed=0, ks=(10, 0), n_boot=10_000):
     import go2_g0_replay as rp
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
-    tables, heads, norm_ids = {}, {}, {}
+    tables, heads, norm_ids, loaded = {}, {}, {}, {}
     for name, wm, npath in models:
         npath = npath or norm_path
         sd, _, norm, _ = rp.load_model(wm, npath, "cpu")
@@ -634,7 +709,12 @@ def run_go2(models, norm_path, probes, out, seed=0, ks=(10, 0), n_boot=10_000):
         tables[name], heads[name] = {"wm_sha256": sha256(wm), "norm_sha256": sha256(npath)}, {}
         for k in ks:
             win, counts = go2_windows(eps, k, seed=seed)
-            t = model_table(sd, stats_np, win, 26, (0, 25), n_boot, seed)
+            loaded[name, k] = (stats_np, win, counts, model_arms(sd, win, 26, (0, 25)))
+    for k in ks:                         # every model reads the same windows per K: one common zero-spread mask
+        runs = {n: v for (n, kk), v in loaded.items() if kk == k}
+        drop = common_drop([v[1] for v in runs.values()], [v[3] for v in runs.values()])
+        for name, (stats_np, win, counts, arms) in runs.items():
+            t = model_table(arms, stats_np, win, (0, 25), n_boot, seed, drop)
             heads[name][f"K{k}"] = t.pop("heads")
             tables[name][f"K{k}"] = dict(t, counts=counts)
     flat = {n: tables[n]["K10"] for n in tables}
@@ -656,18 +736,24 @@ def _c0_text(b):
             + (f"; zero-spread pairs left out {z}" if z else ""))
 
 
+def _win_line(name, src, cw):
+    return (f"  WINDOWS {name} {src}: common windows {cw['pairs']}, excluded for zero spread {cw['excluded_zero_spread']} "
+            "(one mask: union over models, arms, depths, groups, imagined paths and head sets)")
+
+
 def _side_lines(name, src, ws):
     lines = []
     for d, r in ws.items():
         u = lambda a, k: f"{r[a][f'log_u_{k}']:.3f} {_ci(r[a].get(f'log_u_{k}_ci', [np.nan] * 2))}"
-        e = lambda a, k: f"{r[a][f'e_phys_{k}']:.3f} {_ci(r[a].get(f'e_phys_{k}_ci', [np.nan] * 2))}"
+        e = lambda a: "; ".join(f"{g} {x['unit']} {x['fall']:.3f}|{x['nonfall']:.3f} diff {x['diff']:+.3f} "
+                                f"{_ci(x.get('diff_ci', [np.nan] * 2))}" for g, x in r[a]["error_by_group"].items())
         lines.append(f"  SIDE {name} {src} {d} log u: ctx fall {u('ctx', 'fall')} non-fall {u('ctx', 'nonfall')} diff "
                      f"{u('ctx', 'diff')} | imag fall {u('imag', 'fall')} non-fall {u('imag', 'nonfall')} diff "
                      f"{u('imag', 'diff')} | geomean u ctx {r['ctx']['u_geomean_fall']:.2f}/{r['ctx']['u_geomean_nonfall']:.2f}"
                      f" imag {r['imag']['u_geomean_fall']:.2f}/{r['imag']['u_geomean_nonfall']:.2f} | H fall {r['H_fall']:.3f}"
                      f" non-fall {r['H_nonfall']:.3f}")
-        lines.append(f"  SIDE {name} {src} {d} e_phys sum: ctx fall {e('ctx', 'fall')} non-fall {e('ctx', 'nonfall')} diff "
-                     f"{e('ctx', 'diff')} | imag fall {e('imag', 'fall')} non-fall {e('imag', 'nonfall')} diff {e('imag', 'diff')}")
+        lines.append(f"  SIDE {name} {src} {d} error by component (fall|non-fall, diff [95 %]): ctx {e('ctx')} || "
+                     f"imag {e('imag')}")
     return lines
 
 
@@ -681,7 +767,8 @@ def _table_lines(name, t):
         for g in GROUPS:
             r, c = t[key][g], t[key][g]["ci"]
             cell = lambda m, pt: f"{r[pt + '_fall']:.3f} {_ci(c[m + '_fall'])} | {r[pt + '_nonfall']:.3f}"
-            lines.append(f"  {key:9s} {g:9s}  {cell('e_phys', 'e_phys')}   {cell('u_geomean', 'u_geomean')}   "
+            ecell = "(mixed units, not read)" if g == "sum" else cell("e_phys", "e_phys")
+            lines.append(f"  {key:9s} {g:9s}  {ecell}   {cell('u_geomean', 'u_geomean')}   "
                          f"{cell('coverage', 'coverage')}   {cell('joint_miss', 'joint_miss')}   {cell('agree_wrong', 'agree_wrong')}"
                          + (f"   tilt err deg {r['tilt_err_deg_fall']:.2f} | {r['tilt_err_deg_nonfall']:.2f}" if g == "gravity" else ""))
     return lines
@@ -709,16 +796,15 @@ def _head_lines(h):
 def _loo_lines(name, src, loo):
     lines = []
     for s, r in loo.items():
-        e = r["e_phys"]
-        last = list(e)[-1]
-        ef = "/".join(f"{e[d]['sum']['fall']:.3f}" for d in e)
-        en = "/".join(f"{e[d]['sum']['nonfall']:.3f}" for d in e)
-        grp = " ".join(f"{g} {e[last][g]['fall']:.3f}|{e[last][g]['nonfall']:.3f}" for g in SIX)
-        warn = "; ".join(f"{k[8:]} gap dH {w['difference']:.3f} {_ci(w['difference_ci'])} AUROC recorded "
-                         f"{w['auroc_u_ctx']:.3f} imagined {w['auroc_u_imag']:.3f}"
+        e, last = r["e_phys"], list(r["e_phys"])[-1]
+        err = " ".join(f"{g} {UNITS[g]} " + "|".join(f"{(r['tilt_err_deg'][last] if g == 'gravity' else e[last][g])[k]:.3f}"
+                                                     for k in ("fall", "nonfall")) for g in SIX)
+        warn = "; ".join(f"{k[8:]} gap dH {w['difference']:.3f} {_ci(w['difference_ci'])} AUROC recorded-context "
+                         f"{w['auroc_u_ctx']:.3f}, recorded-action imagined-path (geomean of "
+                         f"{len(w['auroc_u_imag_per_path'])} paths) {w['auroc_u_imag']:.3f}, one path mean "
+                         f"{w['auroc_u_imag_path_mean']:.3f} [{w['auroc_u_imag_path_min']:.3f}, {w['auroc_u_imag_path_max']:.3f}]"
                          for k, w in r.items() if k.startswith("warning_"))
-        lines.append(f"  LOO {name} {src} {s}: e_phys sum ({'/'.join(e)}) fall {ef} | non-fall {en}; {last} {grp}; "
-                     f"{warn}")
+        lines.append(f"  LOO {name} {src} {s}: error {last} recorded context fall|non-fall {err}; {warn}")
     return lines
 
 
@@ -751,6 +837,9 @@ def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, head
     lines.append(f"  P4: held {pred['P4'].get('held')} " + str({n: v['largest'] for n, v in pred['P4'].items() if isinstance(v, dict)}))
     scopes = {n: t for n, t in tables.items()} if robot == "anymal" else \
         {f"{n} {k}": t[k] for n, t in tables.items() for k in t if k.startswith("K")}
+    for n, t in scopes.items():
+        for src, tt in [("pooled", t)] + list(t.get("by_source", {}).items()):
+            lines.append(_win_line(n, src, tt["common_windows"]))
     lines.append("PART B: C0 deficit on these windows (descriptive, no verdict)")
     if registered:
         for src, r in registered["by_source"].items():
@@ -769,8 +858,9 @@ def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, head
             b = tt["c0_interval"]
             lines.append(f"  {n:8s} {src:12s} {b['pairs']:4d} pairs: {_c0_text(b)}"
                          + (f"; pairs excluded {t['pairs_excluded']}" if src == "pooled" and "pairs_excluded" in t else ""))
-    lines.append("WHICH SIDE MOVED (sum group; mean log u per arm, fall | non-fall | fall - non-fall, 95 % intervals; "
-                 "H = log u_ctx - log u_imag; e_phys = ensemble-mean physical RMS error on the same windows)")
+    lines.append("WHICH SIDE MOVED (log u = log of the spread summed over the 45 NORMALIZED dims, unitless; mean per arm, "
+                 "fall | non-fall | fall - non-fall, 95 % intervals; H = log u_ctx - log u_imag; error = ensemble-mean "
+                 "physical RMS error per component in its own units, gravity as tilt deg, same windows; " + SUM_NOTE + ")")
     for n, t in scopes.items():
         for src, tt in [("pooled", t)] + list(t.get("by_source", {}).items()):
             lines += _side_lines(n, src, tt["which_side"])
@@ -806,9 +896,14 @@ def _write(out, robot, tables, norm_ids, flags, inputs, flat_for_pred=None, head
                     x = hs[d]["sum"][kind]
                     hl.append(f"  {n} {src} {d} sum {kind} advantage: " + " ".join(
                         f"h{i} {a:+.3f} {_ci(c)}" for i, (a, c) in enumerate(zip(x["advantage"], x["advantage_ci"]))))
-        hl.append("LEAVE ONE HEAD OUT (recorded context; e_phys = ensemble-mean physical RMS error, sum, per depth, "
-                  "fall | non-fall; groups at the last depth; gap dH = C0 fall - non-fall H [95 %]; AUROC falls vs "
-                  "non-falls of the spread on recorded context (not seen in imagination) and of the imagined spread)")
+        hl.append("LEAVE ONE HEAD OUT (error = ensemble-mean physical RMS error on recorded context at the last depth, "
+                  "per component in its own units, gravity as tilt deg, fall|non-fall; gap dH = C0 fall - non-fall H "
+                  "[95 %]; AUROC falls vs non-falls of: the spread on recorded context (not seen in imagination); the "
+                  "recorded-action imagined-path spread, geometric mean over the driving paths (recorded actions, all "
+                  "paths at once); and each single driving path (what PPO sees: one path at a time), mean [min, max])")
+        for n, h in hscopes.items():
+            for src, hs in each(h):
+                hl.append(_win_line(n, src, hs["common_windows"]))
         for n, h in hscopes.items():
             for src, hs in each(h):
                 hl += _loo_lines(n, src, hs["leave_one_out"])
