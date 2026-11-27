@@ -233,7 +233,7 @@ def test_v_check_recovers_tape_one_unitree_run_is_not_pass(tmp_path):
     rc = vc.main(["--run", bag, "0.50", "2.52", "--out", str(tmp_path / "o")])
     out = json.loads((tmp_path / "o" / "v_check.json").read_text())
     assert out["runs"][0]["sources"]["sport_pos"]["ratio"] == pytest.approx(2.0 / 2.02, abs=0.01)
-    assert out["gate"]["status"] == "DIAGNOSTIC ONLY" and rc == 2
+    assert out["gate"]["status"] == "INVALID" and rc == 1  # no /api/sport/request: no commanded speed
     assert "PASS" not in (tmp_path / "o" / "v_check.txt").read_text()
 
 
@@ -242,7 +242,8 @@ def test_v_gate_one_run_with_point_lio_is_not_pass(tmp_path):
                                                point_lio=1.0, cmd=0.3)])
     assert out["runs"][0]["sources"][vc.POINT_LIO]["ratio"] == pytest.approx(1.0, abs=0.01)
     assert rc == 2 and out["gate"]["status"] == "DIAGNOSTIC ONLY" and "PASS" not in text
-    assert "1 of 3 bags at commanded 0.30 m/s" in text and "0 of 3 bags at commanded 0.45 m/s" in text
+    assert "1 runs at commanded 0.30 m/s; the rule prescribes exactly 3" in text
+    assert "0 runs at commanded 0.45 m/s; the rule prescribes exactly 3" in text
 
 
 def test_v_gate_unitree_sources_only_is_not_pass(tmp_path):
@@ -257,7 +258,8 @@ def test_v_gate_full_set_within_5_pct_passes_and_6_pct_fails(tmp_path):
     rc, out, text = v_run(tmp_path, good)
     assert out["summary"][vc.POINT_LIO]["max_abs_err_pct"] == pytest.approx(2.0, abs=0.5)  # walk 5.01 m (20 Hz steps)
     assert rc == 0 and out["gate"] == {"status": "PASS", "reasons": []}
-    assert "V GATE (Point-LIO vs tape, every run within 5 %): PASS" in text
+    assert ("V GATE (Point-LIO vs tape, every run within 5 %; 3 runs each at 0.30 and 0.45 m/s; "
+            "speed ± 0.05 m/s, line 5 ± 0.5 m PROPOSED): PASS") in text
     bad = sport_bag(tmp_path / "w045_3b", walk_s=5.0 / 0.45, v=0.45, hz=20.0, point_lio=1.06, cmd=0.45)
     rc, out, _ = v_run(tmp_path, good[:-1] + [bad])
     assert rc == 0 and out["gate"]["status"] == "FAIL"
@@ -301,3 +303,66 @@ def test_v_check_missing_short_or_nan_run_is_never_pass(tmp_path):
     nan = {**ok, "sources": {vc.POINT_LIO: {"ratio": float("nan")}}}
     assert vc.v_gate([ok, nan], vc.summarize([ok, nan])[0], vc.V_BAR)[0] == "INVALID"
     assert vc.v_gate([ok, ok], vc.summarize([ok, ok])[0], vc.V_BAR)[0] == "DIAGNOSTIC ONLY"  # 1 bag only
+
+
+# --- V gate review 27 Nov: one run = one listed row (one walk); every row accounted for -----------
+def v_rows(spec, ratio=1.0, tape=5.0):
+    """spec: [(bag, leg, cmd)] -> v_gate rows; leg 0 = whole bag (longest walk)."""
+    return [{"bag": b, "leg": leg, "tape_m": tape, "cmd_vx_median": c, "walks_in_bag": 1,
+             "sources": {vc.POINT_LIO: {"ratio": ratio}}} for b, leg, c in spec]
+
+
+def gate(rows, *a):
+    return vc.v_gate(rows, vc.summarize(rows)[0], vc.V_BAR, *a)
+
+
+SIX = [(f"w{v}_{i}", 0, c) for v, c in (("030", 0.30), ("045", 0.45)) for i in (1, 2, 3)]
+
+
+def test_v_gate_bag_in_both_speed_groups_is_not_official():
+    # three out-and-back bags, out at 0.30, back at 0.45: before 27 Nov each bag counted in both groups -> PASS
+    rows = v_rows([(f"b{i}", leg, c) for i in (1, 2, 3) for leg, c in ((1, 0.30), (2, -0.45))])
+    status, why = gate(rows)
+    assert status == "DIAGNOSTIC ONLY" and sum("both 0.30 and 0.45" in w for w in why) == 3
+    # extra run at a prescribed speed: 4 at 0.30 is not the prescribed 3
+    status, why = gate(v_rows(SIX + [("w030_4", 0, 0.30)]))
+    assert status == "DIAGNOSTIC ONLY" and why == ["4 runs at commanded 0.30 m/s; the rule prescribes exactly 3"]
+    # the same walk listed twice, or a bag listed twice without distinct legs: ambiguous
+    status, why = gate(v_rows(SIX[:5] + [("w030_1", 0, 0.45)]))
+    assert status == "DIAGNOSTIC ONLY" and any("each row must name a distinct leg" in w for w in why)
+    # a bag with two walks and no leg named: which walk is the run is ambiguous
+    rows = v_rows(SIX)
+    rows[0]["walks_in_bag"] = 2
+    assert gate(rows) == ("DIAGNOSTIC ONLY", ["w030_1: the bag has 2 walks; the row must name its leg"])
+    # one run = one row: an out-and-back bag at one speed gives two runs
+    assert gate(v_rows([("a", 1, 0.30), ("a", 2, -0.30), ("b", 0, 0.30)] + SIX[3:])) == ("PASS", [])
+
+
+def test_v_gate_row_without_command_is_invalid(tmp_path):
+    # an extra listed bag with no /api/sport/request: before 27 Nov it was ignored and the six others gave PASS
+    runs = v_set(tmp_path) + [sport_bag(tmp_path / "nocmd", walk_s=5.0 / 0.3, v=0.3, hz=20.0, point_lio=1.0)]
+    rc, out, text = v_run(tmp_path, runs)
+    assert rc == 1 and out["gate"]["status"] == "INVALID" and "no readable commanded speed" in text and "nocmd" in text
+    assert gate(v_rows(SIX + [("x", 0, float("nan"))]))[0] == "INVALID"  # Move x NaN
+    # a readable command outside the prescribed speeds: the set is wrong, not the data
+    status, why = gate(v_rows(SIX + [("w060_1", 0, 0.60)]))
+    assert status == "DIAGNOSTIC ONLY" and why == ["w060_1: commanded +0.60 m/s is not one of 0.30, 0.45 (± 0.05)"]
+
+
+def test_v_gate_exact_5_pct_passes():
+    assert gate(v_rows(SIX, ratio=5.25 / 5.0)) == ("PASS", [])  # |ratio - 1| = 0.0500000000000000444
+    assert gate(v_rows(SIX, ratio=4.75 / 5.0)) == ("PASS", [])
+    assert gate(v_rows(SIX, ratio=5.2501 / 5.0))[0] == "FAIL"
+    assert gate(v_rows(SIX, ratio=4.7499 / 5.0))[0] == "FAIL"
+
+
+def test_v_gate_tolerances_recorded_and_override_is_diagnostic(tmp_path):
+    good = v_set(tmp_path)
+    rc, out, text = v_run(tmp_path, good)
+    assert rc == 0 and out["gate"]["status"] == "PASS"
+    assert out["tolerances"] == {"speed_tol_mps": 0.05, "line_m": 5.0, "line_tol_m": 0.5,
+                                 "status": vc.V_TOL_STATUS}
+    assert "PROPOSED" in vc.V_TOL_STATUS and "speed ± 0.05 m/s, line 5 ± 0.5 m PROPOSED" in text
+    for opt, val in (("--speed-tol-mps", "0.10"), ("--line-tol-m", "1.0")):
+        rc, out, _ = v_run(tmp_path, good, opt, val)
+        assert rc == 2 and out["gate"]["status"] == "DIAGNOSTIC ONLY" and opt in out["gate"]["reasons"][0]

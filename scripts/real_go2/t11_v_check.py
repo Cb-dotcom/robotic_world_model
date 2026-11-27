@@ -17,13 +17,20 @@ the front-left foot):
 The ratio does not depend on the walk timing. Speeds (m/s) use the walk duration
 found in step 1 and are for orientation only.
 
-Official V-gate verdict (decisions-log 18 Nov 2026, both V rows), from the Point-LIO source only:
-  PASS / FAIL    the prescribed set is complete (>= 3 bags at each commanded speed 0.30 and
-                 0.45 m/s, from /api/sport/request Move x), every run has a tape distance of the
-                 5 m line (+-0.5 m), Point-LIO is in every run, bar 5 %; PASS = every run within 5 %.
-  INVALID        a listed run is missing or errored, or Point-LIO has no finite ratio in a run.
-  DIAGNOSTIC ONLY: <reasons>   anything else (too few runs, no Point-LIO in any bag, another
-                 line length, --max-rel-err other than 0.05). Ratios are printed, never PASS.
+Official V-gate verdict (decisions-log 18 Nov 2026, both V rows), from the Point-LIO source only.
+One run = one listed row = one walk (a whole bag, or one leg of it) with its own tape readings and
+its own commanded speed (median /api/sport/request Move x over the walk; a backward leg commands -x).
+  PASS / FAIL    the listed rows are exactly the prescribed set: 3 runs at commanded 0.30 and 3 at
+                 0.45 m/s, each row in exactly one speed group, each bag in one speed group, no walk
+                 listed twice, every tape distance on the 5 m line, Point-LIO in every run, bar 5 %;
+                 PASS = every run has |ratio - 1| <= 5 % (inclusive).
+  INVALID        a listed run is missing or errored, Point-LIO has no finite ratio in a run, or a run
+                 has no readable commanded speed (data of a listed run are broken).
+  DIAGNOSTIC ONLY: <reasons>   the data are readable but the set or the settings are not the rule
+                 (too few or extra runs, another speed, ambiguous rows, no Point-LIO in any bag,
+                 another line length, --max-rel-err, --speed-tol-mps or --line-tol-m changed).
+                 Ratios are printed, never PASS.
+The speed and line tolerances are PROPOSED (not in the 18 Nov rule) until a dated decisions-log row.
 /sportmodestate and /utlidar/robot_odom are one Unitree estimate: reported, never the gate.
 Exit 0 = official verdict (PASS or FAIL, read the V GATE line), 1 = INVALID (as before),
 2 = no official verdict (DIAGNOSTIC ONLY).
@@ -54,12 +61,14 @@ REQUEST = "/api/sport/request"
 # 0.45 m/s, 3 runs each; pass = every run within 5 %.
 POINT_LIO = "/state_estimation_at_scan"  # 14 Hz Point-LIO odometry (lab 25 Nov); /odom relays Unitree
 V_SPEEDS_MPS = (0.30, 0.45)
-V_BAGS_PER_SPEED = 3  # counted as bags: an out-and-back bag (2 legs) is one run
+V_RUNS_PER_SPEED = 3  # one run = one listed row (one walk): an out-and-back bag listed by leg is two runs
 V_LINE_M = 5.0
 V_BAR = 0.05
-# shortcut: the two tolerances below are not in the 18 Nov rule; Charbel to confirm before the data.
+# Not in the 18 Nov rule: proposed, to be frozen by a dated decisions-log row before collection.
 V_SPEED_TOL_MPS = 0.05
 V_LINE_TOL_M = 0.5
+V_TOL_STATUS = "PROPOSED, to be frozen by a dated decisions-log row before collection"
+EPS = 1e-9  # float slack only, so inclusive bars hold: 5.25 / 5.0 - 1 = 0.0500000000000000444
 
 
 def _segments(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -71,9 +80,9 @@ def _segments(mask: np.ndarray) -> list[tuple[int, int]]:
 
 
 def find_walk(t: np.ndarray, speed: np.ndarray, move_thresh: float, merge_s: float,
-              leg: int = 0, min_walk_s: float = 1.5) -> tuple[int, int]:
-    """leg = 0: the longest walk. leg = k >= 1: the k-th walk in time order
-    (walks shorter than min_walk_s are ignored; a stop longer than merge_s splits walks)."""
+              leg: int = 0, min_walk_s: float = 1.5) -> tuple[int, int, int]:
+    """(start, end, number of walks >= min_walk_s). leg = 0: the longest walk. leg = k >= 1: the
+    k-th walk in time order (walks shorter than min_walk_s are ignored; a stop longer than merge_s splits walks)."""
     segs = _segments(speed > move_thresh)
     if not segs:
         raise ValueError(f"no motion above {move_thresh} m/s")
@@ -83,14 +92,14 @@ def find_walk(t: np.ndarray, speed: np.ndarray, move_thresh: float, merge_s: flo
             merged[-1][1] = e
         else:
             merged.append([s, e])
+    walks = [se for se in merged if t[se[1] - 1] - t[se[0]] >= min_walk_s]
     if leg <= 0:
         s, e = max(merged, key=lambda se: t[se[1] - 1] - t[se[0]])
-        return int(s), int(e)
-    walks = [se for se in merged if t[se[1] - 1] - t[se[0]] >= min_walk_s]
+        return int(s), int(e), len(walks)
     if leg > len(walks):
         raise ValueError(f"leg {leg} asked, bag has {len(walks)} walks of >= {min_walk_s} s")
     s, e = walks[leg - 1]
-    return int(s), int(e)
+    return int(s), int(e), len(walks)
 
 
 def still_pose(t, pos, t_edge, still_s, before: bool):
@@ -117,7 +126,7 @@ def analyse_run(bag: str, tape_start: float, tape_end: float, args, lat_start: f
     t = sp.t
     vel_b = sp.cols["velocity"]
     speed = np.hypot(vel_b[:, 0], vel_b[:, 1])
-    s, e = find_walk(t, speed, args.move_thresh, args.merge_s, leg, args.min_walk_s)
+    s, e, out["walks_in_bag"] = find_walk(t, speed, args.move_thresh, args.merge_s, leg, args.min_walk_s)
     t0, t1 = t[s], t[e - 1]
     if t1 - t0 < args.min_walk_s:
         raise ValueError(f"walk {t1 - t0:.2f} s is shorter than --min-walk-s {args.min_walk_s} s")
@@ -216,36 +225,64 @@ def summarize(rows: list[dict]) -> tuple[dict, list[str]]:
     return summ, lines
 
 
-def v_gate(rows: list[dict], summ: dict, bar: float) -> tuple[str, list[str]]:
-    """Official V-gate status (PASS, FAIL, INVALID, DIAGNOSTIC ONLY) and the reasons."""
+def _name(r: dict) -> str:
+    return Path(r["bag"]).name + (f" leg {r['leg']}" if r.get("leg") else "")
+
+
+def v_gate(rows: list[dict], summ: dict, bar: float, speed_tol: float = V_SPEED_TOL_MPS,
+           line_tol: float = V_LINE_TOL_M) -> tuple[str, list[str]]:
+    """Official V-gate status (PASS, FAIL, INVALID, DIAGNOSTIC ONLY) and the reasons.
+    Every listed row is one run and must be accounted for (see the module docstring)."""
     pl = summ.get(POINT_LIO)
     n_err = sum("error" in r for r in rows)
     bad = [f"{n_err} of {len(rows)} runs not analysed (ERROR above)"] if n_err else []
     if pl and pl["n"] < pl["n_expected"]:
         bad.append(f"Point-LIO ratio missing in {pl['n_expected'] - pl['n']} of {pl['n_expected']} runs")
+    no_cmd = [_name(r) for r in rows if "error" not in r and not np.isfinite(r.get("cmd_vx_median", np.nan))]
+    if no_cmd:
+        bad.append(f"no readable commanded speed ({REQUEST} Move x) in {', '.join(no_cmd)}")
     if bad:
         return "INVALID", bad
     why = []
-    if not np.isclose(bar, V_BAR):
-        why.append(f"bar {bar * 100:g} % (--max-rel-err) is not the decided {V_BAR * 100:g} %")
+    for val, ref, what in ((bar, V_BAR, f"bar {bar * 100:g} % (--max-rel-err) is not the decided {V_BAR * 100:g} %"),
+                           (speed_tol, V_SPEED_TOL_MPS, f"speed tolerance {speed_tol:g} m/s (--speed-tol-mps) "
+                                                        f"is not the proposed {V_SPEED_TOL_MPS:g} m/s"),
+                           (line_tol, V_LINE_TOL_M, f"line tolerance {line_tol:g} m (--line-tol-m) "
+                                                    f"is not the proposed {V_LINE_TOL_M:g} m")):
+        if not np.isclose(val, ref):
+            why.append(what)
     if pl is None:
         why.append(f"no Point-LIO source ({POINT_LIO}) in any run; /sportmodestate and "
                    "/utlidar/robot_odom are one Unitree estimate and cannot decide the gate")
-    bags: dict[float, set] = {v: set() for v in V_SPEEDS_MPS}
+    runs: dict[float, int] = {v: 0 for v in V_SPEEDS_MPS}
+    groups: dict[str, set] = {}  # bag -> speed groups of its runs
+    legs: dict[str, list] = {}  # bag -> listed legs
     for r in rows:
-        name = Path(r["bag"]).name + (f" leg {r['leg']}" if r.get("leg") else "")
-        cmd = abs(r.get("cmd_vx_median", np.nan))  # a backward leg commands -x
-        hit = [v for v in V_SPEEDS_MPS if abs(cmd - v) <= V_SPEED_TOL_MPS]
-        if hit:
-            bags[hit[0]].add(r["bag"])
-        if not abs(r["tape_m"] - V_LINE_M) <= V_LINE_TOL_M:
+        name, bag, cmd = _name(r), str(Path(r["bag"]).resolve()), r["cmd_vx_median"]
+        legs.setdefault(bag, []).append(r.get("leg", 0))
+        if not r.get("leg") and r.get("walks_in_bag", 1) > 1:
+            why.append(f"{name}: the bag has {r['walks_in_bag']} walks; the row must name its leg")
+        hit = [v for v in V_SPEEDS_MPS if abs(abs(cmd) - v) <= speed_tol + EPS]  # a backward leg commands -x
+        if len(hit) == 1:
+            runs[hit[0]] += 1
+            groups.setdefault(bag, set()).add(hit[0])
+        else:
+            why.append(f"{name}: commanded {cmd:+.2f} m/s is " + ("in two speed groups" if hit else
+                       f"not one of {', '.join(f'{v:.2f}' for v in V_SPEEDS_MPS)} (± {speed_tol:g})"))
+        if not abs(r["tape_m"] - V_LINE_M) <= line_tol + EPS:
             why.append(f"{name}: tape {r['tape_m']:.2f} m, protocol line {V_LINE_M:g} m")
-    for v, b in bags.items():
-        if len(b) < V_BAGS_PER_SPEED:
-            why.append(f"{len(b)} of {V_BAGS_PER_SPEED} bags at commanded {v:.2f} m/s")
+    for bag, ls in legs.items():
+        if len(ls) > 1 and (0 in ls or len(set(ls)) < len(ls)):
+            why.append(f"{Path(bag).name}: listed {len(ls)} times with legs {ls}; each row must name a distinct leg")
+        if len(groups.get(bag, ())) > 1:
+            why.append(f"{Path(bag).name}: runs at both 0.30 and 0.45 m/s; one bag holds runs of one speed")
+    for v, n in runs.items():
+        if n != V_RUNS_PER_SPEED:
+            why.append(f"{n} runs at commanded {v:.2f} m/s; the rule prescribes exactly {V_RUNS_PER_SPEED}")
     if why:
         return "DIAGNOSTIC ONLY", why
-    return ("PASS" if pl["max_abs_err_pct"] <= bar * 100 else "FAIL"), []
+    worst = max(abs(r["sources"][POINT_LIO]["ratio"] - 1.0) for r in rows)
+    return ("PASS" if worst <= bar + EPS else "FAIL"), []
 
 
 def main(argv=None) -> int:
@@ -261,6 +298,10 @@ def main(argv=None) -> int:
     ap.add_argument("--odom-stride", type=int, default=1)
     ap.add_argument("--max-rel-err", type=float, default=V_BAR,
                     help="per-run bar (decided 18 Nov: 0.05 = 5 %%). Another value gives DIAGNOSTIC ONLY.")
+    ap.add_argument("--speed-tol-mps", type=float, default=V_SPEED_TOL_MPS,
+                    help="commanded-speed match (PROPOSED). Another value gives DIAGNOSTIC ONLY.")
+    ap.add_argument("--line-tol-m", type=float, default=V_LINE_TOL_M,
+                    help="tape distance vs the 5 m line (PROPOSED). Another value gives DIAGNOSTIC ONLY.")
     args = ap.parse_args(argv)
 
     out = Path(args.out)
@@ -287,16 +328,20 @@ def main(argv=None) -> int:
             f"est vx {r['mean_vx_body_mps']:.3f}, yaw drift {r['yaw_drift_deg']:+.1f} deg | ratio {src}"
         )
     summ, slines = summarize(rows)
-    status, reasons = v_gate(rows, summ, args.max_rel_err)
+    status, reasons = v_gate(rows, summ, args.max_rel_err, args.speed_tol_mps, args.line_tol_m)
+    tol = {"speed_tol_mps": args.speed_tol_mps, "line_m": V_LINE_M, "line_tol_m": args.line_tol_m,
+           "status": V_TOL_STATUS}
     lines += ["", *slines, "",
-              f"V GATE (Point-LIO vs tape, every run within {args.max_rel_err * 100:g} %): "
+              f"V GATE (Point-LIO vs tape, every run within {args.max_rel_err * 100:g} %; "
+              f"{V_RUNS_PER_SPEED} runs each at {' and '.join(f'{v:.2f}' for v in V_SPEEDS_MPS)} m/s; "
+              f"speed ± {args.speed_tol_mps:g} m/s, line {V_LINE_M:g} ± {args.line_tol_m:g} m PROPOSED): "
               + (f"{status}: " + "; ".join(reasons) if reasons else status),
               "Unitree sources (sport_pos, sport_int, /utlidar/robot_odom, /odom) are reported, never the gate."]
     text = "\n".join(lines) + "\n"
     (out / "v_check.txt").write_text(text)
     (out / "v_check.json").write_text(json.dumps({"runs": rows, "summary": summ,
                                                    "gate": {"status": status, "reasons": reasons},
-                                                   "max_rel_err": args.max_rel_err,
+                                                   "max_rel_err": args.max_rel_err, "tolerances": tol,
                                                    "settings": {k: v for k, v in vars(args).items()
                                                                 if k not in ("run",)}},
                                                   indent=2, default=float))
